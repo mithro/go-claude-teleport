@@ -1,0 +1,25 @@
+# Binaries and test artefacts
+*.exe
+*.test
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Local git worktrees and superpowers SDD scratch (never committed)
+.worktrees/
+.superpowers/
+
+# Project-local scratch directory
+tmp/
+
+# Built binary and release artefacts
+/claude-teleport
+/dist/
+
+# Python caches (packaging/version.py tests)
+__pycache__/
