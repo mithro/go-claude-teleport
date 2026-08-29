@@ -166,7 +166,12 @@ type PaneProbe interface {
     // FindWindow resolves "<session> <window index|name>" to its pane ids.
     FindWindow(session, window string) (paneIDs []string, err error)
     SocketPath() string
+    // ListPanes enumerates every pane on the server (suspended-pane discovery
+    // in Load; Plan 01 addition — tmuxx.Prober implements it with
+    // `list-panes -a -F "#{session_name} #{window_id} #{pane_id}"`).
+    ListPanes() ([]PaneInfo, error)
 }
+type PaneInfo struct{ Session, WindowID, PaneID string }
 
 // Resolve turns a selector into a Session, scanning the registry, the
 // projects tree and (optionally) tmux panes. Ambiguity is an error listing
@@ -543,7 +548,46 @@ type Endpoint interface {
     JournalGet(ctx context.Context, jobID string) (*job.Journal, bool, error)
     JournalPut(ctx context.Context, j *job.Journal) error
     Record(ctx context.Context, jobID string, rec job.HistoryRecord) error
+
+    // Plan 03 additions (implemented on Local and Client in Plan 03 Tasks 13, 14, 16, 23;
+    // Plan 02 ships the interface without them — Plan 03 adds them to endpoint.go)
+    GitFiles(ctx context.Context, p *gitx.Plan, excludes []string, includeIgnored bool) ([]session.FileEntry, error)
+    GitSourceFacts(ctx context.Context, mainDir, indexRel, tip, destTip string) (*gitx.SourceFacts, error)
+    BuildManifest(ctx context.Context, jobID string, id session.ID, srcHost, dstHost string, files []session.FileEntry, pm session.PathMap) (*transfer.Manifest, error)
+    SessionExtras(ctx context.Context, id session.ID, pm session.PathMap) (*transfer.InstallExtras, error)
+    TmuxSessions(ctx context.Context, socketPath string) ([]tmuxx.SessionInfo, error)
+    KillWindow(ctx context.Context, ref *session.TmuxRef) error
+    ClaudeStatus(ctx context.Context, id session.ID) (*session.Registry, bool, error)
+    ListSessions(ctx context.Context) ([]SessionSummary, error)
+    Cleanup(ctx context.Context, jobID string) error
+    DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids []int) (deleted []string, err error)
 }
+
+// SessionSummary is one row of ListSessions (Plan 03).
+type SessionSummary struct {
+    ID      session.ID `json:"id"`
+    State   string     `json:"state"`
+    Cwd     string     `json:"cwd"`
+    Branch  string     `json:"branch"`
+    Name    string     `json:"name"`
+    Tmux    string     `json:"tmux"`
+    Version string     `json:"version"`
+    LastTS  string     `json:"last_ts"`
+}
+
+// Not on Endpoint (Plan 02): the merge inputs for Install travel separately.
+// Local and Client both implement it (op "install-extras"); Local.Install reads
+// jobs/<id>/extras.json. The orchestrator calls it right before Install.
+// func (l *Local)  PutInstallExtras(ctx context.Context, jobID string, extra transfer.InstallExtras) error
+// func (c *Client) PutInstallExtras(ctx context.Context, jobID string, extra transfer.InstallExtras) error
+
+// Op names on the wire (Plan 02 `ops.go`; Plan 03 adds the second row):
+//   hello paths resolve-session inventory-session inventory-host inventory-git git-dest-state
+//   inventory-tmux manifest-diff install-extras install git-attach freeze thaw tmux-capture tmux-open
+//   claude-start claude-confirm claude-exit tmux-keys shape-state claude-pty-resume
+//   job-journal-get job-journal-put record
+//   git-files git-source-facts tmux-sessions tmux-kill claude-status build-manifest session-extras
+//   cleanup list-sessions delete-installed
 
 type Request struct {
     ID   int             `json:"id"`
@@ -609,6 +653,7 @@ type Manifest struct {
     PathMap    session.PathMap  `json:"path_map"`
     Entries    []Entry          `json:"entries"`
     Skipped    []session.Skipped `json:"skipped"`
+    TmpDir     string           `json:"-"` // Plan 02 addition: where Send writes rewritten temp files ("" = os.TempDir())
 }
 // Build hashes every file (streaming) and computes Dst via the path map.
 func Build(ctx context.Context, jobID string, id session.ID, srcHost, dstHost string, files []session.FileEntry, pm session.PathMap) (*Manifest, error)
@@ -719,7 +764,8 @@ type HistoryRecord struct {
     At        time.Time `json:"at"`
     SessionID string    `json:"session_id"`
     Direction string    `json:"direction"`
-    From, To  string    `json:"from","to"`
+    From      string    `json:"from"`
+    To        string    `json:"to"`
     Outcome   string    `json:"outcome"`
     Note      string    `json:"note,omitempty"`
 }
@@ -812,6 +858,14 @@ func WritePack(ctx context.Context, repoDir string, want []string, have []string
 // fresh-main, or index pack + refs + worktree creation + dirty apply for
 // existing-main. packPath may be "".
 func Attach(ctx context.Context, p *Plan, packPath string, dirtyFiles map[string]string /* dst path -> staged file */) error
+
+// Plan 03 addition (Endpoint.GitSourceFacts): source-side facts the
+// destination needs to finish the decision table.
+type SourceFacts struct {
+    DestTipReachable bool     // dest branch tip is an ancestor of the source tip
+    StagedBlobs      []string // blobs only the index references
+}
+func SourceFactsOf(mainDir, indexRel, tip, destTip string) (*SourceFacts, error)
 ```
 
 ## internal/tmuxx (Plan 03)
@@ -844,6 +898,10 @@ type Facts struct {
     HistorySize  int
 }
 func Describe(ctx context.Context, t Transport, paneID string) (*Facts, error)
+
+// Plan 03 addition (Endpoint.TmuxSessions).
+type SessionInfo struct{ Name, Group string }
+func ListSessions(ctx context.Context, t Transport) ([]SessionInfo, error)
 
 // FindServer implements spec §9 discovery. Returns the socket path.
 func FindServer(socketDir string, preferredName string, override string) (string, error)
