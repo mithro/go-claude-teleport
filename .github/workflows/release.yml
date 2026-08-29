@@ -1,0 +1,238 @@
+name: release
+
+# Every push to main is a release:
+#   1. test   — full suite (tmux installed for the integration tests)
+#   2. version — HEAD's vX.Y tag if it has one, else the next patch tag
+#                (latest reachable vX.Y + 1), created and pushed here
+#   3. build  — static linux amd64 + arm64 binaries (-X version.Version=<tag>)
+#                and nfpm .debs (version X.Y)
+#   4. release — GitHub Release <tag> with binaries, debs, checksums
+#   5. apt    — signed apt repository on GitHub Pages
+# Tags are always vXX.ZZZ (the repo's tag ruleset); git describe on a released
+# commit is therefore exactly the release tag.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialise releases so two quick pushes never compute the same next tag.
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  NFPM_VERSION: 2.41.1
+  GO_MODULE: github.com/mithro/go-claude-teleport
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: packaging helper tests
+        run: python3 -m unittest discover -s packaging -p 'version_test.py' -v
+
+  version:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # push the release tag
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      deb: ${{ steps.v.outputs.deb }}
+      created: ${{ steps.v.outputs.created }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Decide the release tag
+        id: v
+        run: |
+          set -euo pipefail
+          TAG="$(python3 packaging/version.py tag)"
+          DEB="$(python3 packaging/version.py deb "$TAG")"
+          if python3 packaging/version.py is-tagged; then
+            echo "HEAD already tagged $TAG"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "refs/tags/$TAG"
+            echo "created $TAG"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "deb=$DEB" >> "$GITHUB_OUTPUT"
+          echo "release tag: $TAG (deb $DEB)"
+
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      DEBVER: ${{ needs.version.outputs.deb }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build static binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
+            go build -trimpath \
+              -ldflags "-s -w -X ${GO_MODULE}/internal/version.Version=${TAG}" \
+              -o dist/claude-teleport ./cmd/claude-teleport
+          ls -l dist/
+      - name: Install nfpm
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nfpm.deb \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb"
+          sudo dpkg -i /tmp/nfpm.deb
+          nfpm --version
+      - name: Build deb
+        run: |
+          set -euo pipefail
+          VERSION="$DEBVER" ARCH="${{ matrix.arch }}" nfpm package -p deb -f nfpm.yaml -t dist/
+          mv dist/claude-teleport "dist/claude-teleport-linux-${{ matrix.arch }}"
+          ls -l dist/
+          dpkg-deb -I dist/*_${{ matrix.arch }}.deb | head -20
+          dpkg-deb -c dist/*_${{ matrix.arch }}.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub Release
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum claude-teleport-linux-* *.deb > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update the GitHub Release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --generate-notes \
+              --notes "Static linux binaries (amd64, arm64), Debian packages and SHA256SUMS. Apt repository: https://mith.ro/go-claude-teleport/ (see index for setup)."
+          fi
+
+  apt:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+      - name: Assemble apt repo
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev apt-utils
+          mkdir -p apt-repo
+          cp dist/*.deb apt-repo/
+          cd apt-repo
+          dpkg-scanpackages --multiversion . > Packages
+          gzip -k Packages
+          cat > Release <<EOF
+          Origin: mithro-go-claude-teleport
+          Label: mithro-go-claude-teleport
+          Suite: stable
+          Codename: trixie
+          Architectures: amd64 arm64
+          Components: main
+          Description: go-claude-teleport ${TAG} — move Claude Code sessions between machines
+          EOF
+          apt-ftparchive release . >> Release
+      - name: Sign repo
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        if: env.GPG_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          cd apt-repo
+          gpg --batch --yes --armor --detach-sign --output Release.gpg Release
+          gpg --batch --yes --armor --clearsign --output InRelease Release
+          gpg --batch --yes --armor --export > go-claude-teleport.gpg
+      - name: Index page
+        run: |
+          cat > apt-repo/index.html <<HTMLEOF
+          <!DOCTYPE html>
+          <html><head><meta charset="utf-8"><title>mithro go-claude-teleport apt repository</title></head>
+          <body>
+          <h1>mithro go-claude-teleport apt repository</h1>
+          <p><a href="https://github.com/mithro/go-claude-teleport">go-claude-teleport</a>
+          — move an in-progress Claude Code session (transcript, git worktree,
+          tmux window) to another machine over ssh.
+          Current release: <b>${TAG}</b> (amd64, arm64). Every push to
+          <code>main</code> publishes a new release here and on
+          <a href="https://github.com/mithro/go-claude-teleport/releases">GitHub Releases</a>.</p>
+          <h2>Setup</h2>
+          <pre>
+          curl -fsSL https://mith.ro/go-claude-teleport/go-claude-teleport.gpg \\
+            | sudo tee /etc/apt/keyrings/mithro-go-claude-teleport.gpg > /dev/null
+          echo "deb [signed-by=/etc/apt/keyrings/mithro-go-claude-teleport.gpg] https://mith.ro/go-claude-teleport/ ./" \\
+            | sudo tee /etc/apt/sources.list.d/mithro-go-claude-teleport.list
+          sudo apt update
+          sudo apt install claude-teleport
+          </pre>
+          <p>Files: <a href="Packages">Packages</a> · <a href="Release">Release</a> ·
+          <a href="InRelease">InRelease</a> · <a href="go-claude-teleport.gpg">signing key</a></p>
+          </body></html>
+          HTMLEOF
+          sed -i 's/^          //' apt-repo/index.html
+          ls -l apt-repo/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: apt-repo/
+      - id: deploy
+        uses: actions/deploy-pages@v4
