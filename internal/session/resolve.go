@@ -12,14 +12,21 @@ import (
 var ErrNotFound = errors.New("session not found")
 
 // TmuxRef is where a session's pane lives (from the registry or a pane scan).
+//
+// CONVENTION (R-PRB-2): Session carries tmux's STORED, vis(3)-encoded
+// spelling — the name tmux itself reports and the only one a `-t` target
+// resolves (a session created as `a\b` is stored, and must be targeted, as
+// `a\\b`). Decode with tmuxx.UnvisName only when feeding a creation flag
+// (`new-session -s`, `new-window -n`) or when displaying a name to a human.
 type TmuxRef struct {
 	SocketPath string
-	Session    string // session name
+	Session    string // session name, in tmux's stored (vis-encoded) spelling
 	WindowID   string // "@N"
 	PaneID     string // "%N"
 }
 
-// PaneInfo identifies one pane for ListPanes.
+// PaneInfo identifies one pane for ListPanes. Session follows TmuxRef's
+// convention: tmux's stored (vis-encoded) spelling.
 type PaneInfo struct {
 	Session  string
 	WindowID string

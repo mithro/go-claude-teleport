@@ -42,6 +42,10 @@ func (l *Local) ClaudeStatus(ctx context.Context, id session.ID) (*session.Regis
 // ConfirmClaude implements spec §6.2: registry entry alive in our pane,
 // no failure marker in the pane, status idle — all within timeout.
 func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration) (*session.Registry, error) {
+	// Both sides of this comparison are tmux's STORED session-name spelling
+	// (R-PRB-2): Claude Code writes registry.tmux from #{session_name}, and
+	// TmuxRef.Session carries the same spelling — so no decoding here, on
+	// either side, or an escaped name could never match.
 	wantTmux := ""
 	if ref != nil {
 		wantTmux = fmt.Sprintf("%s:%s.%s", ref.Session, ref.WindowID, ref.PaneID)

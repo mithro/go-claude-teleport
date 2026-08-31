@@ -9,7 +9,12 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/mithro/go-claude-teleport/internal/procx"
+	"github.com/mithro/go-claude-teleport/internal/session"
 )
+
+// listPanesCmd is the exact command prober.ListPanes issues (tab-separated,
+// see listPanesFormat).
+const listPanesCmd = "list-panes -a -F \"#{session_name}\t#{window_id}\t#{pane_id}\""
 
 func TestCaptureJoinsLinesWithNewline(t *testing.T) {
 	f := &Fake{Replies: map[string][]string{`capture-pane -epJ -S - -t "%7"`: {"line1", "", "line3"}}}
@@ -106,10 +111,10 @@ func TestStateBareShell(t *testing.T) {
 func TestProber(t *testing.T) {
 	tb := fakeProc(t, [][4]string{{"100", "1", "bash", "bash\x00"}, {"200", "100", "claude", "claude\x00"}})
 	f := &Fake{Replies: map[string][]string{
-		`list-panes -t "%7" -F "#{pane_pid}"`:                        {"100"},
-		`capture-pane -p -S -50 -t "%7"`:                             {},
-		`list-panes -t "=main:2" -F "#{pane_id}"`:                    {"%7", "%8"},
-		`list-panes -a -F "#{session_name} #{window_id} #{pane_id}"`: {"main @1 %7", "main @1 %8"},
+		`list-panes -t "%7" -F "#{pane_pid}"`:     {"100"},
+		`capture-pane -p -S -50 -t "%7"`:          {},
+		`list-panes -t "=main:2" -F "#{pane_id}"`: {"%7", "%8"},
+		listPanesCmd: {"main\t@1\t%7", "main\t@1\t%8"},
 	}}
 	p := Prober(context.Background(), f, tb, "/tmp/tmux-1000/default")
 	argv, pid, ok := p.PaneCommand("%7")
@@ -132,17 +137,49 @@ func TestProber(t *testing.T) {
 	}
 }
 
-// CARRIED RULING: ListPanes must UnvisName-decode session names — tmux
-// vis(3)-encodes session names at creation time (see UnvisName), so a name
-// containing a space comes back over list-panes as e.g. `a\sb`.
-func TestProberListPanesDecodesSessionNames(t *testing.T) {
+// TestProberListPanesKeepsStoredSessionNames replaces the Task 10 fixture
+// that asserted tmux reports a space as `\s` (I2). It does not: a space is
+// printable and vis leaves it alone, so the old space-separated format split
+// such a name in two and the pane was silently dropped from suspended-pane
+// discovery. Transcribed from a live probe on a throwaway socket (tmux
+// next-3.8), recorded in the fix-wave report:
+//
+//	$ tmux new-session -d -s 'a b'; tmux new-session -d -s 'a\b'
+//	$ tmux new-session -d -s 'a"b'
+//	$ tmux list-panes -a -F '#{session_name}<TAB>#{window_id}<TAB>#{pane_id}'
+//	a b<TAB>@0<TAB>%0
+//	a"b<TAB>@2<TAB>%2
+//	a\\b<TAB>@1<TAB>%1
+//
+// Names keep their stored spelling — that is what a `-t` target needs.
+func TestProberListPanesKeepsStoredSessionNames(t *testing.T) {
 	tb := fakeProc(t, nil)
 	f := &Fake{Replies: map[string][]string{
-		`list-panes -a -F "#{session_name} #{window_id} #{pane_id}"`: {`a\sb @1 %7`},
+		listPanesCmd: {"a b\t@0\t%0", "a\"b\t@2\t%2", `a\\b` + "\t@1\t%1"},
 	}}
 	p := Prober(context.Background(), f, tb, "/tmp/tmux-1000/default")
 	all, err := p.ListPanes()
-	if err != nil || len(all) != 1 || all[0].Session != "a b" {
-		t.Errorf("ListPanes = %+v %v", all, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []session.PaneInfo{
+		{Session: `a b`, WindowID: "@0", PaneID: "%0"},
+		{Session: `a"b`, WindowID: "@2", PaneID: "%2"},
+		{Session: `a\\b`, WindowID: "@1", PaneID: "%1"},
+	}
+	if diff := cmp.Diff(want, all); diff != "" {
+		t.Errorf("ListPanes (-want +got):\n%s", diff)
+	}
+}
+
+// TestProberListPanesRejectsMalformedLine: a wrong field count must be an
+// error, never a `continue` — a dropped pane is an invisible session, and
+// step 7 would then open a second window for a session that already has one.
+func TestProberListPanesRejectsMalformedLine(t *testing.T) {
+	f := &Fake{Replies: map[string][]string{listPanesCmd: {"nope"}}}
+	p := Prober(context.Background(), f, fakeProc(t, nil), "/tmp/tmux-1000/default")
+	all, err := p.ListPanes()
+	if err == nil {
+		t.Fatalf("ListPanes = %+v, want an error on a malformed line", all)
 	}
 }

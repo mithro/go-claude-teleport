@@ -69,6 +69,14 @@ func Describe(ctx context.Context, t Transport, paneID string) (*Facts, error) {
 }
 
 // SessionInfo is one row of list-sessions.
+//
+// CONVENTION (R-PRB-2): Name (and Group) carry tmux's STORED, vis(3)-encoded
+// spelling — whatever tmux itself reports — everywhere in this codebase, as
+// does session.TmuxRef.Session. That is the spelling every `-t` target needs
+// (`-t '=a\\b'` resolves the session created as `a\b`; `-t '=a\b'` does not).
+// UnvisName is applied in exactly two places: passing a name to a creation
+// flag (`new-session -s`, `new-window -n`), which tmux re-encodes, and human
+// display. Never decode a name on its way into a target or a comparison.
 type SessionInfo struct{ Name, Group string }
 
 // ListSessions lists every session with its group ("" when ungrouped).

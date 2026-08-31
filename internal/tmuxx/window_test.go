@@ -58,29 +58,77 @@ func TestOpenWindowHostileNamesAreQuoted(t *testing.T) {
 	}
 }
 
-// TestOpenWindowDecodesVisEncodedSessionNames pins the Task 9 review carry:
-// tmux's control-mode replies vis(3)-encode session/group names (see
-// UnvisName) — list-sessions reports a space as "\s" and a literal quote
-// passes through unescaped. OpenWindow must UnvisName the reply before (a)
-// comparing it against the caller-supplied plain group name in BaseSession
-// and (b) handing it back into a new-window/new-session target; otherwise a
-// stored "\s" would be Quoted verbatim and tmux would double-encode it.
-func TestOpenWindowDecodesVisEncodedSessionNames(t *testing.T) {
-	const group = `wo rk"grp`      // real chars: space and a literal quote
-	const encoded = "wo\\srk\"grp" // as tmux's control mode reports it: \s for the space
+// TestOpenWindowTargetsStoredSessionName replaces the Task 10 fixture that
+// asserted the opposite (I1/I2). Its premise — that tmux reports a space as
+// "\s" — is false, and decoding a name into a `-t` target makes the target
+// unresolvable. Both fixture rows below are transcribed from a live probe
+// on a throwaway socket (tmux next-3.8), recorded in the fix-wave report:
+//
+//	$ tmux new-session -d -s 'a b'; tmux new-session -d -s 'a\b'
+//	$ tmux new-session -d -s 'a"b'
+//	$ tmux list-sessions -F '#{session_name}<TAB>#{session_group}'
+//	a b<TAB>
+//	a"b<TAB>
+//	a\\b<TAB>
+//	$ tmux has-session -t '=a\b'   → can't find session: a\b
+//	$ tmux has-session -t '=a\\b'  → rc=0
+//
+// So: a space is NOT encoded, a literal quote is NOT encoded, a backslash IS
+// doubled — and the stored spelling is the one a target must carry.
+func TestOpenWindowTargetsStoredSessionName(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		stored        string // exactly what list-sessions reports
+		wantNewWindow string
+	}{
+		{"space", `a b`, `new-window -t "=a b:" -n "claude" -c "/home/alice/x" -P -F "#{pane_id}	#{window_id}	#{session_name}"`},
+		{"backslash", `a\\b`, `new-window -t "=a\\\\b:" -n "claude" -c "/home/alice/x" -P -F "#{pane_id}	#{window_id}	#{session_name}"`},
+		{"quote", `a"b`, `new-window -t "=a\"b:" -n "claude" -c "/home/alice/x" -P -F "#{pane_id}	#{window_id}	#{session_name}"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &Fake{Replies: map[string][]string{
+				listSessionsCmd:  {tc.stored + "\t"},
+				tc.wantNewWindow: {"%9\t@4\t" + tc.stored},
+			}}
+			ref, err := OpenWindow(context.Background(), f, &Plan{Group: tc.stored, WindowName: "claude", AutoRename: true, Cwd: "/home/alice/x"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ref.Session != tc.stored {
+				t.Errorf("ref.Session = %q, want the stored spelling %q", ref.Session, tc.stored)
+			}
+			if ref.WindowID != "@4" || ref.PaneID != "%9" {
+				t.Errorf("ref = %+v", ref)
+			}
+		})
+	}
+}
+
+// TestOpenWindowDecodesNamesForCreationFlags is the other half of the
+// convention: `new-session -s` / `new-window -n` get the DECODED spelling,
+// because tmux re-encodes what it is handed. Probe-verified:
+//
+//	$ tmux new-session -d -s 'a\b';  tmux list-sessions -F '[#{session_name}]'
+//	[a\\b]
+//	$ tmux new-session -d -s 'a\\b'; tmux list-sessions -F '[#{session_name}]'
+//	[a\\\\b]
+//	[a\\b]
+//
+// Quote then doubles the single backslash again for tmux's own double-quote
+// parser, so the command line reads -s "a\\b" and tmux stores `a\\b`.
+func TestOpenWindowDecodesNamesForCreationFlags(t *testing.T) {
+	const stored = `a\\b` // as list-sessions reports it
+	want := `new-session -d -s "a\\b" -n "w\\x" -c "/home/alice/x" -P -F "#{pane_id}	#{window_id}	#{session_name}"`
 	f := &Fake{Replies: map[string][]string{
-		listSessionsCmd: {encoded + "\t" + encoded},
-		`new-window -t "=wo rk\"grp:" -n "claude" -c "/home/bob/x" -P -F "#{pane_id}	#{window_id}	#{session_name}"`: {"%9\t@4\t" + encoded},
+		listSessionsCmd: {"other\t"},
+		want:            {"%9\t@4\t" + stored},
 	}}
-	ref, err := OpenWindow(context.Background(), f, &Plan{Group: group, WindowName: "claude", AutoRename: true, Cwd: "/home/bob/x"})
+	ref, err := OpenWindow(context.Background(), f, &Plan{Group: stored, WindowName: `w\\x`, AutoRename: true, Cwd: "/home/alice/x", CreateSession: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ref.Session != group {
-		t.Errorf("ref.Session = %q, want decoded %q", ref.Session, group)
-	}
-	if ref.WindowID != "@4" || ref.PaneID != "%9" {
-		t.Errorf("ref = %+v", ref)
+	if ref.Session != stored {
+		t.Errorf("ref.Session = %q, want the stored spelling %q", ref.Session, stored)
 	}
 }
 
