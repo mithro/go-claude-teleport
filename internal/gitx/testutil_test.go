@@ -10,7 +10,12 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/mithro/go-claude-teleport/internal/session"
 )
+
+func pathMap(from, to string) session.PathMap {
+	return session.NewPathMap(session.Mapping{From: from, To: to})
+}
 
 // gitCLI runs the real git binary inside dir. Tests only: the tool itself
 // never execs git. Skips the test when git is not installed.
