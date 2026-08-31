@@ -27,7 +27,13 @@ type InstallExtras struct {
 	History      []json.RawMessage
 	ProjectCwd   string
 	ProjectEntry session.ProjectEntry
-	Memory       []Entry // memory files: copy only if absent
+	// Memory holds the memory-file entries: copy only if absent. INVARIANT:
+	// every entry MUST be a row of the SAME manifest passed to Install (same
+	// ID space) — i.e. m.ByID(e.ID) must find an entry with an identical
+	// Dst. Install validates this and errors otherwise; it never accepts a
+	// Memory entry whose ID belongs to a different manifest or a different
+	// Dst under a reused ID.
+	Memory []Entry
 }
 
 func parentMode(e Entry) os.FileMode {
@@ -124,6 +130,13 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 	rep := &InstallReport{}
 	memory := map[int]bool{}
 	for _, e := range extra.Memory {
+		// Enforce the InstallExtras.Memory invariant: every entry must be a
+		// row of THIS manifest (same ID space), not a foreign or
+		// hand-built Entry that merely resembles one.
+		me, ok := m.ByID(e.ID)
+		if !ok || me.Dst != e.Dst {
+			return rep, fmt.Errorf("install memory %s: id %d is not a manifest entry with this Dst (extra.Memory must be rows of the manifest passed to Install)", e.Dst, e.ID)
+		}
 		memory[e.ID] = true
 	}
 	installed := map[string]bool{}

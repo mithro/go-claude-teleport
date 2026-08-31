@@ -190,6 +190,35 @@ func TestInstallMemoryCopyIfAbsent(t *testing.T) {
 	}
 }
 
+func TestInstallRefusesMemoryEntryWithMismatchedID(t *testing.T) {
+	m, staging, p := staged(t)
+	memSrc := filepath.Join(t.TempDir(), "memory.md")
+	os.WriteFile(memSrc, []byte("# notes\n"), 0o600)
+	memDst := filepath.Join(p.ConfigDir, "projects", "-home-bob-work", "memory", "MEMORY.md")
+	mem := Entry{ID: 5, Category: session.CatSession, Src: memSrc, Dst: memDst, Size: 8, Mode: 0o600, SHA256: sha("# notes\n")}
+	m.Entries = append(m.Entries, mem)
+	writeFile(t, StagedPath(staging, 5), "# notes\n")
+	st, _ := Diff(context.Background(), m, staging)
+
+	// The Dst does not match manifest entry ID 5 (foreign/hand-built Entry
+	// reusing an unrelated ID) — Install must refuse before touching disk.
+	foreign := Entry{ID: 5, Category: session.CatSession, Src: memSrc, Dst: memDst + ".evil", Size: 8, Mode: 0o600, SHA256: sha("# notes\n")}
+	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{Memory: []Entry{foreign}})
+	if err == nil || !strings.Contains(err.Error(), "not a manifest entry") {
+		t.Fatalf("err = %v, want refusal naming the mismatched memory entry", err)
+	}
+	if _, err := os.Stat(memDst); !os.IsNotExist(err) {
+		t.Errorf("mismatched memory entry must not be installed")
+	}
+
+	// An ID that does not exist in the manifest at all is refused too.
+	unknown := Entry{ID: 999, Category: session.CatSession, Src: memSrc, Dst: memDst, Size: 8, Mode: 0o600, SHA256: sha("# notes\n")}
+	_, err = Install(context.Background(), m, st, staging, p, InstallExtras{Memory: []Entry{unknown}})
+	if err == nil || !strings.Contains(err.Error(), "not a manifest entry") {
+		t.Fatalf("err = %v, want refusal for unknown memory id", err)
+	}
+}
+
 func TestUninstallRemovesOnlyMatching(t *testing.T) {
 	m, staging, p := staged(t)
 	st, _ := Diff(context.Background(), m, staging)
