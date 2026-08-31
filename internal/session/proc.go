@@ -8,9 +8,6 @@ import (
 	"strings"
 )
 
-// ProcRoot is where /proc is mounted. Tests point it at a fixture tree.
-var ProcRoot = "/proc"
-
 // ProcStartTime returns field 22 (starttime) of /proc/<pid>/stat as a
 // string, the value Claude Code stores as procStart.
 func ProcStartTime(procRoot string, pid int) (string, error) {

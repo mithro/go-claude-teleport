@@ -36,7 +36,7 @@ func listSessions(p session.Paths, probe session.PaneProbe) ([]listRow, error) {
 	}
 	running := map[string]session.Registry{}
 	for _, r := range regs {
-		if session.ProcAlive(session.ProcRoot, r.PID, r.ProcStart) {
+		if session.ProcAlive(p.ProcRoot, r.PID, r.ProcStart) {
 			running[r.SessionID] = r
 		}
 	}

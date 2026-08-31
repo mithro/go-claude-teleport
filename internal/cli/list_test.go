@@ -61,11 +61,8 @@ func (f *fakeProbe) SocketPath() string { return f.socket }
 // placeholder pane must mark its session suspended, but a live registry
 // entry for the same session id still wins.
 func TestListSuspendedViaProbe(t *testing.T) {
-	old := session.ProcRoot
-	session.ProcRoot = "../session/testdata/proc"
-	t.Cleanup(func() { session.ProcRoot = old })
-
 	p := session.NewPaths("/home/alice", "../session/testdata/config", "/tmp/xdg")
+	p.ProcRoot = "../session/testdata/proc"
 
 	// pid 41234 (session 3f9c...) is alive in the fixture /proc, so its
 	// registry entry marks it running even though a pane also claims it via

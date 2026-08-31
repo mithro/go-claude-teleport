@@ -90,7 +90,7 @@ func Load(p Paths, id ID, probe PaneProbe) (*Session, error) {
 	}
 	for i := range regs {
 		r := regs[i]
-		if r.SessionID != string(id) || !ProcAlive(ProcRoot, r.PID, r.ProcStart) {
+		if r.SessionID != string(id) || !ProcAlive(p.ProcRoot, r.PID, r.ProcStart) {
 			continue
 		}
 		s.State, s.Registry, s.Name = StateRunning, &r, r.Name
@@ -146,7 +146,7 @@ func liveRegistry(p Paths) ([]Registry, error) {
 	}
 	var live []Registry
 	for _, r := range regs {
-		if ProcAlive(ProcRoot, r.PID, r.ProcStart) {
+		if ProcAlive(p.ProcRoot, r.PID, r.ProcStart) {
 			live = append(live, r)
 		}
 	}

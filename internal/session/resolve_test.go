@@ -40,13 +40,10 @@ func (f *fakeProbe) ListPanes() ([]PaneInfo, error) {
 }
 func (f *fakeProbe) SocketPath() string { return f.socket }
 
-func fixturePaths() Paths { return NewPaths("/home/alice", "testdata/config", "/tmp/xdg") }
-
-func useFixtureProc(t *testing.T) {
-	t.Helper()
-	old := ProcRoot
-	ProcRoot = "testdata/proc"
-	t.Cleanup(func() { ProcRoot = old })
+func fixturePaths() Paths {
+	p := NewPaths("/home/alice", "testdata/config", "/tmp/xdg")
+	p.ProcRoot = "testdata/proc"
+	return p
 }
 
 func TestProcAlive(t *testing.T) {
@@ -65,7 +62,6 @@ func TestProcAlive(t *testing.T) {
 }
 
 func TestLoadRunning(t *testing.T) {
-	useFixtureProc(t)
 	probe := &fakeProbe{socket: "/tmp/tmux-1000/default"}
 	s, err := Load(fixturePaths(), sidA, probe)
 	if err != nil {
@@ -84,7 +80,6 @@ func TestLoadRunning(t *testing.T) {
 }
 
 func TestLoadStaleRegistryIsIdle(t *testing.T) {
-	useFixtureProc(t)
 	s, err := Load(fixturePaths(), sidB, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +90,6 @@ func TestLoadStaleRegistryIsIdle(t *testing.T) {
 }
 
 func TestLoadSuspendedViaPlaceholderPane(t *testing.T) {
-	useFixtureProc(t)
 	probe := &fakeProbe{socket: "/tmp/tmux-1000/default",
 		panes: map[string]struct {
 			argv []string
@@ -119,7 +113,6 @@ func TestLoadNotFound(t *testing.T) {
 }
 
 func TestResolve(t *testing.T) {
-	useFixtureProc(t)
 	p := fixturePaths()
 	probe := &fakeProbe{socket: "/tmp/tmux-1000/default",
 		panes: map[string]struct {
@@ -161,7 +154,6 @@ func TestResolve(t *testing.T) {
 }
 
 func TestResolveAmbiguousPrefix(t *testing.T) {
-	useFixtureProc(t)
 	// both fixture transcripts live in the same project dir; a prefix that
 	// matches neither uuid but matches two names is simulated with a
 	// common hex prefix: none exists, so craft the ambiguity via ID prefixes

@@ -16,6 +16,7 @@ type Paths struct {
 	ConfigDir  string // ~/.claude or $CLAUDE_CONFIG_DIR
 	GlobalJSON string // ~/.claude.json, or <ConfigDir>/.claude.json when CLAUDE_CONFIG_DIR is set
 	DataDir    string // claude-teleport data dir (jobs/, staging/)
+	ProcRoot   string // where /proc is mounted; tests point it at a fixture tree
 }
 
 // NewPaths computes Paths from the three environment inputs. configDirEnv is
@@ -27,7 +28,7 @@ type Paths struct {
 // projects/, sessions/ and backups/; $HOME/.claude.json is untouched.
 // Without the variable the file is $HOME/.claude.json, next to $HOME/.claude/.
 func NewPaths(home, configDirEnv, xdgDataHome string) Paths {
-	p := Paths{Home: home}
+	p := Paths{Home: home, ProcRoot: "/proc"}
 	if configDirEnv != "" {
 		p.ConfigDir = configDirEnv
 		p.GlobalJSON = filepath.Join(configDirEnv, ".claude.json")
