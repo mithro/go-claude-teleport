@@ -25,7 +25,7 @@ func TestVersionCommand(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("exit %d", code)
 	}
-	if !strings.HasPrefix(out, "claude-teleport dev (protocol 1)") {
+	if !strings.HasPrefix(out, "claude-teleport dev (protocol 2)") {
 		t.Fatalf("stdout = %q", out)
 	}
 }

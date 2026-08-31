@@ -7,11 +7,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/version"
 )
 
@@ -56,7 +59,7 @@ func TestServeHelloAndProtocolMismatch(t *testing.T) {
 		return HostInfo{Version: version.Version, Protocol: version.Protocol, Hostname: "big-storage.example"}, nil
 	}}
 	rs := roundTrip(t, ep,
-		`{"id":1,"op":"hello","args":{"version":"v0.3","protocol":1}}`,
+		`{"id":1,"op":"hello","args":{"version":"v0.3","protocol":2}}`,
 		`{"id":2,"op":"hello","args":{"version":"v0.3","protocol":99}}`,
 		`{"id":3,"op":"paths","args":{}}`,
 	)
@@ -66,7 +69,7 @@ func TestServeHelloAndProtocolMismatch(t *testing.T) {
 	if !rs[0].OK || rs[0].ID != 1 || !strings.Contains(string(rs[0].Result), `"hostname":"big-storage.example"`) {
 		t.Errorf("hello: %+v %s", rs[0], rs[0].Result)
 	}
-	if rs[1].OK || rs[1].Error == nil || rs[1].Error.Code != "usage" || !strings.Contains(rs[1].Error.Message, "99") || !strings.Contains(rs[1].Error.Message, "1") {
+	if rs[1].OK || rs[1].Error == nil || rs[1].Error.Code != "usage" || !strings.Contains(rs[1].Error.Message, "99") || !strings.Contains(rs[1].Error.Message, "2") {
 		t.Errorf("protocol mismatch must report both versions: %+v", rs[1].Error)
 	}
 	var pr PathsResult
@@ -107,7 +110,7 @@ func TestServeOverNetPipeStopsOnClose(t *testing.T) {
 	ep := stubEndpoint{hello: func() (HostInfo, error) { return HostInfo{Protocol: version.Protocol}, nil }}
 	done := make(chan error, 1)
 	go func() { done <- Serve(context.Background(), a, a, ep) }()
-	io.WriteString(b, `{"id":1,"op":"hello","args":{"protocol":1}}`+"\n")
+	io.WriteString(b, `{"id":1,"op":"hello","args":{"protocol":2}}`+"\n")
 	line, _ := bufio.NewReader(b).ReadString('\n')
 	if !strings.Contains(line, `"ok":true`) {
 		t.Errorf("line = %q", line)
@@ -120,5 +123,29 @@ func TestServeOverNetPipeStopsOnClose(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Serve did not return after the peer closed")
+	}
+}
+
+// TestWireStructTagsMatchGoNames is the M2 guard: the plan/inventory types
+// cross the protocol AND get persisted into the journal's opaque plan blob,
+// which planView re-decodes on resume. Tagging them must not have changed a
+// single wire byte, so every tag has to be exactly the Go field name — and
+// a future rename now has to change the tag deliberately, in sight of this
+// test, instead of silently breaking a live protocol and stored journals.
+func TestWireStructTagsMatchGoNames(t *testing.T) {
+	for _, v := range []any{gitx.Plan{}, gitx.Info{}, gitx.DestState{}, gitx.SourceFacts{},
+		tmuxx.Facts{}, tmuxx.Plan{}, tmuxx.PaneState{}, tmuxx.SessionInfo{}} {
+		rt := reflect.TypeOf(v)
+		for i := 0; i < rt.NumField(); i++ {
+			f := rt.Field(i)
+			tag, ok := f.Tag.Lookup("json")
+			if !ok {
+				t.Errorf("%s.%s has no json tag", rt, f.Name)
+				continue
+			}
+			if tag != f.Name {
+				t.Errorf("%s.%s tag is %q, want %q — that would change the wire format", rt, f.Name, tag, f.Name)
+			}
+		}
 	}
 }

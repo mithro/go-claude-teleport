@@ -3,6 +3,7 @@ module github.com/mithro/go-claude-teleport
 go 1.26
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/go-git/go-billy/v5 v5.9.0
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/google/go-cmp v0.7.0

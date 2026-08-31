@@ -26,14 +26,17 @@ type HostInfo struct {
 	HasClaudeResume  bool   `json:"has_claude_resume"`            // go-tmux-saver's claude-resume on PATH
 }
 
-// StreamKind names the bulk channels.
+// StreamKind names the bulk channels. Direction is NOT a property of the
+// kind: it lives in the stream id ("send:<n>" / "recv:<n>", see
+// splitStreamID), so tar and pack are each opened in both directions —
+// send on the producing host, recv on the consuming one.
 type StreamKind string
 
 const (
-	StreamTar     StreamKind = "tar"     // driver -> dest: transfer stream
-	StreamCapture StreamKind = "capture" // source -> driver: pane capture
-	StreamPack    StreamKind = "pack"    // source -> driver: git packfile
-	StreamLog     StreamKind = "log"     // remote job log tail
+	StreamTar     StreamKind = "tar"     // transfer stream (send and recv)
+	StreamCapture StreamKind = "capture" // pane capture (send only)
+	StreamPack    StreamKind = "pack"    // git packfile (send and recv)
+	StreamLog     StreamKind = "log"     // remote job log tail (send only)
 )
 
 type Request struct {
@@ -56,8 +59,3 @@ type Error struct {
 }
 
 func (e *Error) Error() string { return fmt.Sprintf("%s: %s", e.Code, e.Message) }
-
-// Unavailable is the explicit stub error for ops implemented in Plan 03.
-func Unavailable(op string) *Error {
-	return &Error{Code: "unavailable", Message: op + ": implemented in Plan 03"}
-}

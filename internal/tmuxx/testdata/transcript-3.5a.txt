@@ -1,0 +1,66 @@
+# tmux control-mode transcript — tmux 3.5a (big-storage), recorded for
+# go-tmux-saver issue #10. Synthetic server state; commands are the
+# exact wire lines Dial/collect/restore send. Raw stream follows.
+%begin 1787537587 285 0
+%end 1787537587 285 0
+%session-changed $0 default
+%begin 1787537587 290 1
+1787537587	3.5a	client-294073
+%end 1787537587 290 1
+%begin 1787537587 291 1
+1787537587	client-294073	default
+%end 1787537587 291 1
+%begin 1787537587 292 1
+default	0	1
+extra	0	0
+%end 1787537587 292 1
+%begin 1787537587 293 1
+default	0	h	1	*	b25d,80x24,0,0,0	0
+extra	0	w0	1	*	c19a,80x24,0,0[80x12,0,0,1,80x11,0,13,3]	0
+extra	1	ti tle"q\uote	0		b25f,80x24,0,0,2	0
+%end 1787537587 293 1
+%begin 1787537587 294 1
+default	0	0	%0	1	294035	/home/tim	big-storage	0
+extra	0	0	%1	1	294038	/home/tim	big-storage	0
+extra	0	1	%3	0	294043	/home/tim	big-storage	0
+extra	1	0	%2	1	294040	/home/tim	big-storage	0
+%end 1787537587 294 1
+%begin 1787537587 295 1
+printf 'synthetic scrollback line %d\n' 1 2 3
+tmux 3.5a
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+%end 1787537587 295 1
+%begin 1787537587 296 1
+can't find session: nosuchsession
+%error 1787537587 296 1
+%begin 1787537587 297 1
+2
+%end 1787537587 297 1
+%begin 1787537587 298 1
+%end 1787537587 298 1
+%begin 1787537587 299 1
+%end 1787537587 299 1
+%unlinked-window-add @3
+%unlinked-window-close @3
+%exit

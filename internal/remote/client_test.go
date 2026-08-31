@@ -3,6 +3,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/sshx"
@@ -24,11 +26,15 @@ import (
 
 // pipeClient wires a Client to a Local through net.Pipe; streams are opened
 // directly on the Local.
-func pipeClient(t *testing.T, l *Local) *Client {
+func pipeClient(t *testing.T, l *Local) *Client { return pipeEndpointClient(t, l) }
+
+// pipeEndpointClient is pipeClient over ANY Endpoint — a Client included,
+// which is how the chained-server case is tested (I5).
+func pipeEndpointClient(t *testing.T, ep Endpoint) *Client {
 	t.Helper()
 	a, b := net.Pipe()
-	go func() { Serve(context.Background(), b, b, l); b.Close() }()
-	c, err := NewClientConn(context.Background(), a, l.OpenStream, t.Logf)
+	go func() { Serve(context.Background(), b, b, ep); b.Close() }()
+	c, err := NewClientConn(context.Background(), a, ep.OpenStream, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,8 +58,12 @@ func TestClientHelloAndCallsOverPipe(t *testing.T) {
 		t.Errorf("Paths = %+v, want %+v", c.Paths(), wantPaths)
 	}
 	ctx := context.Background()
-	if _, err := c.InventoryGit(ctx, "/x"); !isUnavailable(err) {
-		t.Errorf("stub error must cross the wire: %v", err)
+	// InventoryGit is a real op now (local_git.go): "/x" is not a git repo,
+	// so this exercises gitx.ErrNotRepo crossing the wire as "not-found".
+	if _, err := c.InventoryGit(ctx, "/x"); err == nil {
+		t.Errorf("expected not-found for a non-repo path")
+	} else if pe := new(Error); !errors.As(err, &pe) || pe.Code != "not-found" {
+		t.Errorf("err = %v", err)
 	}
 	if _, err := c.ResolveSession(ctx, session.Selector{ID: session.ID(sid)}); err == nil {
 		t.Errorf("expected not-found")
@@ -96,9 +106,14 @@ func TestClientProtocolMismatchIsUsageError(t *testing.T) {
 	}
 }
 
-func TestClientTransferOverSSHTest(t *testing.T) {
-	// "dest" host: a Local behind an in-process sshd whose exec handler runs
-	// `<exe> remote serve` and `<exe> remote stream ...` in-process.
+// newSSHTestClient wires a Client to a fresh Local ("dest") through an
+// in-process sshd whose exec handler runs `<exe> remote serve` and
+// `<exe> remote stream ...` in-process — the same harness
+// TestClientTransferOverSSHTest used inline, factored out so other tests
+// (the pack round trip below) can reuse it without duplicating the ssh
+// dial boilerplate.
+func newSSHTestClient(t *testing.T) (*Client, *Local, session.Paths) {
+	t.Helper()
 	destPaths := testPaths(t)
 	dest := NewLocal(destPaths, "claude-teleport", LocalOptions{Logf: t.Logf})
 	exec := func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -136,15 +151,31 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sc.Close()
+	t.Cleanup(func() { sc.Close() })
 
 	c, err := NewClient(context.Background(), sc, "claude-teleport", t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	t.Cleanup(func() { c.Close() })
+	return c, dest, destPaths
+}
+
+func TestClientTransferOverSSHTest(t *testing.T) {
+	c, _, destPaths := newSSHTestClient(t)
 	if c.Info().Hostname == "" {
 		t.Errorf("hello over ssh: %+v", c.Info())
+	}
+
+	// Task 16: InventoryGit over the wire, dispatched through the same
+	// persistent `remote serve` connection (not a new exec).
+	repo := t.TempDir()
+	gitc(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "a"), []byte("a"), 0o644)
+	gitc(t, repo, "add", "a")
+	gitc(t, repo, "commit", "-q", "-m", "i")
+	if info, err := c.InventoryGit(context.Background(), repo); err != nil || info.Branch != "main" {
+		t.Errorf("InventoryGit over ssh: info=%+v err=%v", info, err)
 	}
 
 	ctx := context.Background()
@@ -156,7 +187,7 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	if st[0] != transfer.Absent {
 		t.Fatalf("diff = %v", st)
 	}
-	s, err := c.OpenStream(ctx, StreamTar, sid, "s1")
+	s, err := c.OpenStream(ctx, StreamTar, sid, "recv:1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +210,7 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	}
 
 	// a failing stream surfaces on Close with the remote stderr
-	bad, _ := c.OpenStream(ctx, StreamTar, sid, "s2")
+	bad, _ := c.OpenStream(ctx, StreamTar, sid, "recv:2")
 	io.WriteString(bad, "garbage")
 	if err := bad.Close(); err == nil || !strings.Contains(err.Error(), "gzip") {
 		t.Errorf("bad stream Close = %v, want remote gzip error", err)
@@ -193,7 +224,7 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	// performs that half-close itself for receive-direction kinds before
 	// returning the stream, so the read-then-close below is safe as written.
 	os.WriteFile(filepath.Join(job.Dir(destPaths.DataDir, sid), "log.txt"), []byte("remote log\n"), 0o600)
-	lg, err := c.OpenStream(ctx, StreamLog, sid, "l")
+	lg, err := c.OpenStream(ctx, StreamLog, sid, "send:1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,4 +241,78 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	if _, err := c.Hello(ctx); err == nil {
 		t.Errorf("calls after Close must fail")
 	}
+}
+
+// TestClientOpenStreamPackBothDirectionsOverSSH is the regression test for
+// the half-close bug fixed in this round: Client.openStream used to gate
+// its eager half-close on `kind != StreamTar`, which closed stdin on EVERY
+// pack stream immediately (pack didn't exist as a kind when that check was
+// written) — breaking a pack PUSH (recv-direction: the driver writes into
+// the stream) even though a pack PULL (send-direction: the driver only
+// reads) happened to still work by accident. The fix gates on
+// splitStreamID's parsed direction instead of the kind, so both directions
+// are exercised here over the real ssh round trip (in-process sshd).
+func TestClientOpenStreamPackBothDirectionsOverSSH(t *testing.T) {
+	c, dest, destPaths := newSSHTestClient(t)
+	ctx := context.Background()
+
+	t.Run("push (recv): driver writes pack bytes into the dest", func(t *testing.T) {
+		const jobID = "pack-push-job"
+		s, err := c.OpenStream(ctx, StreamPack, jobID, "recv:1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(s, "FAKE-PACK-BYTES"); err != nil {
+			// Under the bug, stdin was half-closed before this write ever
+			// happened: it would fail here with a broken-pipe-shaped error.
+			t.Fatalf("write pack push: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(filepath.Join(job.StagingDir(destPaths.DataDir, jobID), "objects.pack"))
+		if err != nil || string(got) != "FAKE-PACK-BYTES" {
+			t.Errorf("objects.pack = %q, err = %v", got, err)
+		}
+	})
+
+	t.Run("pull (send): driver reads a real packfile out of the source", func(t *testing.T) {
+		const jobID = "pack-pull-job"
+		repo := t.TempDir()
+		gitc(t, repo, "init", "-q", "-b", "main")
+		os.WriteFile(filepath.Join(repo, "a"), []byte("a"), 0o644)
+		gitc(t, repo, "add", "a")
+		gitc(t, repo, "commit", "-q", "-m", "i")
+		tip := strings.TrimSpace(gitc(t, repo, "rev-parse", "HEAD"))
+
+		// dest doubles as the pack-send "source" host here: any Local can
+		// serve either direction, keyed only by the journal's plan.
+		planBytes, err := json.Marshal(planView{Git: &gitx.Plan{SrcMain: repo, Tip: tip, PackEntryID: gitx.NoEntry, IndexEntryID: gitx.NoEntry}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		j, err := job.New(destPaths.DataDir, jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		j.Plan = planBytes
+		if err := dest.JournalPut(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+
+		s, err := c.OpenStream(ctx, StreamPack, jobID, "send:1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, s); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if buf.Len() == 0 || !bytes.HasPrefix(buf.Bytes(), []byte("PACK")) {
+			t.Errorf("pack pull = %d bytes, prefix %q, want a git packfile (PACK magic)", buf.Len(), buf.Bytes()[:min(4, buf.Len())])
+		}
+	})
 }

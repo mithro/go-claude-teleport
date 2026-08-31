@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/mithro/go-claude-teleport/internal/session"
-	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
 // maxLine bounds one request/response line (manifests can be large).
@@ -30,9 +29,29 @@ func decode[T any](args json.RawMessage) (T, error) {
 	return v, nil
 }
 
-// dispatch is the op-name -> handler table. Every op's args/result types
-// live in ops.go so Client and Server cannot drift apart.
-var dispatch = map[string]handler{
+// dispatch is THE op-name -> handler table: Plan 02's ops below, merged
+// with Plan 03's (ops_plan03.go). Every op's args/result types live in
+// ops.go or ops_plan03.go so Client and Server cannot drift apart, and
+// every handler takes an Endpoint, so handle needs exactly one lookup and
+// no concrete-type assertion.
+var dispatch = mergeOps(plan02Ops, plan03Ops)
+
+// mergeOps builds the dispatch table, refusing (loudly, at init) to let two
+// tables claim the same op name.
+func mergeOps(tables ...map[string]handler) map[string]handler {
+	out := map[string]handler{}
+	for _, t := range tables {
+		for op, h := range t {
+			if _, dup := out[op]; dup {
+				panic("remote: duplicate op in the dispatch table: " + op)
+			}
+			out[op] = h
+		}
+	}
+	return out
+}
+
+var plan02Ops = map[string]handler{
 	OpHello: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {
 		a, err := decode[HelloArgs](args)
 		if err != nil {
@@ -113,13 +132,7 @@ var dispatch = map[string]handler{
 		if err != nil {
 			return nil, err
 		}
-		p, ok := ep.(interface {
-			PutInstallExtras(ctx context.Context, jobID string, extra transfer.InstallExtras) error
-		})
-		if !ok {
-			return nil, Unavailable(OpInstallExtras)
-		}
-		return Empty{}, p.PutInstallExtras(ctx, a.JobID, a.Extra)
+		return Empty{}, ep.PutInstallExtras(ctx, a.JobID, a.Extra)
 	},
 	OpInstall: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {
 		a, err := decode[InstallArgs](args)
@@ -315,52 +328,7 @@ func Serve(ctx context.Context, r io.Reader, w io.Writer, ep Endpoint) error {
 	return nil
 }
 
-// ServeStream handles `remote stream <kind> <job> <id>`: connects stdin/stdout
-// to the local stream endpoint returned by ep.OpenStream. Bytes read from
-// stdin are copied INTO the stream; bytes read from the stream are copied to
-// stdout. The two directions run concurrently in separate goroutines, and
-// the stream is only Close()d once BOTH have finished.
-//
-// Half-close contract (spec deadlock/truncation fix): the client signals
-// "no more inbound data" by closing (or half-closing the write side of) its
-// stdin; ServeStream treats that stdin EOF as end-of-inbound for every
-// StreamKind, including StreamTar where the client is actively sending a
-// large payload. For the receive-direction kinds (StreamCapture, StreamPack,
-// StreamLog: this host produces data, the client only reads) the client has
-// nothing to write, so Task 16's client half-closes stdin *before* it starts
-// reading stdout — if it instead waited to close stdin until after reading,
-// both sides would block forever (server stuck in the inbound copy waiting
-// for stdin EOF; client stuck reading stdout waiting for data the server
-// hasn't started sending). Because ServeStream waits for BOTH copies before
-// calling Close, that early inbound EOF can never truncate an in-flight
-// outbound copy — closing the stream only happens once whichever direction
-// actually carries the payload has fully drained.
-func ServeStream(ctx context.Context, kind StreamKind, jobID, streamID string, stdin io.Reader, stdout io.Writer, ep Endpoint) error {
-	s, err := ep.OpenStream(ctx, kind, jobID, streamID)
-	if err != nil {
-		return err
-	}
-	inDone := make(chan error, 1)
-	go func() {
-		_, err := io.Copy(s, stdin)
-		inDone <- err
-	}()
-	outDone := make(chan error, 1)
-	go func() {
-		_, err := io.Copy(stdout, s)
-		outDone <- err
-	}()
-	inErr := <-inDone
-	outErr := <-outDone
-	closeErr := s.Close()
-	if inErr != nil {
-		return fmt.Errorf("stream %s/%s: stdin: %w", kind, streamID, inErr)
-	}
-	if outErr != nil {
-		return fmt.Errorf("stream %s/%s: stdout: %w", kind, streamID, outErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("stream %s/%s: %w", kind, streamID, closeErr)
-	}
-	return nil
-}
+// ServeStream is implemented in streams.go: streamID now carries the
+// direction (send:<n> / recv:<n>), so runStream already knows which of
+// stdin/stdout it needs and there is no longer a generic bidirectional pump
+// to run here.

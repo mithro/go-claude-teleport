@@ -14,22 +14,32 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 )
 
-type Dirty struct{ Staged, Modified, Untracked, Deleted []string }
+// Dirty is nested in Info and Plan, so it crosses the protocol too; tags
+// pin Go-name marshaling exactly (no wire change), as on Info and Plan.
+type Dirty struct {
+	Staged    []string `json:"Staged"`
+	Modified  []string `json:"Modified"`
+	Untracked []string `json:"Untracked"`
+	Deleted   []string `json:"Deleted"`
+}
 
+// Info crosses the protocol (inventory-git). The json tags reproduce
+// Go-name marshaling EXACTLY (field F -> "F"), so they changed no wire
+// byte; they pin the names against a future rename.
 type Info struct {
-	Root            string // worktree root (W)
-	CommonDir       string // M/.git
-	MainDir         string // M
-	IsLinked        bool
-	WorktreeName    string // basename under .git/worktrees
-	Branch          string // "" if detached
-	Head            string // hex
-	Detached        bool
-	RootCommit      string
-	Dirty           Dirty
-	Submodules      []string
-	DirtySubmodules []string // subset of Submodules whose checkout is not clean
-	OtherWorktrees  []string // absolute paths of other linked worktrees
+	Root            string   `json:"Root"`      // worktree root (W)
+	CommonDir       string   `json:"CommonDir"` // M/.git
+	MainDir         string   `json:"MainDir"`   // M
+	IsLinked        bool     `json:"IsLinked"`
+	WorktreeName    string   `json:"WorktreeName"` // basename under .git/worktrees
+	Branch          string   `json:"Branch"`       // "" if detached
+	Head            string   `json:"Head"`         // hex
+	Detached        bool     `json:"Detached"`
+	RootCommit      string   `json:"RootCommit"`
+	Dirty           Dirty    `json:"Dirty"`
+	Submodules      []string `json:"Submodules"`
+	DirtySubmodules []string `json:"DirtySubmodules"` // subset of Submodules whose checkout is not clean
+	OtherWorktrees  []string `json:"OtherWorktrees"`  // absolute paths of other linked worktrees
 }
 
 var ErrNotRepo = errors.New("not a git repository")

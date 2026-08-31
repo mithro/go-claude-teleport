@@ -576,6 +576,7 @@ func TestCreateLinkedWorktreeRefusesNonEmptyDir(t *testing.T) {
 		Mode: ModeExistingMain, Linked: true, WorktreeName: "feat", Branch: "main",
 		DstMain: dstMain, DstWorktree: filepath.Join(dstMain, ".worktrees", "feat"),
 		Tip: root, IndexRel: ".git/worktrees/feat/index",
+		PackEntryID: NoEntry, IndexEntryID: NoEntry,
 	}
 	survivor := filepath.Join(p.DstWorktree, "theirs.txt")
 	writeFile(t, survivor, "do not clobber\n")

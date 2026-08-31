@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/procx"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 	"github.com/mithro/go-claude-teleport/internal/version"
 )
@@ -33,8 +33,12 @@ type LocalOptions struct {
 	// resolves it and passes it in here.
 	TmuxSocketDir string
 
+	// Sleep is used for every bounded poll (ConfirmClaude, ExitClaude);
+	// nil defaults to time.Sleep. Tests inject a no-op / counting stub.
+	Sleep func(time.Duration)
+
 	Probe session.PaneProbe
-	Tmux  TmuxDialer // Plan 03; nil = tmux unavailable
+	Tmux  tmuxx.Dialer // nil = tmux unavailable
 	Logf  func(string, ...any)
 }
 
@@ -48,6 +52,10 @@ type Local struct {
 
 	mu       sync.Mutex
 	freezers map[int]*procx.Freezer
+
+	// procs scans the process table (opts.ProcRoot); shared by the tmux
+	// and Claude ops so a poll loop's every iteration rescans fresh.
+	procs func() (*procx.Table, error)
 }
 
 func NewLocal(p session.Paths, selfExe string, opts LocalOptions) *Local {
@@ -58,8 +66,12 @@ func NewLocal(p session.Paths, selfExe string, opts LocalOptions) *Local {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
+	if opts.Sleep == nil {
+		opts.Sleep = time.Sleep
+	}
 	host, _ := os.Hostname()
-	return &Local{paths: p, selfExe: selfExe, opts: opts, Hostname: host, freezers: map[int]*procx.Freezer{}}
+	return &Local{paths: p, selfExe: selfExe, opts: opts, Hostname: host, freezers: map[int]*procx.Freezer{},
+		procs: func() (*procx.Table, error) { return procx.Scan(opts.ProcRoot) }}
 }
 
 var _ Endpoint = (*Local)(nil)
@@ -128,15 +140,13 @@ func (l *Local) InventoryHost(ctx context.Context, cwd, claudeVersion string) (*
 	return claudecfg.Collect(l.paths, cwd, l.Hostname, claudeVersion)
 }
 
-func (l *Local) InventoryGit(ctx context.Context, cwd string) (*GitInfo, error) {
-	return nil, Unavailable(OpInventoryGit)
-}
-func (l *Local) GitDestState(ctx context.Context, mainDir, worktreeDir, branch string) (*GitDestState, error) {
-	return nil, Unavailable(OpGitDestState)
-}
-func (l *Local) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket string) (*TmuxFacts, error) {
-	return nil, Unavailable(OpInventoryTmux)
-}
+// InventoryGit, GitDestState, GitFiles, GitSourceFacts and GitAttach are
+// implemented in local_git.go.
+
+// InventoryTmux, TmuxSessions, OpenWindow, Capture, TypeCommand, PaneState
+// and KillWindow are implemented in local_tmux.go. StartClaude,
+// ConfirmClaude, ExitClaude and ClaudeStatus are implemented in
+// local_claude.go. RunPtyResume is implemented in local_pty.go.
 
 func (l *Local) jobDir(jobID string) string     { return job.Dir(l.paths.DataDir, jobID) }
 func (l *Local) stagingDir(jobID string) string { return job.StagingDir(l.paths.DataDir, jobID) }
@@ -169,75 +179,8 @@ func (l *Local) PutInstallExtras(ctx context.Context, jobID string, extra transf
 	return os.WriteFile(l.extrasPath(jobID), raw, 0o600)
 }
 
-// tarStream is the write side of a receive: bytes written go to Receive;
-// Close waits for it and returns its verdict.
-//
-// Contract (controller ruling, Task 15): a tarStream is send-direction only
-// — the driver writes the tar payload into it, nothing flows back out. Its
-// Read must therefore never block: it always returns (0, io.EOF) so that
-// ServeStream's concurrent "copy the stream to stdout" goroutine (which runs
-// unconditionally for every stream kind) finishes immediately instead of
-// hanging on a direction nobody uses.
-type tarStream struct {
-	pw   *io.PipeWriter
-	done chan error
-	once sync.Once
-	err  error
-}
-
-func (t *tarStream) Read(p []byte) (int, error)  { return 0, io.EOF }
-func (t *tarStream) Write(p []byte) (int, error) { return t.pw.Write(p) }
-func (t *tarStream) Close() error {
-	t.once.Do(func() {
-		t.pw.Close()
-		t.err = <-t.done
-	})
-	return t.err
-}
-
-// readStream is the read side of a receive-direction stream (capture, log):
-// this host produces data, the client only reads. Its Write must never
-// block: it fails immediately instead of hanging on a direction nobody uses
-// (see tarStream's contract note above; ServeStream always runs both
-// directions concurrently regardless of stream kind).
-type readStream struct{ io.ReadCloser }
-
-func (r readStream) Write(p []byte) (int, error) { return 0, errors.New("read-only stream") }
-
-func (l *Local) OpenStream(ctx context.Context, kind StreamKind, jobID, streamID string) (io.ReadWriteCloser, error) {
-	switch kind {
-	case StreamTar:
-		m, err := transfer.Load(filepath.Join(l.jobDir(jobID), "manifest.json"))
-		if err != nil {
-			return nil, fmt.Errorf("stream tar %s: manifest-diff must run first: %w", jobID, err)
-		}
-		pr, pw := io.Pipe()
-		t := &tarStream{pw: pw, done: make(chan error, 1)}
-		go func() {
-			err := transfer.Receive(ctx, m, pr, l.stagingDir(jobID), func(e transfer.Entry, n int64) {
-				l.opts.Logf("received entry %d %s (%d bytes total)", e.ID, e.Dst, n)
-			})
-			pr.CloseWithError(err)
-			t.done <- err
-		}()
-		return t, nil
-	case StreamCapture:
-		f, err := os.Open(filepath.Join(l.jobDir(jobID), "capture.txt"))
-		if err != nil {
-			return nil, fmt.Errorf("stream capture %s: %w", jobID, err)
-		}
-		return readStream{f}, nil
-	case StreamLog:
-		f, err := os.Open(filepath.Join(l.jobDir(jobID), "log.txt"))
-		if err != nil {
-			return nil, fmt.Errorf("stream log %s: %w", jobID, err)
-		}
-		return readStream{f}, nil
-	case StreamPack:
-		return nil, Unavailable("stream pack")
-	}
-	return nil, &Error{Code: "usage", Message: "unknown stream kind " + string(kind)}
-}
+// OpenStream is implemented in streams.go (runStream drives all four kinds,
+// keyed by the direction streamID carries).
 
 func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string) (*transfer.InstallReport, error) {
 	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID))
@@ -254,10 +197,6 @@ func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string)
 		return nil, err
 	}
 	return transfer.Install(ctx, m, st, l.stagingDir(jobID), l.paths, extra)
-}
-
-func (l *Local) GitAttach(ctx context.Context, plan *GitPlan, jobID string) error {
-	return Unavailable(OpGitAttach)
 }
 
 func (l *Local) Freeze(ctx context.Context, pid int, startTime string) error {
@@ -283,31 +222,6 @@ func (l *Local) Thaw(ctx context.Context, pid int) error {
 		return nil // not frozen by us: no-op (spec §6 step 9)
 	}
 	return f.Thaw()
-}
-
-func (l *Local) Capture(ctx context.Context, ref *session.TmuxRef, jobID string) error {
-	return Unavailable(OpCapture)
-}
-func (l *Local) OpenWindow(ctx context.Context, p *TmuxPlan) (*session.TmuxRef, error) {
-	return nil, Unavailable(OpOpenWindow)
-}
-func (l *Local) StartClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, jobID string, argv []string) error {
-	return Unavailable(OpStartClaude)
-}
-func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration) (*session.Registry, error) {
-	return nil, Unavailable(OpConfirmClaude)
-}
-func (l *Local) ExitClaude(ctx context.Context, ref *session.TmuxRef, pid int, startTime string, timeout time.Duration) error {
-	return Unavailable(OpExitClaude)
-}
-func (l *Local) TypeCommand(ctx context.Context, ref *session.TmuxRef, argv []string) error {
-	return Unavailable(OpTypeCommand)
-}
-func (l *Local) PaneState(ctx context.Context, ref *session.TmuxRef) (*TmuxPaneState, error) {
-	return nil, Unavailable(OpPaneState)
-}
-func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, timeout time.Duration) error {
-	return Unavailable(OpRunPtyResume)
 }
 
 func (l *Local) JournalGet(ctx context.Context, jobID string) (*job.Journal, bool, error) {

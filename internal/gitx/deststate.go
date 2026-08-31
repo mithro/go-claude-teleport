@@ -11,20 +11,23 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 )
 
+// DestState crosses the protocol (git-dest-state). The json tags reproduce
+// Go-name marshaling EXACTLY (field F -> "F"), so they changed no wire
+// byte; they pin the names against a future rename.
 type DestState struct {
-	MainExists                bool
-	RootCommit                string
-	RefTips                   map[string]string // refs/heads/x -> hex
-	BranchTip                 string            // "" if absent
-	WorktreeExists            bool
-	WorktreeBranch            string // branch checked out at worktreeDir if it exists
-	WorktreeDetached          bool   // worktreeDir is a checkout with a detached HEAD
-	Clean                     bool   // for W==M case
-	BranchCheckedOutElsewhere string // path, if the branch is checked out in another worktree
+	MainExists                bool              `json:"MainExists"`
+	RootCommit                string            `json:"RootCommit"`
+	RefTips                   map[string]string `json:"RefTips"`   // refs/heads/x -> hex
+	BranchTip                 string            `json:"BranchTip"` // "" if absent
+	WorktreeExists            bool              `json:"WorktreeExists"`
+	WorktreeBranch            string            `json:"WorktreeBranch"`            // branch checked out at worktreeDir if it exists
+	WorktreeDetached          bool              `json:"WorktreeDetached"`          // worktreeDir is a checkout with a detached HEAD
+	Clean                     bool              `json:"Clean"`                     // for W==M case
+	BranchCheckedOutElsewhere string            `json:"BranchCheckedOutElsewhere"` // path, if the branch is checked out in another worktree
 	// BranchTipReachable is NOT computed by DestStateOf: the orchestrator
 	// sets it on the source (IsAncestor(srcMain, BranchTip, Tip)) before
 	// PlanTransfer, which needs it for the fast-forward decision.
-	BranchTipReachable bool
+	BranchTipReachable bool `json:"BranchTipReachable"`
 }
 
 // DestStateOf describes what the destination already has (spec §8).
