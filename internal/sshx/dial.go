@@ -21,6 +21,7 @@ type Options struct {
 	Logf           func(string, ...any)
 	Home           string                                                            // for "~" in identity files
 	NetDial        func(ctx context.Context, network, addr string) (net.Conn, error) // first hop only; nil = net.Dialer
+	LocalUser      string                                                            // user for jump hops with no explicit user (falls back to r.User if empty)
 }
 
 func (o Options) logf() func(string, ...any) {
@@ -89,9 +90,17 @@ func clientConfig(r Resolved, o Options) (*ssh.ClientConfig, func(), error) {
 // and silently change, the jump hosts along the way.
 func Dial(ctx context.Context, r Resolved, cfg *ssh_config.Config, overrides map[string]string, o Options) (*Client, error) {
 	logf := o.logf()
+	// Jump hops authenticate as the LOCAL user (o.LocalUser) when they have
+	// no explicit user of their own, never as the target's resolved user
+	// (r.User): the jump host and the target are different machines that
+	// may have entirely different accounts for the same person.
+	jumpLocalUser := o.LocalUser
+	if jumpLocalUser == "" {
+		jumpLocalUser = r.User
+	}
 	hops := make([]Resolved, 0, len(r.Via)+1)
 	for _, v := range r.Via {
-		rv, err := Resolve(v, cfg, nil, r.User)
+		rv, err := Resolve(v, cfg, nil, jumpLocalUser)
 		if err != nil {
 			return nil, fmt.Errorf("jump %s: %w", v.Host, err)
 		}

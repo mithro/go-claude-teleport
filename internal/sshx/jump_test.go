@@ -72,6 +72,57 @@ func TestDialThroughJumpResolvesOnJump(t *testing.T) {
 	}
 }
 
+// TestDialThroughJumpAuthenticatesAsLocalUser covers the case where the
+// target has an explicit user but the jump hop does not: the jump hop MUST
+// authenticate as the local user (Options.LocalUser), never as the
+// target's resolved user (they can be different accounts on different
+// machines).
+func TestDialThroughJumpAuthenticatesAsLocalUser(t *testing.T) {
+	home, pub := testHome(t)
+	dest := sshtest.New(t, sshtest.Options{Authorized: []ssh.PublicKey{pub}, Exec: echoExec})
+	jump := sshtest.New(t, sshtest.Options{
+		Authorized: []ssh.PublicKey{pub},
+		Resolver:   map[string]string{"dest.private": dest.Addr},
+	})
+	jumpHost, jumpPort := hostPort(t, jump.Addr)
+
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+	os.WriteFile(kh, []byte(
+		sshtest.KnownHostsLine(knownHostsName(jumpHost, jumpPort), jump.HostKey)+
+			sshtest.KnownHostsLine("[dest.private]:2222", dest.HostKey)), 0o600)
+
+	// target has an explicit user; the jump hop (Via) does not.
+	r := Resolved{
+		Target:   Target{User: "bob", Host: "big-storage", Port: 2222, Via: []Target{{Host: jumpHost, Port: jumpPort}}},
+		HostName: "dest.private",
+	}
+	c, err := Dial(context.Background(), r, nil, nil, Options{KnownHostsFile: kh, Home: home, Logf: t.Logf, LocalUser: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	jumpUsers := jump.Users()
+	if len(jumpUsers) == 0 {
+		t.Fatal("jump recorded no authenticated users")
+	}
+	for _, u := range jumpUsers {
+		if u != "alice" {
+			t.Errorf("jump saw user %q, want local user %q (not target user %q)", u, "alice", "bob")
+		}
+	}
+
+	destUsers := dest.Users()
+	if len(destUsers) == 0 {
+		t.Fatal("dest recorded no authenticated users")
+	}
+	for _, u := range destUsers {
+		if u != "bob" {
+			t.Errorf("dest saw user %q, want target user %q", u, "bob")
+		}
+	}
+}
+
 func TestRedialBoundedRetries(t *testing.T) {
 	sentinelErr := errors.New("refused")
 	calls := 0

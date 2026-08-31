@@ -35,6 +35,7 @@ type Server struct {
 	mu     sync.Mutex
 	fwd    []string
 	execs  []string
+	users  []string
 	wg     sync.WaitGroup
 }
 
@@ -50,6 +51,9 @@ func New(t testing.TB, o Options) *Server {
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			for _, k := range o.Authorized {
 				if bytes.Equal(k.Marshal(), key.Marshal()) {
+					s.mu.Lock()
+					s.users = append(s.users, conn.User())
+					s.mu.Unlock()
 					return &ssh.Permissions{}, nil
 				}
 			}
@@ -84,6 +88,16 @@ func (s *Server) Execs() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]string(nil), s.execs...)
+}
+
+// Users lists the ssh usernames (conn.User()) that authenticated
+// successfully, in order (may contain duplicates: the client library
+// probes a key before signing with it, so one handshake can record the
+// same user twice).
+func (s *Server) Users() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.users...)
 }
 
 func (s *Server) acceptLoop() {

@@ -129,6 +129,7 @@ func dialTarget(ctx context.Context, target string, via []string, opts []string,
 		AgentSocket:    envValue(env, "SSH_AUTH_SOCK"),
 		Home:           home,
 		Logf:           logf,
+		LocalUser:      localUser,
 	}
 	if kh, ok := r.Options["UserKnownHostsFile"]; ok {
 		o.KnownHostsFile = kh
