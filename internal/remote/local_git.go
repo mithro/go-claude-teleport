@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
 func (l *Local) InventoryGit(ctx context.Context, cwd string) (*gitx.Info, error) {
@@ -51,12 +53,30 @@ func (l *Local) GitSourceFacts(ctx context.Context, mainDir, indexRel, tip, dest
 	return f, nil
 }
 
+// entryModes reads jobs/<jobID>/manifest.json (already saved there by
+// ManifestDiff) and returns each entry's Mode by id. A missing manifest is
+// not an error here — GitAttach can be called without one ever having been
+// saved (e.g. directly, as some tests do) — entryModes then simply returns
+// nil and every lookup misses, leaving DirtyFile.Mode zero (gitx.Attach's
+// documented "keep the staged file's own mode" fallback).
+func (l *Local) entryModes(jobID string) map[int]fs.FileMode {
+	m, err := transfer.Load(filepath.Join(l.jobDir(jobID), "manifest.json"))
+	if err != nil {
+		return nil
+	}
+	modes := make(map[int]fs.FileMode, len(m.Entries))
+	for _, e := range m.Entries {
+		modes[e.ID] = fs.FileMode(e.Mode)
+	}
+	return modes
+}
+
 // GitAttach resolves the pack and dirty files from this host's staging
 // directory (jobs are keyed by session id, staging by job id) and calls
 // gitx.Attach. The pack arrives via the pack stream (Task 16) as
-// staging/<job>/objects.pack; dirty files are staged manifest entries, and
-// land with the staged copy's own mode (gitx.DirtyFile.Mode left zero) —
-// Task 13 has no mode information of its own to give them.
+// staging/<job>/objects.pack; dirty files are staged manifest entries and
+// land with the mode the manifest recorded for that entry id, or the
+// staged copy's own mode when the manifest has no entry for it.
 func (l *Local) GitAttach(ctx context.Context, p *gitx.Plan, jobID string) error {
 	staging := job.StagingDir(l.paths.DataDir, jobID)
 	packPath := ""
@@ -66,12 +86,13 @@ func (l *Local) GitAttach(ctx context.Context, p *gitx.Plan, jobID string) error
 			return &Error{Code: "not-found", Message: fmt.Sprintf("git-attach: pack %s: %v", packPath, err)}
 		}
 	}
+	modes := l.entryModes(jobID)
 	dirty := map[string]gitx.DirtyFile{}
 	for dst, id := range p.DirtyEntries {
-		dirty[dst] = gitx.DirtyFile{Src: filepath.Join(staging, strconv.Itoa(id))}
+		dirty[dst] = gitx.DirtyFile{Src: filepath.Join(staging, strconv.Itoa(id)), Mode: modes[id]}
 	}
 	if p.IndexEntryID >= 0 { // gitx.NoEntry (-1) means "no index entry"; 0 is a real id
-		dirty[filepath.Join(p.DstMain, p.IndexRel)] = gitx.DirtyFile{Src: filepath.Join(staging, strconv.Itoa(p.IndexEntryID))}
+		dirty[filepath.Join(p.DstMain, p.IndexRel)] = gitx.DirtyFile{Src: filepath.Join(staging, strconv.Itoa(p.IndexEntryID)), Mode: modes[p.IndexEntryID]}
 	}
 	for dst, df := range dirty {
 		if _, err := os.Stat(df.Src); err != nil {

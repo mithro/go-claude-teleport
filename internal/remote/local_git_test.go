@@ -11,6 +11,7 @@ import (
 
 	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/job"
+	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
 func gitc(t *testing.T, dir string, args ...string) string {
@@ -91,6 +92,49 @@ func TestLocalGitAttachUsesStagingPaths(t *testing.T) {
 	}
 	if !strings.Contains(gitc(t, main, "worktree", "list"), w) {
 		t.Error("git does not list the new worktree")
+	}
+}
+
+// TestLocalGitAttachAppliesManifestEntryMode is task 20 point C: a dirty
+// worktree file lands with the mode its manifest entry recorded, not
+// whatever mode the staged copy on disk happens to carry.
+func TestLocalGitAttachAppliesManifestEntryMode(t *testing.T) {
+	p := testPaths(t)
+	main := filepath.Join(p.Home, "x")
+	os.MkdirAll(main, 0o755)
+	gitc(t, main, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(main, "a.txt"), []byte("a"), 0o644)
+	gitc(t, main, "add", "a.txt")
+	gitc(t, main, "commit", "-q", "-m", "init")
+	tip := strings.TrimSpace(gitc(t, main, "rev-parse", "HEAD"))
+	jobID := "3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c"
+	staging := job.StagingDir(p.DataDir, jobID)
+	os.MkdirAll(staging, 0o700)
+	content := []byte("#!/bin/sh\necho hi\n")
+	os.WriteFile(filepath.Join(staging, "7"), content, 0o644) // staged with 0644...
+
+	w := filepath.Join(main, ".worktrees", "feat")
+	m := &transfer.Manifest{Version: 1, JobID: jobID, Entries: []transfer.Entry{
+		{ID: 7, Dst: filepath.Join(w, "run.sh"), Size: int64(len(content)), Mode: 0o755}, // ...but the manifest says 0755 (executable)
+	}}
+	l := NewLocal(p, "/usr/local/bin/claude-teleport", LocalOptions{ProcRoot: "/proc"})
+	if err := m.Save(filepath.Join(l.jobDir(jobID), "manifest.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := &gitx.Plan{Mode: gitx.ModeExistingMain, SrcMain: "/home/alice/x", SrcWorktree: "/home/alice/x/.worktrees/feat",
+		DstMain: main, DstWorktree: w, Linked: true, WorktreeName: "feat", Branch: "feat", Tip: tip, NeedPack: false,
+		IndexRel: ".git/worktrees/feat/index", IndexEntryID: gitx.NoEntry, PackEntryID: gitx.NoEntry,
+		DirtyEntries: map[string]int{filepath.Join(w, "run.sh"): 7}}
+	if err := l.GitAttach(context.Background(), plan, jobID); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(filepath.Join(w, "run.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Errorf("run.sh mode = %o, want 0755 (from the manifest entry, not the staged copy's 0644)", st.Mode().Perm())
 	}
 }
 
