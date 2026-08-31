@@ -74,3 +74,27 @@ func TestLocalOpenWindowAndKill(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCaptureRejectsNilRef(t *testing.T) {
+	l := NewLocal(testPaths(t), "x", LocalOptions{ProcRoot: "/proc"})
+	err := l.Capture(context.Background(), nil, "3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c")
+	if e, ok := err.(*Error); !ok || e.Code != "usage" {
+		t.Fatalf("err = %v, want Error{Code: usage}", err)
+	}
+}
+
+func TestPaneStateRejectsNilRef(t *testing.T) {
+	l := NewLocal(testPaths(t), "x", LocalOptions{ProcRoot: "/proc"})
+	_, err := l.PaneState(context.Background(), nil)
+	if e, ok := err.(*Error); !ok || e.Code != "usage" {
+		t.Fatalf("err = %v, want Error{Code: usage}", err)
+	}
+}
+
+func TestKillWindowRejectsNilRef(t *testing.T) {
+	l := NewLocal(testPaths(t), "x", LocalOptions{ProcRoot: "/proc"})
+	err := l.KillWindow(context.Background(), nil)
+	if e, ok := err.(*Error); !ok || e.Code != "usage" {
+		t.Fatalf("err = %v, want Error{Code: usage}", err)
+	}
+}

@@ -77,6 +77,9 @@ func (l *Local) OpenWindow(ctx context.Context, p *tmuxx.Plan) (*session.TmuxRef
 
 // Capture writes jobs/<jobID>/capture.txt on this host.
 func (l *Local) Capture(ctx context.Context, ref *session.TmuxRef, jobID string) error {
+	if ref == nil {
+		return &Error{Code: "usage", Message: "capture: nil pane ref"}
+	}
 	t, err := l.dial(ctx, ref.SocketPath)
 	if err != nil {
 		return err
@@ -110,6 +113,9 @@ func (l *Local) TypeCommand(ctx context.Context, ref *session.TmuxRef, argv []st
 }
 
 func (l *Local) PaneState(ctx context.Context, ref *session.TmuxRef) (*tmuxx.PaneState, error) {
+	if ref == nil {
+		return nil, &Error{Code: "usage", Message: "pane-state: nil pane ref"}
+	}
 	t, err := l.dial(ctx, ref.SocketPath)
 	if err != nil {
 		return nil, err
@@ -127,6 +133,9 @@ func (l *Local) PaneState(ctx context.Context, ref *session.TmuxRef) (*tmuxx.Pan
 }
 
 func (l *Local) KillWindow(ctx context.Context, ref *session.TmuxRef) error {
+	if ref == nil {
+		return &Error{Code: "usage", Message: "kill-window: nil pane ref"}
+	}
 	t, err := l.dial(ctx, ref.SocketPath)
 	if err != nil {
 		return err
