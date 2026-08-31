@@ -20,7 +20,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, body []byte) {
 	inTokens := estimateTokens(body)
 	outTokens := estimateTokens([]byte(s.opts.Reply))
 	if !req.Stream {
-		writeJSON(w, 200, map[string]any{
+		s.writeJSON(w, 200, map[string]any{
 			"id": id, "type": "message", "role": "assistant", "model": s.opts.Model,
 			"content":     []map[string]string{{"type": "text", "text": s.opts.Reply}},
 			"stop_reason": "end_turn", "stop_sequence": nil,
@@ -33,7 +33,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, body []byte) {
 	w.WriteHeader(200)
 	fl, _ := w.(http.Flusher)
 	event := func(name string, v any) {
-		raw, _ := json.Marshal(v)
+		raw, err := json.Marshal(v)
+		if err != nil {
+			s.errf("Marshal event %s: %v", name, err)
+			return
+		}
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, raw)
 		if fl != nil {
 			fl.Flush()

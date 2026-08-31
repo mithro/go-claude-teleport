@@ -151,3 +151,44 @@ func TestLogDirWritesOneFilePerRequest(t *testing.T) {
 		t.Errorf("log file = %s", raw)
 	}
 }
+
+func TestLogDirUnwritableStillSucceeds(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("test runs as non-root")
+	}
+	dir := t.TempDir()
+	// Create an unwritable subdirectory
+	unwritable := filepath.Join(dir, "unwritable")
+	if err := os.Mkdir(unwritable, 0o500); err != nil {
+		t.Fatalf("mkdir %s: %v", unwritable, err)
+	}
+	defer os.Chmod(unwritable, 0o755)
+
+	s, ts := newTestServer(t, Options{Reply: "ok", Model: "m", LogDir: unwritable})
+	resp, err := http.Post(ts.URL+"/v1/messages", "application/json", strings.NewReader(`{"a":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	// Request should still succeed (200, not error)
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	// But the server should record an error mentioning the path
+	errs := s.Errs()
+	if len(errs) == 0 {
+		t.Errorf("expected error logged, got none")
+	}
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e, unwritable) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected error to mention unwritable path %q, got: %v", unwritable, errs)
+	}
+}
