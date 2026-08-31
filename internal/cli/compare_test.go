@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -50,8 +51,56 @@ func TestCompareConfigWithSessionUsesUsage(t *testing.T) {
 	}
 }
 
+// TestCompareConfigDestHomeNormalLayout covers the fix for the review
+// finding that --dest-home was inert: a normal (non-CLAUDE_CONFIG_DIR)
+// install keeps ~/.claude.json next to ~/.claude, not inside it, so the
+// destination inventory must be read from <dest-home>/.claude.json rather
+// than always from <target-config-dir>/.claude.json.
+func TestCompareConfigDestHomeNormalLayout(t *testing.T) {
+	stubClaudeVersion(t, "2.1.247")
+	srcHome, dstHome := t.TempDir(), t.TempDir()
+	mcp := `{"mcpServers": {"playwright": {"type": "stdio", "command": "npx", "args": ["@playwright/mcp@latest"]}}}`
+	if err := os.WriteFile(filepath.Join(srcHome, ".claude.json"), []byte(mcp), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dstHome, ".claude.json"), []byte(mcp), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dstConfigDir := filepath.Join(dstHome, ".claude")
+	if err := os.MkdirAll(dstConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + srcHome, "PWD=/home/alice/github/example/widget"}
+	code, out, stderr := run(t, env, "compare-config", "--dest-home", dstHome, dstConfigDir)
+	if code != ExitOK {
+		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, stderr)
+	}
+	if strings.Contains(out, "mcp.") {
+		t.Fatalf("identical mcpServers must produce no mcp drift:\n%s", out)
+	}
+}
+
 func TestCompareConfigRemoteNotYet(t *testing.T) {
 	if code, _, stderr := run(t, []string{"HOME=/home/alice"}, "compare-config", "big-storage.example"); code != ExitUsage || !strings.Contains(stderr, "not implemented yet") {
+		t.Fatalf("%d %q", code, stderr)
+	}
+}
+
+// TestCompareConfigAbsolutePathStatErrorSurfaces covers the classification
+// bug where an absolute target that errors on Stat (as opposed to simply
+// not existing) was silently reinterpreted as a remote hostname instead of
+// surfacing the error.
+func TestCompareConfigAbsolutePathStatErrorSurfaces(t *testing.T) {
+	dir := t.TempDir()
+	loop := filepath.Join(dir, "loop")
+	if err := os.Symlink(loop, loop); err != nil {
+		t.Fatal(err)
+	}
+	code, out, stderr := run(t, []string{"HOME=/home/alice"}, "compare-config", loop)
+	if code == ExitUsage && strings.Contains(stderr, "not implemented yet") {
+		t.Fatalf("Stat error must not be reinterpreted as a remote hostname: %d\nstdout:%s\nstderr:%s", code, out, stderr)
+	}
+	if code != ExitFailed || !strings.Contains(stderr, "stat") {
 		t.Fatalf("%d %q", code, stderr)
 	}
 }

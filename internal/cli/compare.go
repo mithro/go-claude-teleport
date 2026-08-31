@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,10 +93,18 @@ entirely locally.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target := args[0]
-			// Check if target is remote (hostname) before doing other operations
+			// Check if target is remote (hostname) before doing other operations.
 			info, statErr := os.Stat(target)
-			if !filepath.IsAbs(target) || statErr != nil || !info.IsDir() {
+			switch {
+			case !filepath.IsAbs(target):
 				// A hostname: needs the Plan 02 transport (hello + inventory-host).
+				return Exit(ExitUsage, "compare-config %s: remote comparison not implemented yet (an absolute config-dir path works locally)", target)
+			case statErr != nil && !errors.Is(statErr, fs.ErrNotExist):
+				// The path exists as far as the filesystem is concerned but Stat
+				// itself failed (permissions, a symlink loop, ...): surface that,
+				// don't silently reinterpret it as "must be a remote hostname".
+				return Exit(ExitFailed, "stat %s: %v", target, statErr)
+			case statErr != nil || !info.IsDir():
 				return Exit(ExitUsage, "compare-config %s: remote comparison not implemented yet (an absolute config-dir path works locally)", target)
 			}
 			p, err := a.resolvePaths()
@@ -127,10 +137,23 @@ entirely locally.`,
 			if err != nil {
 				return Exit(ExitFailed, "%v", err)
 			}
-			if destHome == "" {
-				destHome = filepath.Dir(target)
+			// Build the destination Paths explicitly: NewPaths' CLAUDE_CONFIG_DIR
+			// heuristic (GlobalJSON always inside ConfigDir) is wrong for a normal
+			// home layout, where ~/.claude.json sits next to ~/.claude. With
+			// --dest-home, prefer <destHome>/.claude.json when it exists; without
+			// it (or when that file is absent) fall back to <target>/.claude.json,
+			// as before.
+			destHomeGiven := destHome != ""
+			effectiveHome := destHome
+			if effectiveHome == "" {
+				effectiveHome = filepath.Dir(target)
 			}
-			dstPaths := session.NewPaths(destHome, target, "")
+			dstPaths := session.Paths{Home: effectiveHome, ConfigDir: target, GlobalJSON: filepath.Join(target, ".claude.json")}
+			if destHomeGiven {
+				if fi, err := os.Stat(filepath.Join(effectiveHome, ".claude.json")); err == nil && !fi.IsDir() {
+					dstPaths.GlobalJSON = filepath.Join(effectiveHome, ".claude.json")
+				}
+			}
 			dst, err := claudecfg.Collect(dstPaths, cwd, target, ver)
 			if err != nil {
 				return Exit(ExitFailed, "%v", err)
