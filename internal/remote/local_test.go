@@ -265,24 +265,6 @@ func TestLocalJournalOps(t *testing.T) {
 	}
 }
 
-func TestLocalPlan03OpsAreExplicitStubs(t *testing.T) {
-	l := NewLocal(testPaths(t), "self", LocalOptions{Logf: t.Logf})
-	ctx := context.Background()
-	checks := map[string]error{}
-	// InventoryGit, GitDestState and GitAttach are implemented for real
-	// (local_git.go, local_git_test.go) and no longer explicit stubs.
-	// InventoryTmux, Capture, OpenWindow, StartClaude, ConfirmClaude,
-	// ExitClaude, TypeCommand and PaneState are implemented for real
-	// (local_tmux.go/local_claude.go, local_tmux_test.go/local_claude_test.go)
-	// and no longer explicit stubs (Task 14).
-	checks["RunPtyResume"] = l.RunPtyResume(ctx, session.ID(sid), "/home/bob/work", time.Second)
-	for name, err := range checks {
-		if !isUnavailable(err) {
-			t.Errorf("%s: err = %v, want Error{Code: unavailable}", name, err)
-		}
-	}
-}
-
 func isUnavailable(err error) bool {
 	var pe *Error
 	return errors.As(err, &pe) && pe.Code == "unavailable"

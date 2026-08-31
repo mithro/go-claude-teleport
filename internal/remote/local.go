@@ -147,7 +147,7 @@ func (l *Local) InventoryHost(ctx context.Context, cwd, claudeVersion string) (*
 // InventoryTmux, TmuxSessions, OpenWindow, Capture, TypeCommand, PaneState
 // and KillWindow are implemented in local_tmux.go. StartClaude,
 // ConfirmClaude, ExitClaude and ClaudeStatus are implemented in
-// local_claude.go.
+// local_claude.go. RunPtyResume is implemented in local_pty.go.
 
 func (l *Local) jobDir(jobID string) string     { return job.Dir(l.paths.DataDir, jobID) }
 func (l *Local) stagingDir(jobID string) string { return job.StagingDir(l.paths.DataDir, jobID) }
@@ -290,10 +290,6 @@ func (l *Local) Thaw(ctx context.Context, pid int) error {
 		return nil // not frozen by us: no-op (spec §6 step 9)
 	}
 	return f.Thaw()
-}
-
-func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, timeout time.Duration) error {
-	return Unavailable(OpRunPtyResume)
 }
 
 func (l *Local) JournalGet(ctx context.Context, jobID string) (*job.Journal, bool, error) {
