@@ -85,6 +85,9 @@ func (a *app) rootCmd() *cobra.Command {
 			if err := tf.validate(args); err != nil {
 				return err
 			}
+			// Parsed (not resolved) here only so a malformed selector fails as a
+			// usage error before the transport stub runs; resolveSession (used by
+			// inspect/list) does the full parse-then-Resolve for those commands.
 			if _, err := session.ParseSelector(args, a.selectorEnv()); err != nil {
 				return Exit(ExitUsage, "%v", err)
 			}

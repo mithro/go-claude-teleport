@@ -25,8 +25,10 @@ type listRow struct {
 }
 
 // listSessions enumerates every transcript under projects/ and marks the
-// ones with a live registry entry as running (a placeholder pane scan needs
-// the tmux probe, which arrives with Plan 03).
+// ones with a live registry entry as running; when probe is non-nil (Plan 03
+// wires tmuxx.Prober in) it additionally scans every pane for a placeholder
+// holding a session id and marks that session suspended — a live registry
+// entry for the same id always wins over a suspended pane.
 func listSessions(p session.Paths, probe session.PaneProbe) ([]listRow, error) {
 	regs, err := session.ReadRegistry(p.SessionsDir())
 	if err != nil {
@@ -36,6 +38,27 @@ func listSessions(p session.Paths, probe session.PaneProbe) ([]listRow, error) {
 	for _, r := range regs {
 		if session.ProcAlive(session.ProcRoot, r.PID, r.ProcStart) {
 			running[r.SessionID] = r
+		}
+	}
+	suspended := map[string]session.PaneInfo{}
+	if probe != nil {
+		panes, err := probe.ListPanes()
+		if err != nil {
+			return nil, fmt.Errorf("list tmux panes: %w", err)
+		}
+		for _, pi := range panes {
+			argv, _, ok := probe.PaneCommand(pi.PaneID)
+			if !ok {
+				continue
+			}
+			sid, placeholder, ok := session.ArgvSessionID(argv)
+			if !ok || !placeholder || sid == "" {
+				continue
+			}
+			if _, isRunning := running[sid]; isRunning {
+				continue
+			}
+			suspended[sid] = pi
 		}
 	}
 	transcripts, err := filepath.Glob(filepath.Join(p.ProjectsDir(), "*", "*.jsonl"))
@@ -55,6 +78,9 @@ func listSessions(p session.Paths, probe session.PaneProbe) ([]listRow, error) {
 		row := listRow{ID: id, State: session.StateIdle.String(), Cwd: m.LaunchCwd, Branch: m.Branch, Last: m.LastTS}
 		if r, ok := running[id]; ok {
 			row.State, row.Name, row.PID, row.Tmux = session.StateRunning.String(), r.Name, r.PID, r.Tmux
+		} else if pi, ok := suspended[id]; ok {
+			row.State = session.StateSuspended.String()
+			row.Tmux = fmt.Sprintf("%s:%s.%s", pi.Session, pi.WindowID, pi.PaneID)
 		}
 		rows = append(rows, row)
 	}
