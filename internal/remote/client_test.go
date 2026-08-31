@@ -151,6 +151,17 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 		t.Errorf("hello over ssh: %+v", c.Info())
 	}
 
+	// Task 16: InventoryGit over the wire, dispatched through the same
+	// persistent `remote serve` connection (not a new exec).
+	repo := t.TempDir()
+	gitc(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "a"), []byte("a"), 0o644)
+	gitc(t, repo, "add", "a")
+	gitc(t, repo, "commit", "-q", "-m", "i")
+	if info, err := c.InventoryGit(context.Background(), repo); err != nil || info.Branch != "main" {
+		t.Errorf("InventoryGit over ssh: info=%+v err=%v", info, err)
+	}
+
 	ctx := context.Background()
 	m := sourceManifest(t, destPaths)
 	st, err := c.ManifestDiff(ctx, m, sid)
@@ -160,7 +171,7 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	if st[0] != transfer.Absent {
 		t.Fatalf("diff = %v", st)
 	}
-	s, err := c.OpenStream(ctx, StreamTar, sid, "s1")
+	s, err := c.OpenStream(ctx, StreamTar, sid, "recv:1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +194,7 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	}
 
 	// a failing stream surfaces on Close with the remote stderr
-	bad, _ := c.OpenStream(ctx, StreamTar, sid, "s2")
+	bad, _ := c.OpenStream(ctx, StreamTar, sid, "recv:2")
 	io.WriteString(bad, "garbage")
 	if err := bad.Close(); err == nil || !strings.Contains(err.Error(), "gzip") {
 		t.Errorf("bad stream Close = %v, want remote gzip error", err)
@@ -197,7 +208,7 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	// performs that half-close itself for receive-direction kinds before
 	// returning the stream, so the read-then-close below is safe as written.
 	os.WriteFile(filepath.Join(job.Dir(destPaths.DataDir, sid), "log.txt"), []byte("remote log\n"), 0o600)
-	lg, err := c.OpenStream(ctx, StreamLog, sid, "l")
+	lg, err := c.OpenStream(ctx, StreamLog, sid, "send:1")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -178,7 +178,7 @@ func TestLocalManifestDiffStreamInstall(t *testing.T) {
 	if err := transfer.Send(ctx, m, transfer.Need(m, st), &buf, nil); err != nil {
 		t.Fatal(err)
 	}
-	s, err := l.OpenStream(ctx, StreamTar, sid, "s1")
+	s, err := l.OpenStream(ctx, StreamTar, sid, "recv:1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestLocalManifestDiffStreamInstall(t *testing.T) {
 	}
 
 	// a corrupt tar stream: Close reports it and nothing is installed twice
-	s2, _ := l.OpenStream(ctx, StreamTar, sid, "s2")
+	s2, _ := l.OpenStream(ctx, StreamTar, sid, "recv:2")
 	io.WriteString(s2, "definitely not gzip")
 	if err := s2.Close(); err == nil {
 		t.Errorf("corrupt stream must fail on Close")
@@ -223,7 +223,7 @@ func TestLocalCaptureAndLogStreams(t *testing.T) {
 	os.WriteFile(j.CapturePath(), []byte("pane contents\n"), 0o600)
 	os.WriteFile(j.LogPath(), []byte("log line\n"), 0o600)
 	for kind, want := range map[StreamKind]string{StreamCapture: "pane contents\n", StreamLog: "log line\n"} {
-		s, err := l.OpenStream(context.Background(), kind, sid, "x")
+		s, err := l.OpenStream(context.Background(), kind, sid, "send:1")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -233,10 +233,25 @@ func TestLocalCaptureAndLogStreams(t *testing.T) {
 			t.Errorf("%s stream = %q", kind, data)
 		}
 	}
-	if _, err := l.OpenStream(context.Background(), StreamPack, sid, "x"); !isUnavailable(err) {
-		t.Errorf("pack stream err = %v, want unavailable", err)
+	// StreamPack is implemented (Task 16): recv writes staging/<job>/objects.pack.
+	pw, err := l.OpenStream(context.Background(), StreamPack, sid, "recv:1")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := l.OpenStream(context.Background(), StreamCapture, "no-such-job", "x"); err == nil {
+	io.WriteString(pw, "PACKDATA")
+	if err := pw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(job.StagingDir(p.DataDir, sid), "objects.pack")); err != nil || string(b) != "PACKDATA" {
+		t.Errorf("objects.pack = %q %v", b, err)
+	}
+	// OpenStream itself never fails eagerly (the goroutine drives runStream);
+	// a missing capture file surfaces on Read/Close instead.
+	miss, err := l.OpenStream(context.Background(), StreamCapture, "no-such-job", "send:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(miss); err == nil {
 		t.Errorf("missing capture must be an error")
 	}
 }
@@ -263,11 +278,6 @@ func TestLocalJournalOps(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(job.Dir(p.DataDir, sid), "history.jsonl")); err != nil {
 		t.Errorf("history not written: %v", err)
 	}
-}
-
-func isUnavailable(err error) bool {
-	var pe *Error
-	return errors.As(err, &pe) && pe.Code == "unavailable"
 }
 
 func TestLocalResolveNotFoundMapsToProtocolError(t *testing.T) {
@@ -303,7 +313,7 @@ func TestServeStreamLocalLogDeliversFullPayload(t *testing.T) {
 	stdoutR, stdoutW := io.Pipe()
 	serveDone := make(chan error, 1)
 	go func() {
-		err := ServeStream(context.Background(), StreamLog, sid, "s1", stdinR, stdoutW, l)
+		err := ServeStream(context.Background(), StreamLog, sid, "send:1", stdinR, stdoutW, l)
 		// ServeStream itself never closes stdout — in production the
 		// `remote stream` process exit is what EOFs the ssh channel to the
 		// peer. An io.Pipe standing in for that channel needs the same
@@ -338,11 +348,11 @@ func TestServeStreamLocalLogDeliversFullPayload(t *testing.T) {
 }
 
 // TestServeStreamLocalTarCompletesOnClientWriteThenClose proves the
-// send-direction (tar) path: the client writes the payload then closes
-// stdin, and ServeStream completes cleanly even though it also runs a
-// concurrent "copy the stream to stdout" goroutine that has nothing to
-// deliver (tarStream.Read returns io.EOF immediately, per its documented
-// contract, so that goroutine can never block this from finishing).
+// recv-direction (tar) path: the client writes the payload then closes
+// stdin, and ServeStream completes cleanly. runStream's tar/recv case never
+// touches stdout at all, so the concurrent "read stdout" goroutine below
+// only needs the explicit stdoutW.Close() (after ServeStream returns) to
+// unblock — it was never going to receive any bytes.
 func TestServeStreamLocalTarCompletesOnClientWriteThenClose(t *testing.T) {
 	p := testPaths(t)
 	l := NewLocal(p, "self", LocalOptions{Logf: t.Logf})
@@ -362,7 +372,7 @@ func TestServeStreamLocalTarCompletesOnClientWriteThenClose(t *testing.T) {
 	stdoutR, stdoutW := io.Pipe()
 	serveDone := make(chan error, 1)
 	go func() {
-		err := ServeStream(ctx, StreamTar, sid, "s2", stdinR, stdoutW, l)
+		err := ServeStream(ctx, StreamTar, sid, "recv:2", stdinR, stdoutW, l)
 		// See the log test above: stand in for the process-exit EOF a real
 		// `remote stream` invocation gives its peer.
 		stdoutW.Close()
@@ -392,7 +402,7 @@ func TestServeStreamLocalTarCompletesOnClientWriteThenClose(t *testing.T) {
 	select {
 	case <-stdoutDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("stdout copy did not finish (tarStream.Read must not block)")
+		t.Fatal("stdout copy did not finish")
 	}
 
 	st, err = l.ManifestDiff(ctx, m, sid)

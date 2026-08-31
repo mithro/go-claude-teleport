@@ -47,12 +47,14 @@ func TestRemoteStreamLog(t *testing.T) {
 	j, _ := job.New(dataDir, tsid)
 	os.WriteFile(j.LogPath(), []byte("hello log\n"), 0o600)
 	var stdout, stderr bytes.Buffer
-	code := Main([]string{"remote", "stream", "log", tsid, "s1"}, strings.NewReader(""), &stdout, &stderr, env)
+	// streamID carries the direction (Task 16): log is a send-direction-only
+	// kind (source/any streams jobs/<job>/log.txt out).
+	code := Main([]string{"remote", "stream", "log", tsid, "send:1"}, strings.NewReader(""), &stdout, &stderr, env)
 	if code != ExitOK || stdout.String() != "hello log\n" {
 		t.Errorf("exit %d stdout %q stderr %q", code, stdout.String(), stderr.String())
 	}
-	code = Main([]string{"remote", "stream", "bogus", tsid, "s1"}, strings.NewReader(""), &stdout, &stderr, env)
-	if code != ExitFailed || !strings.Contains(stderr.String(), "unknown stream kind") {
+	code = Main([]string{"remote", "stream", "bogus", tsid, "send:1"}, strings.NewReader(""), &stdout, &stderr, env)
+	if code != ExitFailed || !strings.Contains(stderr.String(), "unsupported stream") {
 		t.Errorf("bad kind: exit %d stderr %q", code, stderr.String())
 	}
 }

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -180,75 +179,8 @@ func (l *Local) PutInstallExtras(ctx context.Context, jobID string, extra transf
 	return os.WriteFile(l.extrasPath(jobID), raw, 0o600)
 }
 
-// tarStream is the write side of a receive: bytes written go to Receive;
-// Close waits for it and returns its verdict.
-//
-// Contract (controller ruling, Task 15): a tarStream is send-direction only
-// — the driver writes the tar payload into it, nothing flows back out. Its
-// Read must therefore never block: it always returns (0, io.EOF) so that
-// ServeStream's concurrent "copy the stream to stdout" goroutine (which runs
-// unconditionally for every stream kind) finishes immediately instead of
-// hanging on a direction nobody uses.
-type tarStream struct {
-	pw   *io.PipeWriter
-	done chan error
-	once sync.Once
-	err  error
-}
-
-func (t *tarStream) Read(p []byte) (int, error)  { return 0, io.EOF }
-func (t *tarStream) Write(p []byte) (int, error) { return t.pw.Write(p) }
-func (t *tarStream) Close() error {
-	t.once.Do(func() {
-		t.pw.Close()
-		t.err = <-t.done
-	})
-	return t.err
-}
-
-// readStream is the read side of a receive-direction stream (capture, log):
-// this host produces data, the client only reads. Its Write must never
-// block: it fails immediately instead of hanging on a direction nobody uses
-// (see tarStream's contract note above; ServeStream always runs both
-// directions concurrently regardless of stream kind).
-type readStream struct{ io.ReadCloser }
-
-func (r readStream) Write(p []byte) (int, error) { return 0, errors.New("read-only stream") }
-
-func (l *Local) OpenStream(ctx context.Context, kind StreamKind, jobID, streamID string) (io.ReadWriteCloser, error) {
-	switch kind {
-	case StreamTar:
-		m, err := transfer.Load(filepath.Join(l.jobDir(jobID), "manifest.json"))
-		if err != nil {
-			return nil, fmt.Errorf("stream tar %s: manifest-diff must run first: %w", jobID, err)
-		}
-		pr, pw := io.Pipe()
-		t := &tarStream{pw: pw, done: make(chan error, 1)}
-		go func() {
-			err := transfer.Receive(ctx, m, pr, l.stagingDir(jobID), func(e transfer.Entry, n int64) {
-				l.opts.Logf("received entry %d %s (%d bytes total)", e.ID, e.Dst, n)
-			})
-			pr.CloseWithError(err)
-			t.done <- err
-		}()
-		return t, nil
-	case StreamCapture:
-		f, err := os.Open(filepath.Join(l.jobDir(jobID), "capture.txt"))
-		if err != nil {
-			return nil, fmt.Errorf("stream capture %s: %w", jobID, err)
-		}
-		return readStream{f}, nil
-	case StreamLog:
-		f, err := os.Open(filepath.Join(l.jobDir(jobID), "log.txt"))
-		if err != nil {
-			return nil, fmt.Errorf("stream log %s: %w", jobID, err)
-		}
-		return readStream{f}, nil
-	case StreamPack:
-		return nil, Unavailable("stream pack")
-	}
-	return nil, &Error{Code: "usage", Message: "unknown stream kind " + string(kind)}
-}
+// OpenStream is implemented in streams.go (runStream drives all four kinds,
+// keyed by the direction streamID carries).
 
 func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string) (*transfer.InstallReport, error) {
 	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID))
