@@ -32,9 +32,11 @@ func DestStateOf(mainDir, worktreeDir, branch string) (*DestState, error) {
 	st := &DestState{RefTips: map[string]string{}}
 	if _, err := os.Stat(filepath.Join(mainDir, ".git")); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			if _, err := os.Lstat(worktreeDir); err == nil {
-				st.WorktreeExists = true
+			exists, err := worktreeDirExists(worktreeDir)
+			if err != nil {
+				return nil, err
 			}
+			st.WorktreeExists = exists
 			return st, nil
 		}
 		return nil, err
@@ -70,10 +72,17 @@ func DestStateOf(mainDir, worktreeDir, branch string) (*DestState, error) {
 		st.BranchTip = st.RefTips["refs/heads/"+branch]
 	}
 
-	if _, err := os.Lstat(worktreeDir); err == nil {
+	exists, err := worktreeDirExists(worktreeDir)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
 		st.WorktreeExists = true
+		// A directory that is not a repository, or is one whose HEAD is
+		// still unborn, leaves WorktreeBranch empty for PlanTransfer to
+		// refuse on; anything else is a real failure.
 		if wi, err := Inspect(worktreeDir); err != nil {
-			if !errors.Is(err, ErrNotRepo) && !errors.Is(err, os.ErrNotExist) {
+			if !errors.Is(err, ErrNotRepo) && !errors.Is(err, os.ErrNotExist) && !errors.Is(err, plumbing.ErrReferenceNotFound) {
 				return nil, fmt.Errorf("inspect %s: %w", worktreeDir, err)
 			}
 		} else if wi.Root == filepath.Clean(worktreeDir) {
@@ -116,6 +125,19 @@ func DestStateOf(mainDir, worktreeDir, branch string) (*DestState, error) {
 		}
 	}
 	return st, nil
+}
+
+// worktreeDirExists reports whether worktreeDir is present. Only ENOENT
+// counts as absent: a stat that fails for any other reason (an unreadable
+// parent, say) must not be mistaken for a free destination.
+func worktreeDirExists(worktreeDir string) (bool, error) {
+	if _, err := os.Lstat(worktreeDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat %s: %w", worktreeDir, err)
+	}
+	return true, nil
 }
 
 // IsAncestor reports whether ancestor is reachable from descendant in the

@@ -65,6 +65,8 @@ func TestPlanTransferTable(t *testing.T) {
 		{"detached, dest has tip", detachedInfo(), &DestState{MainExists: true, RootCommit: rootA, RefTips: map[string]string{"refs/heads/main": tip}}, ModeExistingMain, false, false, ""},
 		{"detached, dest lacks tip", detachedInfo(), &DestState{MainExists: true, RootCommit: rootA, RefTips: map[string]string{"refs/heads/main": older}}, ModeExistingMain, false, true, ""},
 		{"W==M no working tree", mainInfo(), &DestState{MainExists: true, RootCommit: rootA}, "", false, false, "no working tree"},
+		{"existing main, empty dest repository", linkedInfo(), &DestState{MainExists: true, RootCommit: ""}, "", false, false, "empty repository"},
+		{"W==M dest has no branch checked out", mainInfo(), &DestState{MainExists: true, RootCommit: rootA, WorktreeExists: true, WorktreeBranch: "", Clean: true, BranchTip: tip}, "", false, false, "no branch checked out"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

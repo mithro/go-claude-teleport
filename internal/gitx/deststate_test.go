@@ -1,6 +1,9 @@
 package gitx
 
 import (
+	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -115,5 +118,50 @@ func TestIsAncestor(t *testing.T) {
 	}
 	if _, err := IsAncestor(dir, "0000000000000000000000000000000000000000", second); err == nil {
 		t.Error("unknown ancestor hash must be an error, not false")
+	}
+}
+
+// TestDestStateUnbornHeadSameDir: W == M against a destination that is a
+// repository but has no commits yet. That is not "not a repository" and not
+// an error — WorktreeBranch simply stays empty for the caller to refuse on.
+func TestDestStateUnbornHeadSameDir(t *testing.T) {
+	dir := t.TempDir()
+	gitCLI(t, dir, "init", "-b", "main")
+	st, err := DestStateOf(dir, dir, "main")
+	if err != nil {
+		t.Fatalf("unborn HEAD must not be an error: %v", err)
+	}
+	if !st.MainExists || !st.WorktreeExists {
+		t.Errorf("state = %+v, want main and worktree present", st)
+	}
+	if st.RootCommit != "" || st.WorktreeBranch != "" || st.BranchTip != "" {
+		t.Errorf("state = %+v, want empty root/branch/tip", st)
+	}
+}
+
+// TestDestStateWorktreeStatErrorPropagates: only ENOENT means "no worktree
+// there"; a stat that fails for any other reason must not be reported as
+// absent.
+func TestDestStateWorktreeStatErrorPropagates(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := t.TempDir()
+	initRepo(t, dir)
+	locked := filepath.Join(dir, "locked")
+	if err := os.Mkdir(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+	if _, err := DestStateOf(dir, filepath.Join(locked, "w"), "main"); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("err = %v, want a permission error, not a silent absent worktree", err)
+	}
+	// Same for a destination whose main checkout is not there at all.
+	absent := filepath.Join(t.TempDir(), "nope")
+	if _, err := DestStateOf(absent, filepath.Join(locked, "w"), "main"); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("absent main: err = %v, want a permission error", err)
 	}
 }

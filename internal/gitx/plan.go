@@ -84,6 +84,9 @@ func PlanTransfer(src *Info, dst *DestState, pm session.PathMap) (*Plan, error) 
 		return p, nil
 	}
 	p.Mode = ModeExistingMain
+	if dst.RootCommit == "" {
+		return nil, refuse("%s on the destination is an empty repository (no commits); populate it first, e.g. git fetch", p.DstMain)
+	}
 	if dst.RootCommit != src.RootCommit {
 		return nil, refuse("%s on the destination is a different repository (root commit %s, source %s)", p.DstMain, short(dst.RootCommit), short(src.RootCommit))
 	}
@@ -119,6 +122,9 @@ func PlanTransfer(src *Info, dst *DestState, pm session.PathMap) (*Plan, error) 
 	// W == M
 	if !dst.WorktreeExists {
 		return nil, refuse("destination main checkout %s has no working tree", p.DstMain)
+	}
+	if dst.WorktreeBranch == "" {
+		return nil, refuse("destination checkout %s has no branch checked out (detached HEAD, or not a checkout of this repository), session branch is %q", p.DstMain, src.Branch)
 	}
 	if dst.WorktreeBranch != src.Branch {
 		return nil, refuse("destination checkout %s has branch %q checked out, session branch is %q", p.DstMain, dst.WorktreeBranch, src.Branch)
