@@ -26,26 +26,33 @@ const (
 // Every Plan must set both fields; guards test >= 0.
 const NoEntry = -1
 
+// Plan crosses the protocol AND is persisted in the journal's opaque plan
+// blob, which planView re-decodes on resume. The json tags below reproduce
+// Go-name marshaling EXACTLY (field F -> "F"), so adding them changed no
+// wire byte; they exist so a future field rename cannot silently break a
+// live protocol and every stored journal at once.
 type Plan struct {
-	Mode                 Mode
-	SrcMain, SrcWorktree string
-	DstMain, DstWorktree string
-	Linked               bool
-	WorktreeName         string
-	Branch               string
-	Tip                  string
-	Detached             bool
-	NeedPack             bool
-	HaveTips             []string // destination tips to exclude from the pack
-	FastForward          bool     // branch exists on dest and is an ancestor of Tip
-	Dirty                Dirty
+	Mode         Mode     `json:"Mode"`
+	SrcMain      string   `json:"SrcMain"`
+	SrcWorktree  string   `json:"SrcWorktree"`
+	DstMain      string   `json:"DstMain"`
+	DstWorktree  string   `json:"DstWorktree"`
+	Linked       bool     `json:"Linked"`
+	WorktreeName string   `json:"WorktreeName"`
+	Branch       string   `json:"Branch"`
+	Tip          string   `json:"Tip"`
+	Detached     bool     `json:"Detached"`
+	NeedPack     bool     `json:"NeedPack"`
+	HaveTips     []string `json:"HaveTips"`    // destination tips to exclude from the pack
+	FastForward  bool     `json:"FastForward"` // branch exists on dest and is an ancestor of Tip
+	Dirty        Dirty    `json:"Dirty"`
 
 	// Additions (Plan 03):
-	IndexRel     string         // ".git/index" or ".git/worktrees/<n>/index", relative to SrcMain/DstMain
-	StagedBlobs  []string       // blob hashes referenced by the index but not by Tip; set with SetStagedBlobs, never directly
-	PackEntryID  int            // manifest entry id of the pack, NoEntry = none (existing-main only)
-	IndexEntryID int            // manifest entry id of the index file, NoEntry = none (existing-main only)
-	DirtyEntries map[string]int // dst path -> manifest entry id of dirty worktree files (existing-main only)
+	IndexRel     string         `json:"IndexRel"`     // ".git/index" or ".git/worktrees/<n>/index", relative to SrcMain/DstMain
+	StagedBlobs  []string       `json:"StagedBlobs"`  // blob hashes referenced by the index but not by Tip; set with SetStagedBlobs, never directly
+	PackEntryID  int            `json:"PackEntryID"`  // manifest entry id of the pack, NoEntry = none (existing-main only)
+	IndexEntryID int            `json:"IndexEntryID"` // manifest entry id of the index file, NoEntry = none (existing-main only)
+	DirtyEntries map[string]int `json:"DirtyEntries"` // dst path -> manifest entry id of dirty worktree files (existing-main only)
 }
 
 // SetStagedBlobs records the blob hashes the transferred index references

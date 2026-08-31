@@ -7,20 +7,23 @@ import (
 	"strings"
 )
 
+// Facts crosses the protocol (inventory-tmux). The json tags reproduce
+// Go-name marshaling EXACTLY (field F -> "F"), so they changed no wire
+// byte; they pin the names against a future rename.
 type Facts struct {
-	SocketPath  string
-	SessionName string
-	Group       string // session_group or ""
-	WindowID    string
-	WindowIndex int
-	WindowName  string
-	AutoRename  bool
-	PaneID      string
-	PaneTitle   string
-	PaneCwd     string
-	PaneCommand string
-	PanePID     int
-	HistorySize int
+	SocketPath  string `json:"SocketPath"`
+	SessionName string `json:"SessionName"`
+	Group       string `json:"Group"` // session_group or ""
+	WindowID    string `json:"WindowID"`
+	WindowIndex int    `json:"WindowIndex"`
+	WindowName  string `json:"WindowName"`
+	AutoRename  bool   `json:"AutoRename"`
+	PaneID      string `json:"PaneID"`
+	PaneTitle   string `json:"PaneTitle"`
+	PaneCwd     string `json:"PaneCwd"`
+	PaneCommand string `json:"PaneCommand"`
+	PanePID     int    `json:"PanePID"`
+	HistorySize int    `json:"HistorySize"`
 }
 
 // describeFormat: pane_title is last on purpose — it is the only field that
@@ -77,7 +80,14 @@ func Describe(ctx context.Context, t Transport, paneID string) (*Facts, error) {
 // UnvisName is applied in exactly two places: passing a name to a creation
 // flag (`new-session -s`, `new-window -n`), which tmux re-encodes, and human
 // display. Never decode a name on its way into a target or a comparison.
-type SessionInfo struct{ Name, Group string }
+//
+// SessionInfo crosses the protocol (tmux-sessions). The json tags reproduce
+// Go-name marshaling EXACTLY (field F -> "F"), so they changed no wire
+// byte; they pin the names against a future rename.
+type SessionInfo struct {
+	Name  string `json:"Name"`
+	Group string `json:"Group"`
+}
 
 // ListSessions lists every session with its group ("" when ungrouped).
 func ListSessions(ctx context.Context, t Transport) ([]SessionInfo, error) {

@@ -102,9 +102,12 @@ func StagedBlobsOf(repoDir, indexPath, tip string) ([]string, error) {
 
 // SourceFacts is what the source repository must answer before the plan
 // can be made (it is computed on the source host by remote.GitSourceFacts).
+// SourceFacts crosses the protocol (git-source-facts). The json tags
+// reproduce Go-name marshaling EXACTLY (field F -> "F"), so they changed no
+// wire byte; they pin the names against a future rename.
 type SourceFacts struct {
-	DestTipReachable bool     // destTip is an ancestor of tip ("" destTip -> false)
-	StagedBlobs      []string // StagedBlobsOf(mainDir, mainDir/indexRel, tip)
+	DestTipReachable bool     `json:"DestTipReachable"` // destTip is an ancestor of tip ("" destTip -> false)
+	StagedBlobs      []string `json:"StagedBlobs"`      // StagedBlobsOf(mainDir, mainDir/indexRel, tip)
 }
 
 // SourceFactsOf combines IsAncestor and StagedBlobsOf. A destTip the

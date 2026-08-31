@@ -35,12 +35,15 @@ func checkTargetID(op, sigil, id string) error {
 	return nil
 }
 
+// PaneState crosses the protocol (shape-state). The json tags reproduce
+// Go-name marshaling EXACTLY (field F -> "F"), so they changed no wire
+// byte; they pin the names against a future rename.
 type PaneState struct {
-	PaneID  string
-	Command string
-	Argv    []string
-	PID     int
-	Content []string // last 50 lines
+	PaneID  string   `json:"PaneID"`
+	Command string   `json:"Command"`
+	Argv    []string `json:"Argv"`
+	PID     int      `json:"PID"`
+	Content []string `json:"Content"` // last 50 lines
 }
 
 // Capture returns the pane's whole scrollback with escapes (-e), joined

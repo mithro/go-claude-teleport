@@ -11,13 +11,17 @@ import (
 // Plan describes the destination window to open. Group and WindowName
 // carry tmux's STORED (vis-encoded) spelling — see the convention on
 // SessionInfo.Name; OpenWindow decodes them for the creation flags.
+//
+// Plan crosses the protocol (tmux-open). The json tags reproduce Go-name
+// marshaling EXACTLY (field F -> "F"), so they changed no wire byte; they
+// pin the names against a future rename.
 type Plan struct {
-	SocketPath    string
-	Group         string
-	WindowName    string
-	AutoRename    bool
-	Cwd           string
-	CreateSession bool // no session in Group exists
+	SocketPath    string `json:"SocketPath"`
+	Group         string `json:"Group"`
+	WindowName    string `json:"WindowName"`
+	AutoRename    bool   `json:"AutoRename"`
+	Cwd           string `json:"Cwd"`
+	CreateSession bool   `json:"CreateSession"` // no session in Group exists
 }
 
 // BaseSession picks the session to add windows to for group G: the member
