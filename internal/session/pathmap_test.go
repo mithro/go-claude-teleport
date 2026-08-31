@@ -42,6 +42,10 @@ func TestParseMappings(t *testing.T) {
 			t.Errorf("accepted %q", bad)
 		}
 	}
+	_, err = ParseMappings([]string{"/a=/b", "/a=/c"})
+	if err == nil || !strings.Contains(err.Error(), "/a") {
+		t.Errorf("duplicate From not rejected: %v", err)
+	}
 }
 
 func TestApplyPath(t *testing.T) {

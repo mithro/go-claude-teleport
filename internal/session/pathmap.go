@@ -14,9 +14,10 @@ type Mapping struct{ From, To string }
 type PathMap []Mapping
 
 // ParseMappings parses "SRC=DST" strings (trailing slashes trimmed) and
-// validates that both sides are absolute.
+// validates that both sides are absolute, and that From is not duplicated.
 func ParseMappings(specs []string) ([]Mapping, error) {
 	var out []Mapping
+	seen := map[string]bool{}
 	for _, s := range specs {
 		from, to, ok := strings.Cut(s, "=")
 		if !ok {
@@ -26,6 +27,10 @@ func ParseMappings(specs []string) ([]Mapping, error) {
 		if from == "" || to == "" {
 			return nil, fmt.Errorf("--map %q: both sides must be absolute paths", s)
 		}
+		if seen[from] {
+			return nil, fmt.Errorf("--map: duplicate From %q", from)
+		}
+		seen[from] = true
 		out = append(out, Mapping{From: from, To: to})
 	}
 	return out, nil

@@ -25,7 +25,7 @@ func rewriteValue(v any, m PathMap) (any, bool) {
 		out := make(map[string]any, len(x))
 		changed := false
 		for k, val := range x {
-			nk := m.Apply(k)
+			nk := m.Apply(k)        // Note: two distinct keys may rewrite to the same key; later entry wins.
 			nv, c := rewriteValue(val, m)
 			if nk != k || c {
 				changed = true
