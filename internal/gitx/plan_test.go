@@ -128,3 +128,24 @@ func TestPlanTransferHaveTipsDeduped(t *testing.T) {
 func containsFold(s, sub string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
 }
+
+// TestPlanTransferSetsNoEntrySentinels (I4): manifest ids are 0-based, so
+// the "no entry" sentinel must be NoEntry (-1) and every plan PlanTransfer
+// hands out must carry it explicitly — a zero value here would read as
+// "manifest entry 0" to remote.GitAttach's guard.
+func TestPlanTransferSetsNoEntrySentinels(t *testing.T) {
+	pm := session.NewPathMap(session.Mapping{From: "/home/alice", To: "/home/bob"})
+	notRepo, err := PlanTransfer(nil, &DestState{}, pm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := PlanTransfer(linkedInfo(), &DestState{MainExists: true, RootCommit: rootA, RefTips: map[string]string{"refs/heads/feat": tip}, BranchTip: tip}, pm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []*Plan{notRepo, repo} {
+		if p.PackEntryID != NoEntry || p.IndexEntryID != NoEntry {
+			t.Errorf("%s plan: PackEntryID=%d IndexEntryID=%d, want %d for both", p.Mode, p.PackEntryID, p.IndexEntryID, NoEntry)
+		}
+	}
+}

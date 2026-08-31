@@ -70,7 +70,7 @@ func (l *Local) GitAttach(ctx context.Context, p *gitx.Plan, jobID string) error
 	for dst, id := range p.DirtyEntries {
 		dirty[dst] = gitx.DirtyFile{Src: filepath.Join(staging, strconv.Itoa(id))}
 	}
-	if p.IndexEntryID != 0 {
+	if p.IndexEntryID >= 0 { // gitx.NoEntry (-1) means "no index entry"; 0 is a real id
 		dirty[filepath.Join(p.DstMain, p.IndexRel)] = gitx.DirtyFile{Src: filepath.Join(staging, strconv.Itoa(p.IndexEntryID))}
 	}
 	for dst, df := range dirty {

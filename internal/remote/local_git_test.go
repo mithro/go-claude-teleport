@@ -1,6 +1,7 @@
 package remote
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -76,7 +77,7 @@ func TestLocalGitAttachUsesStagingPaths(t *testing.T) {
 	w := filepath.Join(main, ".worktrees", "feat")
 	plan := &gitx.Plan{Mode: gitx.ModeExistingMain, SrcMain: "/home/alice/x", SrcWorktree: "/home/alice/x/.worktrees/feat",
 		DstMain: main, DstWorktree: w, Linked: true, WorktreeName: "feat", Branch: "feat", Tip: tip, NeedPack: false,
-		IndexRel: ".git/worktrees/feat/index", IndexEntryID: 8,
+		IndexRel: ".git/worktrees/feat/index", IndexEntryID: 8, PackEntryID: gitx.NoEntry,
 		DirtyEntries: map[string]int{filepath.Join(w, "new.txt"): 7}}
 	l := NewLocal(p, "/usr/local/bin/claude-teleport", LocalOptions{ProcRoot: "/proc"})
 	if err := l.GitAttach(context.Background(), plan, jobID); err != nil {
@@ -90,5 +91,53 @@ func TestLocalGitAttachUsesStagingPaths(t *testing.T) {
 	}
 	if !strings.Contains(gitc(t, main, "worktree", "list"), w) {
 		t.Error("git does not list the new worktree")
+	}
+}
+
+// TestLocalGitAttachRestoresIndexAtManifestEntryZero is the I4 regression:
+// manifest ids are 0-based (transfer.Build assigns them by slice index), so
+// the index file can legitimately be entry 0. With the old `!= 0` sentinel
+// that entry was silently skipped and gitx.Attach attached a worktree
+// carrying whatever index git happened to create, with no error anywhere.
+func TestLocalGitAttachRestoresIndexAtManifestEntryZero(t *testing.T) {
+	p := testPaths(t)
+	main := filepath.Join(p.Home, "x")
+	os.MkdirAll(main, 0o755)
+	gitc(t, main, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(main, "a.txt"), []byte("a"), 0o644)
+	gitc(t, main, "add", "a.txt")
+	gitc(t, main, "commit", "-q", "-m", "init")
+	tip := strings.TrimSpace(gitc(t, main, "rev-parse", "HEAD"))
+	// A staged-but-uncommitted file makes this index distinguishable from
+	// the one git writes when it creates the linked worktree.
+	os.WriteFile(filepath.Join(main, "staged.txt"), []byte("s"), 0o644)
+	gitc(t, main, "add", "staged.txt")
+	wantIndex, err := os.ReadFile(filepath.Join(main, ".git", "index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jobID := "3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c"
+	staging := job.StagingDir(p.DataDir, jobID)
+	os.MkdirAll(staging, 0o700)
+	os.WriteFile(filepath.Join(staging, "0"), wantIndex, 0o644) // entry 0: the index
+
+	w := filepath.Join(main, ".worktrees", "feat")
+	plan := &gitx.Plan{Mode: gitx.ModeExistingMain, SrcMain: "/home/alice/x", SrcWorktree: "/home/alice/x/.worktrees/feat",
+		DstMain: main, DstWorktree: w, Linked: true, WorktreeName: "feat", Branch: "feat", Tip: tip, NeedPack: false,
+		IndexRel: ".git/worktrees/feat/index", IndexEntryID: 0, PackEntryID: gitx.NoEntry}
+	l := NewLocal(p, "/usr/local/bin/claude-teleport", LocalOptions{ProcRoot: "/proc"})
+	if err := l.GitAttach(context.Background(), plan, jobID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(main, ".git", "worktrees", "feat", "index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, wantIndex) {
+		t.Errorf("worktree index (%d bytes) is not the transferred one (%d bytes): manifest entry 0 was skipped", len(got), len(wantIndex))
+	}
+	if !strings.Contains(gitc(t, w, "status", "--porcelain"), "staged.txt") {
+		t.Errorf("git in %s does not see the staged file the restored index records", w)
 	}
 }

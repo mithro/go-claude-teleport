@@ -159,7 +159,7 @@ func TestFilesNotRepo(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "notes.txt"), "plain")
 	writeFile(t, filepath.Join(dir, "skip.tmp"), "excluded")
-	p := &Plan{Mode: ModeNotRepo, SrcWorktree: dir, DstWorktree: dir}
+	p := &Plan{Mode: ModeNotRepo, SrcWorktree: dir, DstWorktree: dir, PackEntryID: NoEntry, IndexEntryID: NoEntry}
 	files, err := Files(p, []string{"*.tmp"}, false)
 	if err != nil {
 		t.Fatal(err)

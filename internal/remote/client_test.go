@@ -283,7 +283,7 @@ func TestClientOpenStreamPackBothDirectionsOverSSH(t *testing.T) {
 
 		// dest doubles as the pack-send "source" host here: any Local can
 		// serve either direction, keyed only by the journal's plan.
-		planBytes, err := json.Marshal(planView{Git: &gitx.Plan{SrcMain: repo, Tip: tip}})
+		planBytes, err := json.Marshal(planView{Git: &gitx.Plan{SrcMain: repo, Tip: tip, PackEntryID: gitx.NoEntry, IndexEntryID: gitx.NoEntry}})
 		if err != nil {
 			t.Fatal(err)
 		}

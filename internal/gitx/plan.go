@@ -18,6 +18,14 @@ const (
 	ModeExistingMain Mode = "existing-main" // M present: pack + attach
 )
 
+// NoEntry is the "no such manifest entry" sentinel for PackEntryID and
+// IndexEntryID. It is -1, not 0, because manifest ids are 0-BASED
+// (transfer.Build assigns them by slice index): with a 0 sentinel an index
+// file that legitimately landed as entry 0 was silently not restored and
+// gitx.Attach attached a worktree with a stale index, reporting no error.
+// Every Plan must set both fields; guards test >= 0.
+const NoEntry = -1
+
 type Plan struct {
 	Mode                 Mode
 	SrcMain, SrcWorktree string
@@ -35,8 +43,8 @@ type Plan struct {
 	// Additions (Plan 03):
 	IndexRel     string         // ".git/index" or ".git/worktrees/<n>/index", relative to SrcMain/DstMain
 	StagedBlobs  []string       // blob hashes referenced by the index but not by Tip; set with SetStagedBlobs, never directly
-	PackEntryID  int            // manifest entry id of the pack, 0 = none (existing-main only)
-	IndexEntryID int            // manifest entry id of the index file (existing-main only)
+	PackEntryID  int            // manifest entry id of the pack, NoEntry = none (existing-main only)
+	IndexEntryID int            // manifest entry id of the index file, NoEntry = none (existing-main only)
 	DirtyEntries map[string]int // dst path -> manifest entry id of dirty worktree files (existing-main only)
 }
 
@@ -61,7 +69,7 @@ func refuse(format string, a ...any) error { return &RefuseError{Reason: fmt.Spr
 // SrcWorktree/DstWorktree from the session cwd in that case.
 func PlanTransfer(src *Info, dst *DestState, pm session.PathMap) (*Plan, error) {
 	if src == nil {
-		return &Plan{Mode: ModeNotRepo}, nil
+		return &Plan{Mode: ModeNotRepo, PackEntryID: NoEntry, IndexEntryID: NoEntry}, nil
 	}
 	if len(src.DirtySubmodules) > 0 {
 		return nil, refuse("submodule(s) with uncommitted changes: %s", strings.Join(src.DirtySubmodules, ", "))
@@ -71,7 +79,8 @@ func PlanTransfer(src *Info, dst *DestState, pm session.PathMap) (*Plan, error) 
 		DstMain: pm.ApplyPath(src.MainDir), DstWorktree: pm.ApplyPath(src.Root),
 		Linked: src.IsLinked, WorktreeName: src.WorktreeName,
 		Branch: src.Branch, Tip: src.Head, Detached: src.Detached, Dirty: src.Dirty,
-		IndexRel: ".git/index",
+		IndexRel:    ".git/index",
+		PackEntryID: NoEntry, IndexEntryID: NoEntry,
 	}
 	if src.IsLinked {
 		p.IndexRel = path.Join(".git/worktrees", src.WorktreeName, "index")

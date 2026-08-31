@@ -108,7 +108,7 @@ func TestServeGitFilesOp(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644)
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
-	plan := &gitx.Plan{Mode: gitx.ModeNotRepo, SrcWorktree: dir}
+	plan := &gitx.Plan{Mode: gitx.ModeNotRepo, SrcWorktree: dir, PackEntryID: gitx.NoEntry, IndexEntryID: gitx.NoEntry}
 	var out filesResult
 	if e := callOp(t, ep, "git-files", gitFilesArgs{Plan: plan}, &out); e != nil {
 		t.Fatal(e)
