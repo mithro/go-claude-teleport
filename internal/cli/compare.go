@@ -16,6 +16,33 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
+// resolveSessionCwdUsage resolves --session (if given) into a *session.Session,
+// the cwd to compare from (the session's launch cwd, the environment's PWD,
+// or the process cwd) and the usage scan for that session, shared by the
+// local and remote compare-config branches below.
+func (a *app) resolveSessionCwdUsage(sel string) (*session.Session, string, *session.Usage, error) {
+	var s *session.Session
+	var err error
+	cwd := a.env["PWD"]
+	if sel != "" {
+		if s, err = a.resolveSession(strings.Fields(sel)); err != nil {
+			return nil, "", nil, err
+		}
+		cwd = s.LaunchCwd
+	} else if cwd == "" {
+		if cwd, err = os.Getwd(); err != nil {
+			return nil, "", nil, Exit(ExitFailed, "getwd: %v", err)
+		}
+	}
+	var usage *session.Usage
+	if s != nil {
+		if usage, err = session.ScanUsage(s); err != nil {
+			return nil, "", nil, Exit(ExitFailed, "%v", err)
+		}
+	}
+	return s, cwd, usage, nil
+}
+
 // lookInPath finds bin in a PATH string (exec.LookPath consults the process
 // environment; we must honour the environment handed to Main).
 func lookInPath(pathEnv, bin string) (string, error) {
@@ -114,23 +141,9 @@ as they do for a teleport).`,
 			if err != nil {
 				return err
 			}
-			var s *session.Session
-			cwd := a.env["PWD"]
-			if sel != "" {
-				if s, err = a.resolveSession(strings.Fields(sel)); err != nil {
-					return err
-				}
-				cwd = s.LaunchCwd
-			} else if cwd == "" {
-				if cwd, err = os.Getwd(); err != nil {
-					return Exit(ExitFailed, "getwd: %v", err)
-				}
-			}
-			var usage *session.Usage
-			if s != nil {
-				if usage, err = session.ScanUsage(s); err != nil {
-					return Exit(ExitFailed, "%v", err)
-				}
+			s, cwd, usage, err := a.resolveSessionCwdUsage(sel)
+			if err != nil {
+				return err
 			}
 			ver, err := a.localClaudeVersion(s)
 			if err != nil {
@@ -198,23 +211,9 @@ func (a *app) compareConfigRemote(cmd *cobra.Command, host string, via, opts []s
 	if err != nil {
 		return err
 	}
-	var s *session.Session
-	cwd := a.env["PWD"]
-	if sel != "" {
-		if s, err = a.resolveSession(strings.Fields(sel)); err != nil {
-			return err
-		}
-		cwd = s.LaunchCwd
-	} else if cwd == "" {
-		if cwd, err = os.Getwd(); err != nil {
-			return Exit(ExitFailed, "getwd: %v", err)
-		}
-	}
-	var usage *session.Usage
-	if s != nil {
-		if usage, err = session.ScanUsage(s); err != nil {
-			return Exit(ExitFailed, "%v", err)
-		}
+	_, cwd, usage, err := a.resolveSessionCwdUsage(sel)
+	if err != nil {
+		return err
 	}
 	local := remote.NewLocal(p, selfExe(), remote.LocalOptions{ProcRoot: "/proc", Logf: stderrLogf(a.stderr)})
 	localInfo, _ := local.Hello(ctx)
