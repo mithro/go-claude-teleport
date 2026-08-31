@@ -1,10 +1,8 @@
 package session
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 )
 
@@ -24,18 +22,7 @@ const scannerBuf = 64 * 1024 * 1024
 // to resume from); work cwd = last cwd seen. Unparseable lines are skipped.
 func ReadMeta(transcript string) (Meta, error) {
 	var m Meta
-	f, err := os.Open(transcript)
-	if err != nil {
-		return m, fmt.Errorf("read transcript: %w", err)
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), scannerBuf)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
-		}
+	err := scanLines(transcript, func(line []byte) error {
 		var o struct {
 			Type        string `json:"type"`
 			Cwd         string `json:"cwd"`
@@ -49,8 +36,8 @@ func ReadMeta(transcript string) (Meta, error) {
 				Content json.RawMessage `json:"content"`
 			} `json:"message"`
 		}
-		if json.Unmarshal([]byte(line), &o) != nil {
-			continue
+		if json.Unmarshal(line, &o) != nil {
+			return nil // skip unparseable lines
 		}
 		if o.Cwd != "" {
 			if m.LaunchCwd == "" {
@@ -77,9 +64,10 @@ func ReadMeta(transcript string) (Meta, error) {
 		case o.Type == "user" && m.FirstUser == "":
 			m.FirstUser = firstUserText(o.Message.Content)
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return m, fmt.Errorf("read transcript %s: %w", transcript, err)
+		return nil
+	})
+	if err != nil {
+		return m, fmt.Errorf("read transcript: %w", err)
 	}
 	return m, nil
 }

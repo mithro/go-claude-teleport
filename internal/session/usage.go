@@ -1,11 +1,8 @@
 package session
 
 import (
-	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -44,28 +41,14 @@ func ScanUsage(s *Session) (*Usage, error) {
 }
 
 func scanUsageFile(path string, u *Usage) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("scan usage: %w", err)
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), scannerBuf)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
-			continue
-		}
+	return scanLines(path, func(line []byte) error {
 		var rec any
 		if json.Unmarshal(line, &rec) != nil {
-			continue // unparseable lines carry no usage we can read
+			return nil // skip unparseable lines
 		}
 		walkUsage(rec, u)
-	}
-	if err := sc.Err(); err != nil {
-		return fmt.Errorf("scan usage %s: %w", path, err)
-	}
-	return nil
+		return nil
+	})
 }
 
 func walkUsage(v any, u *Usage) {
@@ -84,7 +67,7 @@ func walkUsage(v any, u *Usage) {
 				if sk, _ := input["skill"].(string); sk != "" {
 					u.Skills[sk] = true
 				}
-			case name == "Agent" || name == "Task":
+			case name == "Agent" || name == "Task": // transcripts from other Claude Code builds name the sub-agent tool "Task" instead of "Agent"
 				if st, _ := input["subagent_type"].(string); st != "" {
 					u.SubagentTypes[st] = true
 				}
