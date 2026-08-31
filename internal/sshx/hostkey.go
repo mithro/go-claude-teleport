@@ -12,6 +12,26 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
+// knownHostsLocks hands out one *sync.Mutex per known_hosts file path, so
+// concurrent dials that share a known_hosts file (e.g. parallel hops or
+// parallel Dial calls) serialize their check-and-append instead of racing
+// the file. The registry itself is guarded by knownHostsLocksMu.
+var (
+	knownHostsLocksMu sync.Mutex
+	knownHostsLocks   = map[string]*sync.Mutex{}
+)
+
+func lockForKnownHosts(path string) *sync.Mutex {
+	knownHostsLocksMu.Lock()
+	defer knownHostsLocksMu.Unlock()
+	mu, ok := knownHostsLocks[path]
+	if !ok {
+		mu = &sync.Mutex{}
+		knownHostsLocks[path] = mu
+	}
+	return mu
+}
+
 // hostKeyCallback implements StrictHostKeyChecking yes|accept-new|no over
 // one known_hosts file. accept-new appends an UNHASHED line (spec §4.2).
 func hostKeyCallback(knownHostsFile, strict string, logf func(string, ...any)) (ssh.HostKeyCallback, error) {
@@ -26,7 +46,7 @@ func hostKeyCallback(knownHostsFile, strict string, logf func(string, ...any)) (
 			return nil
 		}, nil
 	}
-	var mu sync.Mutex
+	mu := lockForKnownHosts(knownHostsFile)
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 		mu.Lock()
 		defer mu.Unlock()
