@@ -1,0 +1,940 @@
+// internal/gitx/attach_test.go
+package gitx
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/google/go-cmp/cmp"
+)
+
+// copyTree copies src to dst recursively (tests only) to simulate the tar
+// transfer of a fresh-main teleport.
+func copyTree(t *testing.T, src, dst string) {
+	t.Helper()
+	err := filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(src, p)
+		target := filepath.Join(dst, rel)
+		switch {
+		case info.IsDir():
+			return os.MkdirAll(target, info.Mode().Perm())
+		case info.Mode()&os.ModeSymlink != 0:
+			l, _ := os.Readlink(p)
+			return os.Symlink(l, target)
+		default:
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(target, b, info.Mode().Perm())
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAttachFreshMainRepairsWorktreeMetadata(t *testing.T) {
+	srcHome := filepath.Join(t.TempDir(), "home", "alice")
+	dstHome := filepath.Join(t.TempDir(), "home", "bob")
+	srcMain := filepath.Join(srcHome, "x")
+	initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "staged.txt"), "s")
+	gitCLI(t, w, "add", "staged.txt")
+	writeFile(t, filepath.Join(w, "untracked.txt"), "u")
+
+	dstMain := filepath.Join(dstHome, "x")
+	copyTree(t, srcMain, dstMain) // as the tar transfer would (metadata still points at srcHome)
+
+	info, _ := Inspect(w)
+	pm := pathMap(srcHome, dstHome)
+	p, err := PlanTransfer(info, &DestState{}, pm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Attach(context.Background(), p, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	dstW := filepath.Join(dstMain, ".worktrees", "feat")
+	gotDotGit, _ := os.ReadFile(filepath.Join(dstW, ".git"))
+	if want := "gitdir: " + filepath.Join(dstMain, ".git", "worktrees", "feat") + "\n"; string(gotDotGit) != want {
+		t.Errorf("W/.git = %q, want %q", gotDotGit, want)
+	}
+	gotGitdir, _ := os.ReadFile(filepath.Join(dstMain, ".git", "worktrees", "feat", "gitdir"))
+	if want := filepath.Join(dstW, ".git") + "\n"; string(gotGitdir) != want {
+		t.Errorf("gitdir = %q, want %q", gotGitdir, want)
+	}
+	// The real git agrees: worktree list shows the destination path, and
+	// status is identical to the source's.
+	list := gitCLI(t, dstMain, "worktree", "list", "--porcelain")
+	if !strings.Contains(list, "worktree "+dstW+"\n") {
+		t.Errorf("git worktree list:\n%s", list)
+	}
+	if diff := cmp.Diff(porcelain(t, w), porcelain(t, dstW)); diff != "" {
+		t.Errorf("status differs (-src +dst):\n%s", diff)
+	}
+	// Idempotent.
+	if err := Attach(context.Background(), p, "", nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAttachExistingMainCreatesWorktreeAndAppliesDirty(t *testing.T) {
+	srcMain := t.TempDir()
+	repo, root := initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "b.txt"), "b\n")
+	gitCLI(t, w, "add", "b.txt")
+	gitCLI(t, w, "commit", "-q", "-m", "feat work")
+	writeFile(t, filepath.Join(w, "README.md"), "modified\n")
+	writeFile(t, filepath.Join(w, "new.txt"), "untracked\n")
+	writeFile(t, filepath.Join(w, "staged.txt"), "staged\n")
+	gitCLI(t, w, "add", "staged.txt")
+	_ = repo
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(w)
+	ds, err := DestStateOf(dstMain, filepath.Join(dstMain, ".worktrees", "feat"), "feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pm := pathMap(srcMain, dstMain)
+	p, err := PlanTransfer(info, ds, pm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Mode != ModeExistingMain || !p.NeedPack {
+		t.Fatalf("plan = %+v", p)
+	}
+	sb, err := StagedBlobsOf(srcMain, filepath.Join(srcMain, p.IndexRel), p.Tip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SetStagedBlobs(sb)
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, append([]string{p.Tip}, p.StagedBlobs...), p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	staging := t.TempDir()
+	packPath := filepath.Join(staging, "objects.pack")
+	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dirty := map[string]DirtyFile{}
+	for i, rel := range []string{"README.md", "new.txt", "staged.txt"} {
+		staged := filepath.Join(staging, string(rune('a'+i)))
+		b, _ := os.ReadFile(filepath.Join(w, rel))
+		if err := os.WriteFile(staged, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		dirty[filepath.Join(p.DstWorktree, rel)] = DirtyFile{Src: staged, Mode: 0o644}
+	}
+	idxStaged := filepath.Join(staging, "index")
+	b, _ := os.ReadFile(filepath.Join(srcMain, p.IndexRel))
+	if err := os.WriteFile(idxStaged, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dirty[filepath.Join(p.DstMain, p.IndexRel)] = DirtyFile{Src: idxStaged}
+
+	if err := Attach(context.Background(), p, packPath, dirty); err != nil {
+		t.Fatal(err)
+	}
+	dstW := p.DstWorktree
+	if diff := cmp.Diff(porcelain(t, w), porcelain(t, dstW)); diff != "" {
+		t.Errorf("status differs (-src +dst):\n%s", diff)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstW, "rev-parse", "HEAD")); got != p.Tip {
+		t.Errorf("dest HEAD = %s, want %s", got, p.Tip)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstW, "rev-parse", "--abbrev-ref", "HEAD")); got != "feat" {
+		t.Errorf("dest branch = %s", got)
+	}
+	if got := gitCLI(t, dstW, "diff", "--cached", "--name-only"); strings.TrimSpace(got) != "staged.txt" {
+		t.Errorf("staged diff = %q", got)
+	}
+	// The recorded DirtyFile.Mode wins over the staged copy's own mode.
+	for _, rel := range []string{"README.md", "new.txt", "staged.txt"} {
+		st, err := os.Stat(filepath.Join(dstW, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Mode().Perm() != 0o644 {
+			t.Errorf("%s mode = %o, want 644 (DirtyFile.Mode)", rel, st.Mode().Perm())
+		}
+	}
+	gitCLI(t, dstMain, "fsck", "--no-dangling")
+	// Re-running attach after success is a no-op that does not clobber the dirty state.
+	if err := Attach(context.Background(), p, packPath, dirty); err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(porcelain(t, w), porcelain(t, dstW)); diff != "" {
+		t.Errorf("status after re-run (-src +dst):\n%s", diff)
+	}
+}
+
+func TestAttachSameDirFastForward(t *testing.T) {
+	srcMain := t.TempDir()
+	repo, root := initRepo(t, srcMain)
+	writeFile(t, filepath.Join(srcMain, "b.txt"), "b\n")
+	second := commitAll(t, repo, "second")
+	writeFile(t, filepath.Join(srcMain, "new.txt"), "untracked\n")
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(srcMain)
+	ds, _ := DestStateOf(dstMain, dstMain, "main")
+	ds.BranchTipReachable, _ = IsAncestor(srcMain, ds.BranchTip, info.Head)
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.FastForward {
+		t.Fatalf("expected fast-forward plan, got %+v", p)
+	}
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	staging := t.TempDir()
+	packPath := filepath.Join(staging, "objects.pack")
+	os.WriteFile(packPath, pack.Bytes(), 0o600)
+	newStaged := filepath.Join(staging, "n")
+	os.WriteFile(newStaged, []byte("untracked\n"), 0o644)
+	idxStaged := filepath.Join(staging, "index")
+	b, _ := os.ReadFile(filepath.Join(srcMain, ".git", "index"))
+	os.WriteFile(idxStaged, b, 0o644)
+	dirty := map[string]DirtyFile{
+		filepath.Join(dstMain, "new.txt"):       {Src: newStaged},
+		filepath.Join(dstMain, ".git", "index"): {Src: idxStaged},
+	}
+	if err := Attach(context.Background(), p, packPath, dirty); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "HEAD")); got != second {
+		t.Errorf("HEAD = %s, want %s", got, second)
+	}
+	if diff := cmp.Diff(porcelain(t, srcMain), porcelain(t, dstMain)); diff != "" {
+		t.Errorf("status differs (-src +dst):\n%s", diff)
+	}
+}
+
+// TestAttachSameDirRefusesWhenDirtiedSincePreflight uses a destination that
+// is BEHIND the tip, so a fast-forward would move refs/heads/main. A
+// refusal must be atomic: the gates are evaluated before the pack is
+// indexed and before the branch ref is touched, so nothing moved.
+func TestAttachSameDirRefusesWhenDirtiedSincePreflight(t *testing.T) {
+	srcMain := t.TempDir()
+	repo, root := initRepo(t, srcMain)
+	writeFile(t, filepath.Join(srcMain, "b.txt"), "b\n")
+	second := commitAll(t, repo, "second")
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+	info, _ := Inspect(srcMain)
+	ds, _ := DestStateOf(dstMain, dstMain, "main")
+	ds.BranchTipReachable, _ = IsAncestor(srcMain, ds.BranchTip, info.Head)
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.FastForward || p.Tip != second {
+		t.Fatalf("fixture wants a fast-forward plan to %s, got %+v", second[:7], p)
+	}
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(t.TempDir(), "objects.pack")
+	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, filepath.Join(dstMain, "sneaky.txt"), "x") // dirtied after preflight
+	err = Attach(context.Background(), p, packPath, nil)
+	if err == nil || !strings.Contains(err.Error(), "not clean") {
+		t.Fatalf("err = %v, want not-clean refusal", err)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "refs/heads/main")); got != root {
+		t.Errorf("refs/heads/main moved to %s on a refused attach, want %s", got[:7], root[:7])
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "HEAD")); got != root {
+		t.Errorf("HEAD moved to %s on a refused attach, want %s", got[:7], root[:7])
+	}
+}
+
+// TestAttachRefusesDirtyPathOutsideWorktree is the containment invariant:
+// a plan whose dirty map names a path outside the destination worktree
+// (and that is not the index) is refused before anything is written.
+func TestAttachRefusesDirtyPathOutsideWorktree(t *testing.T) {
+	srcMain := t.TempDir()
+	repo, root := initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "b.txt"), "b\n")
+	gitCLI(t, w, "add", "b.txt")
+	gitCLI(t, w, "commit", "-q", "-m", "feat work")
+	_ = repo
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(w)
+	ds, err := DestStateOf(dstMain, filepath.Join(dstMain, ".worktrees", "feat"), "feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := t.TempDir()
+	payload := filepath.Join(staging, "payload")
+	writeFile(t, payload, "pwned\n")
+	outside := filepath.Join(filepath.Dir(dstMain), "escape.txt")
+	dirty := map[string]DirtyFile{outside: {Src: payload, Mode: 0o644}}
+
+	var re *RefuseError
+	err = Attach(context.Background(), p, "", dirty)
+	if !errors.As(err, &re) || !strings.Contains(re.Reason, "escape.txt") {
+		t.Fatalf("err = %v, want a *RefuseError naming escape.txt", err)
+	}
+	if _, err := os.Lstat(outside); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("%s was written despite the refusal (%v)", outside, err)
+	}
+	// Nothing else was mutated either: the worktree was never created.
+	if _, err := os.Lstat(p.DstWorktree); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("destination worktree %s created despite the refusal (%v)", p.DstWorktree, err)
+	}
+}
+
+// TestAttachVerifiesStagedBlobs covers the "index references objects that
+// were never sent" hole: when the destination branch already sits at Tip
+// the plan needs no pack, yet the transferred index still names the staged
+// blobs. SetStagedBlobs forces the pack; an attach handed a plan whose
+// staged blobs are absent must refuse rather than install a corrupt index.
+func TestAttachVerifiesStagedBlobs(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "b.txt"), "b\n")
+	gitCLI(t, w, "add", "b.txt")
+	gitCLI(t, w, "commit", "-q", "-m", "feat work")
+	featTip := strings.TrimSpace(gitCLI(t, w, "rev-parse", "HEAD"))
+	// Staged but never committed: its blob lives only in the index.
+	writeFile(t, filepath.Join(w, "staged.txt"), "staged only\n")
+	gitCLI(t, w, "add", "staged.txt")
+
+	info, err := Inspect(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := StagedBlobsOf(srcMain, filepath.Join(srcMain, indexRelOf(info)), info.Head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blobs) != 1 {
+		t.Fatalf("StagedBlobs = %v, want exactly the staged blob", blobs)
+	}
+
+	// newPlan builds a fresh destination that already has refs/heads/feat
+	// at Tip, so PlanTransfer decides NeedPack = false.
+	newPlan := func(t *testing.T) *Plan {
+		t.Helper()
+		dstMain := filepath.Join(t.TempDir(), "x")
+		initRepoAt(t, dstMain, srcMain, root)
+		gitCLI(t, dstMain, "branch", "feat", featTip)
+		ds, err := DestStateOf(dstMain, filepath.Join(dstMain, ".worktrees", "feat"), "feat")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.NeedPack {
+			t.Fatalf("fixture wants a dest already at tip (NeedPack false), got %+v", p)
+		}
+		return p
+	}
+
+	t.Run("unsent staged blob is refused", func(t *testing.T) {
+		p := newPlan(t)
+		p.StagedBlobs = blobs // the old, unguarded assignment: no pack follows
+		var re *RefuseError
+		err := Attach(context.Background(), p, "", nil)
+		if !errors.As(err, &re) || !strings.Contains(re.Reason, blobs[0][:7]) {
+			t.Fatalf("err = %v, want a *RefuseError naming %s", err, blobs[0][:7])
+		}
+		if _, err := os.Lstat(p.DstWorktree); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("worktree created despite the refusal (%v)", err)
+		}
+	})
+
+	t.Run("SetStagedBlobs forces the pack that carries them", func(t *testing.T) {
+		p := newPlan(t)
+		p.SetStagedBlobs(blobs)
+		if !p.NeedPack {
+			t.Fatal("SetStagedBlobs must force NeedPack")
+		}
+		var pack bytes.Buffer
+		if err := WritePack(context.Background(), srcMain, append([]string{p.Tip}, p.StagedBlobs...), p.HaveTips, &pack); err != nil {
+			t.Fatal(err)
+		}
+		if pack.Len() == 0 {
+			t.Fatal("pack for the staged blob must not be empty")
+		}
+		packPath := filepath.Join(t.TempDir(), "objects.pack")
+		if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := Attach(context.Background(), p, packPath, nil); err != nil {
+			t.Fatal(err)
+		}
+		gitCLI(t, p.DstMain, "cat-file", "-e", blobs[0])
+	})
+}
+
+// indexRelOf is the index path a plan would use for info (linked or not).
+func indexRelOf(info *Info) string {
+	if info.IsLinked {
+		return filepath.Join(".git", "worktrees", info.WorktreeName, "index")
+	}
+	return filepath.Join(".git", "index")
+}
+
+// TestAttachLinkedRefusesWorktreeAppearingSincePreflight: the plan said the
+// destination worktree directory was absent, but something created it
+// between preflight and attach. Attach re-checks and refuses without
+// touching what is there.
+func TestAttachLinkedRefusesWorktreeAppearingSincePreflight(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "b.txt"), "b\n")
+	gitCLI(t, w, "add", "b.txt")
+	gitCLI(t, w, "commit", "-q", "-m", "feat work")
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(w)
+	ds, err := DestStateOf(dstMain, filepath.Join(dstMain, ".worktrees", "feat"), "feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Somebody else got there first, after preflight.
+	survivor := filepath.Join(p.DstWorktree, "theirs.txt")
+	writeFile(t, survivor, "do not clobber\n")
+
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(t.TempDir(), "objects.pack")
+	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var re *RefuseError
+	err = Attach(context.Background(), p, packPath, nil)
+	if !errors.As(err, &re) || !strings.Contains(re.Reason, "already exists") {
+		t.Fatalf("err = %v, want an already-exists *RefuseError", err)
+	}
+	got, rerr := os.ReadFile(survivor)
+	if rerr != nil || string(got) != "do not clobber\n" {
+		t.Errorf("%s = %q (%v), want it untouched", survivor, got, rerr)
+	}
+	if _, err := os.Lstat(worktreeGitDir(p)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("worktree metadata created despite the refusal (%v)", err)
+	}
+}
+
+// TestAttachLinkedRefusesBranchCheckedOutElsewhere: the session branch got
+// checked out somewhere else on the destination between plan and attach.
+func TestAttachLinkedRefusesBranchCheckedOutElsewhere(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "b.txt"), "b\n")
+	gitCLI(t, w, "add", "b.txt")
+	gitCLI(t, w, "commit", "-q", "-m", "feat work")
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(w)
+	ds, err := DestStateOf(dstMain, filepath.Join(dstMain, ".worktrees", "feat"), "feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// After preflight the destination checks the branch out elsewhere.
+	gitCLI(t, dstMain, "branch", "feat", root)
+	gitCLI(t, dstMain, "worktree", "add", filepath.Join(dstMain, "other"), "feat")
+
+	var re *RefuseError
+	err = Attach(context.Background(), p, "", nil)
+	if !errors.As(err, &re) || !strings.Contains(re.Reason, "checked out") {
+		t.Fatalf("err = %v, want a checked-out-elsewhere *RefuseError", err)
+	}
+	if _, err := os.Lstat(p.DstWorktree); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("worktree created despite the refusal (%v)", err)
+	}
+}
+
+// TestAttachSameDirFastForwardKeepsIgnoredFiles: go-git's HardReset walks
+// the worktree with excludeIgnoredChanges = false, so a blanket reset
+// deletes ignored-but-present destination files (build output, node_modules
+// …). A fast-forward must move only the paths the two trees differ in.
+func TestAttachSameDirFastForwardKeepsIgnoredFiles(t *testing.T) {
+	srcMain := t.TempDir()
+	repo, _ := initRepo(t, srcMain)
+	writeFile(t, filepath.Join(srcMain, ".gitignore"), "build/\n")
+	base := commitAll(t, repo, "ignore")
+	writeFile(t, filepath.Join(srcMain, "b.txt"), "b\n")
+	writeFile(t, filepath.Join(srcMain, "README.md"), "hello again\n")
+	tip := commitAll(t, repo, "second")
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, base)
+	// Ignored build output the destination already has on disk.
+	ignored := filepath.Join(dstMain, "build", "out.bin")
+	writeFile(t, ignored, "expensive artifact\n")
+	if got := porcelain(t, dstMain); got != nil {
+		t.Fatalf("fixture destination must look clean, got %v", got)
+	}
+
+	info, _ := Inspect(srcMain)
+	ds, _ := DestStateOf(dstMain, dstMain, "main")
+	ds.BranchTipReachable, _ = IsAncestor(srcMain, ds.BranchTip, info.Head)
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.FastForward || p.Tip != tip {
+		t.Fatalf("fixture wants a fast-forward plan, got %+v", p)
+	}
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(t.TempDir(), "objects.pack")
+	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Attach(context.Background(), p, packPath, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := os.ReadFile(ignored); err != nil || string(got) != "expensive artifact\n" {
+		t.Errorf("%s = %q (%v), want it to survive the fast-forward", ignored, got, err)
+	}
+	if got := porcelain(t, dstMain); got != nil {
+		t.Errorf("destination status after fast-forward = %v, want clean", got)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "HEAD")); got != tip {
+		t.Errorf("HEAD = %s, want %s", got, tip)
+	}
+	// The tracked change actually landed.
+	for rel, want := range map[string]string{"b.txt": "b\n", "README.md": "hello again\n"} {
+		if got, err := os.ReadFile(filepath.Join(dstMain, rel)); err != nil || string(got) != want {
+			t.Errorf("%s = %q (%v), want %q", rel, got, err, want)
+		}
+	}
+	gitCLI(t, dstMain, "fsck", "--no-dangling")
+}
+
+// TestCreateLinkedWorktreeRefusesNonEmptyDir guards the populate step
+// itself: go-git's hard reset is only safe on the empty directory attach
+// just made, so createLinkedWorktree refuses anything else outright rather
+// than deleting files it does not own.
+func TestCreateLinkedWorktreeRefusesNonEmptyDir(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	p := &Plan{
+		Mode: ModeExistingMain, Linked: true, WorktreeName: "feat", Branch: "main",
+		DstMain: dstMain, DstWorktree: filepath.Join(dstMain, ".worktrees", "feat"),
+		Tip: root, IndexRel: ".git/worktrees/feat/index",
+	}
+	survivor := filepath.Join(p.DstWorktree, "theirs.txt")
+	writeFile(t, survivor, "do not clobber\n")
+
+	var re *RefuseError
+	err := createLinkedWorktree(p, plumbing.NewHash(root))
+	if !errors.As(err, &re) || !strings.Contains(re.Reason, "not empty") {
+		t.Fatalf("err = %v, want a not-empty *RefuseError", err)
+	}
+	if !strings.Contains(re.Reason, "theirs.txt") {
+		t.Errorf("Reason = %q, want it to name the offending entry", re.Reason)
+	}
+	if got, err := os.ReadFile(survivor); err != nil || string(got) != "do not clobber\n" {
+		t.Errorf("%s = %q (%v), want it untouched", survivor, got, err)
+	}
+}
+
+// TestAttachSameDirDetachedFastForward: a W == M transfer where both sides
+// sit on a detached HEAD. There is no branch to match and no ref to move —
+// the detached HEAD itself advances to the tip and the tree follows.
+func TestAttachSameDirDetachedFastForward(t *testing.T) {
+	srcMain := t.TempDir()
+	repo, root := initRepo(t, srcMain)
+	writeFile(t, filepath.Join(srcMain, "b.txt"), "b\n")
+	second := commitAll(t, repo, "second")
+	gitCLI(t, srcMain, "checkout", "-q", "--detach", second)
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+	gitCLI(t, dstMain, "checkout", "-q", "--detach", root)
+
+	info, err := Inspect(srcMain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Detached {
+		t.Fatalf("fixture wants a detached source, got %+v", info)
+	}
+	ds, err := DestStateOf(dstMain, dstMain, info.Branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ds.WorktreeDetached || ds.WorktreeBranch != "" || !ds.Clean {
+		t.Fatalf("fixture wants a clean detached destination, got %+v", ds)
+	}
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Mode != ModeExistingMain || !p.Detached || p.Linked || !p.NeedPack {
+		t.Fatalf("plan = %+v", p)
+	}
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(t.TempDir(), "objects.pack")
+	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Attach(context.Background(), p, packPath, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "HEAD")); got != second {
+		t.Errorf("HEAD = %s, want %s", got, second)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "--abbrev-ref", "HEAD")); got != "HEAD" {
+		t.Errorf("destination left branch %q, want a detached HEAD", got)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "refs/heads/main")); got != root {
+		t.Errorf("refs/heads/main = %s, want it untouched at %s", got, root)
+	}
+	if got := porcelain(t, dstMain); got != nil {
+		t.Errorf("status = %v, want clean", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(dstMain, "b.txt")); err != nil || string(got) != "b\n" {
+		t.Errorf("b.txt = %q (%v)", got, err)
+	}
+	gitCLI(t, dstMain, "fsck", "--no-dangling")
+
+	// A destination that switched to a branch since preflight is refused.
+	gitCLI(t, dstMain, "checkout", "-q", "main")
+	var re *RefuseError
+	if err := Attach(context.Background(), p, packPath, nil); !errors.As(err, &re) || !strings.Contains(re.Reason, "detached") {
+		t.Fatalf("err = %v, want a detached-HEAD *RefuseError", err)
+	}
+}
+
+// TestAttachRefusesDirtyPathInsideDotGit: in the W == M shape the worktree
+// contains the repository itself, so "under DstWorktree" is not enough —
+// only the index may land inside .git. Anything else (a hook, a config, a
+// ref) is a smuggled payload.
+func TestAttachRefusesDirtyPathInsideDotGit(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(srcMain)
+	ds, _ := DestStateOf(dstMain, dstMain, "main")
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := t.TempDir()
+	payload := filepath.Join(staging, "payload")
+	writeFile(t, payload, "#!/bin/sh\nexfiltrate\n")
+	idxStaged := filepath.Join(staging, "index")
+	b, _ := os.ReadFile(filepath.Join(srcMain, ".git", "index"))
+	writeFile(t, idxStaged, string(b))
+
+	hook := filepath.Join(dstMain, ".git", "hooks", "pre-commit")
+	dirty := map[string]DirtyFile{
+		filepath.Join(dstMain, p.IndexRel): {Src: idxStaged},
+		hook:                               {Src: payload, Mode: 0o755},
+	}
+	var re *RefuseError
+	if err := Attach(context.Background(), p, "", dirty); !errors.As(err, &re) || !strings.Contains(re.Reason, "pre-commit") {
+		t.Fatalf("err = %v, want a *RefuseError naming the hook", err)
+	}
+	if _, err := os.Lstat(hook); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("hook was written despite the refusal (%v)", err)
+	}
+	// The index alone still passes containment.
+	delete(dirty, hook)
+	if err := Attach(context.Background(), p, "", dirty); err != nil {
+		t.Fatalf("index-only dirty map must be accepted: %v", err)
+	}
+}
+
+// TestAttachSameDirFastForwardCheckoutShapes drives applyTreeDiff over the
+// checkout shapes a tree diff can produce. Each case builds a base commit,
+// a tip commit, a destination sitting at base, and then fast-forwards it;
+// unless wantErr says otherwise the destination must end at the tip with a
+// clean `git status --porcelain`.
+func TestAttachSameDirFastForwardCheckoutShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		base    func(t *testing.T, dir string)
+		tip     func(t *testing.T, dir string)
+		dest    func(t *testing.T, dir string)
+		check   func(t *testing.T, dir string)
+		wantErr []string // non-empty: Attach must fail loudly, mentioning all of these
+	}{
+		{
+			name: "delete",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "gone.txt"), "bye\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.Remove(filepath.Join(dir, "gone.txt")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				if _, err := os.Lstat(filepath.Join(dir, "gone.txt")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("gone.txt survived the delete arm (%v)", err)
+				}
+			},
+		},
+		{
+			name: "delete empties a directory",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "sub", "only.txt"), "bye\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.RemoveAll(filepath.Join(dir, "sub")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				if _, err := os.Lstat(filepath.Join(dir, "sub")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("emptied directory sub was not pruned (%v)", err)
+				}
+			},
+		},
+		{
+			name: "symlink added",
+			base: func(t *testing.T, dir string) {},
+			tip: func(t *testing.T, dir string) {
+				if err := os.Symlink("README.md", filepath.Join(dir, "link")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				got, err := os.Readlink(filepath.Join(dir, "link"))
+				if err != nil || got != "README.md" {
+					t.Errorf("link -> %q (%v), want README.md", got, err)
+				}
+			},
+		},
+		{
+			name: "symlink retargeted",
+			base: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, "a.txt"), "a\n")
+				if err := os.Symlink("README.md", filepath.Join(dir, "link")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			tip: func(t *testing.T, dir string) {
+				if err := os.Remove(filepath.Join(dir, "link")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("a.txt", filepath.Join(dir, "link")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				got, err := os.Readlink(filepath.Join(dir, "link"))
+				if err != nil || got != "a.txt" {
+					t.Errorf("link -> %q (%v), want a.txt", got, err)
+				}
+			},
+		},
+		{
+			name: "mode-only change",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "run.sh"), "#!/bin/sh\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.Chmod(filepath.Join(dir, "run.sh"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				st, err := os.Stat(filepath.Join(dir, "run.sh"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if st.Mode().Perm()&0o111 == 0 {
+					t.Errorf("run.sh mode = %o, want the executable bit set", st.Mode().Perm())
+				}
+				if got, err := os.ReadFile(filepath.Join(dir, "run.sh")); err != nil || string(got) != "#!/bin/sh\n" {
+					t.Errorf("run.sh = %q (%v)", got, err)
+				}
+			},
+		},
+		{
+			name: "file becomes a directory",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "x"), "file\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.Remove(filepath.Join(dir, "x")); err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, filepath.Join(dir, "x", "y"), "now a dir\n")
+			},
+			check: func(t *testing.T, dir string) {
+				if got, err := os.ReadFile(filepath.Join(dir, "x", "y")); err != nil || string(got) != "now a dir\n" {
+					t.Errorf("x/y = %q (%v)", got, err)
+				}
+			},
+		},
+		{
+			name: "directory becomes a file",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "d", "f"), "inside\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.RemoveAll(filepath.Join(dir, "d")); err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, filepath.Join(dir, "d"), "now a file\n")
+			},
+			check: func(t *testing.T, dir string) {
+				got, err := os.ReadFile(filepath.Join(dir, "d"))
+				if err != nil || string(got) != "now a file\n" {
+					t.Errorf("d = %q (%v), want the file content", got, err)
+				}
+			},
+		},
+		{
+			// A directory that becomes a file while the destination still
+			// holds an IGNORED file inside it cannot be checked out: the
+			// directory will not go away. The current behaviour is a loud
+			// error, asserted here so it stays loud. Turning this into an
+			// up-front refusal (a pre-scan of the diff against what is on
+			// disk, before anything is written) is deferred; see the fix
+			// wave report's concerns.
+			name: "directory becomes a file, ignored leftover blocks it",
+			base: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
+				writeFile(t, filepath.Join(dir, "d", "f"), "inside\n")
+			},
+			tip: func(t *testing.T, dir string) {
+				if err := os.RemoveAll(filepath.Join(dir, "d")); err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, filepath.Join(dir, "d"), "now a file\n")
+			},
+			dest:    func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "d", "keep.log"), "artifact\n") },
+			wantErr: []string{"fast-forward", "directory not empty"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srcMain := t.TempDir()
+			initRepo(t, srcMain)
+			c.base(t, srcMain)
+			base := commitAllCLI(t, srcMain, "base")
+			c.tip(t, srcMain)
+			tip := commitAllCLI(t, srcMain, "tip")
+			if base == tip {
+				t.Fatal("fixture produced no change between base and tip")
+			}
+
+			dstMain := filepath.Join(t.TempDir(), "x")
+			initRepoAt(t, dstMain, srcMain, base)
+			if c.dest != nil {
+				c.dest(t, dstMain)
+			}
+
+			info, err := Inspect(srcMain)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ds, err := DestStateOf(dstMain, dstMain, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ds.BranchTipReachable, err = IsAncestor(srcMain, ds.BranchTip, info.Head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !p.FastForward || p.Tip != tip {
+				t.Fatalf("fixture wants a fast-forward plan to %s, got %+v", tip[:7], p)
+			}
+			var pack bytes.Buffer
+			if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+				t.Fatal(err)
+			}
+			packPath := filepath.Join(t.TempDir(), "objects.pack")
+			if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			err = Attach(context.Background(), p, packPath, nil)
+			if len(c.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("err = nil, want a failure mentioning %v", c.wantErr)
+				}
+				for _, want := range c.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("err = %v, want it to mention %q", err, want)
+					}
+				}
+				var re *RefuseError
+				if errors.As(err, &re) {
+					t.Errorf("err = %v, want a loud failure, not a refusal", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "HEAD")); got != tip {
+				t.Errorf("HEAD = %s, want %s", got, tip)
+			}
+			if got := porcelain(t, dstMain); got != nil {
+				t.Errorf("status after fast-forward = %v, want clean", got)
+			}
+			c.check(t, dstMain)
+			gitCLI(t, dstMain, "fsck", "--no-dangling")
+		})
+	}
+}
