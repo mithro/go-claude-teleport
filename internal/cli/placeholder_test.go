@@ -27,10 +27,15 @@ func placeholderFixture(t *testing.T) (cfg, cwd string) {
 func stubExec(t *testing.T) (execs *[][]string, chdirs *[]string) {
 	t.Helper()
 	oldExec, oldLook, oldChdir, oldIn, oldOut := execveFn, lookPathFn, chdirFn, stdinTTYFn, stdoutTTYFn
-	t.Cleanup(func() { execveFn, lookPathFn, chdirFn, stdinTTYFn, stdoutTTYFn = oldExec, oldLook, oldChdir, oldIn, oldOut })
+	t.Cleanup(func() {
+		execveFn, lookPathFn, chdirFn, stdinTTYFn, stdoutTTYFn = oldExec, oldLook, oldChdir, oldIn, oldOut
+	})
 	var e [][]string
 	var c []string
-	execveFn = func(path string, argv []string, env []string) error { e = append(e, append([]string{path}, argv...)); return nil }
+	execveFn = func(path string, argv []string, env []string) error {
+		e = append(e, append([]string{path}, argv...))
+		return nil
+	}
 	lookPathFn = func(file string) (string, error) { return "/usr/local/bin/" + file, nil }
 	chdirFn = func(dir string) error { c = append(c, dir); return nil }
 	stdinTTYFn = func() bool { return false }

@@ -35,23 +35,23 @@ type Permissions struct {
 
 // Inventory is everything Compare looks at on one host.
 type Inventory struct {
-	Host           string
-	ClaudeVersion  string
-	Hooks          string // canonical JSON of settings.hooks ("" if absent)
-	Permissions    Permissions
-	Env            map[string]string
-	EnabledPlugins map[string]bool
-	Model, Effort  string
-	MCPServers     map[string]string // name -> canonical JSON config (user level)
-	ProjectPresent bool
-	ProjectMCP     map[string]string // projects[cwd].mcpServers
+	Host                                          string
+	ClaudeVersion                                 string
+	Hooks                                         string // canonical JSON of settings.hooks ("" if absent)
+	Permissions                                   Permissions
+	Env                                           map[string]string
+	EnabledPlugins                                map[string]bool
+	Model, Effort                                 string
+	MCPServers                                    map[string]string // name -> canonical JSON config (user level)
+	ProjectPresent                                bool
+	ProjectMCP                                    map[string]string // projects[cwd].mcpServers
 	ProjectEnabledMCPJSON, ProjectDisabledMCPJSON []string
-	AllowedTools    []string
-	Plugins         map[string]PluginInfo // "name@marketplace" -> info
-	TreeHashes      map[string]string     // "CLAUDE.md", "agents", "skills", "commands"
-	KeybindingsHash string
-	Skills          map[string]bool // user skills/<name>/SKILL.md and plugin "<plugin>:<skill>"
-	Agents          map[string]bool // user agents/<name>.md and plugin "<plugin>:<agent>"
+	AllowedTools                                  []string
+	Plugins                                       map[string]PluginInfo // "name@marketplace" -> info
+	TreeHashes                                    map[string]string     // "CLAUDE.md", "agents", "skills", "commands"
+	KeybindingsHash                               string
+	Skills                                        map[string]bool // user skills/<name>/SKILL.md and plugin "<plugin>:<skill>"
+	Agents                                        map[string]bool // user agents/<name>.md and plugin "<plugin>:<agent>"
 }
 
 // canonical renders a decoded JSON value deterministically (sorted keys,
