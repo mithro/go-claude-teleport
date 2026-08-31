@@ -80,9 +80,18 @@ func TestCompareConfigDestHomeNormalLayout(t *testing.T) {
 	}
 }
 
-func TestCompareConfigRemoteNotYet(t *testing.T) {
-	if code, _, stderr := run(t, []string{"HOME=/home/alice"}, "compare-config", "big-storage.example"); code != ExitUsage || !strings.Contains(stderr, "not implemented yet") {
+// TestCompareConfigHostnameDialsRemote covers the transition from Plan 01's
+// "not implemented yet" stub to the real Plan 02 remote transport: a
+// hostname target is now dialled over ssh (and fails unreachable here,
+// since there is nothing listening) rather than rejected as a usage error.
+// internal/cli/remotecfg_test.go covers the live remote path end to end.
+func TestCompareConfigHostnameDialsRemote(t *testing.T) {
+	code, _, stderr := run(t, []string{"HOME=/home/alice", "USER=alice"}, "compare-config", "big-storage.example", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=1")
+	if code != ExitUnreachable {
 		t.Fatalf("%d %q", code, stderr)
+	}
+	if strings.Contains(stderr, "not implemented yet") {
+		t.Fatalf("hostname targets must dial the remote transport, not the old stub: %q", stderr)
 	}
 }
 
