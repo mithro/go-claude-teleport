@@ -271,14 +271,10 @@ func TestLocalPlan03OpsAreExplicitStubs(t *testing.T) {
 	checks := map[string]error{}
 	// InventoryGit, GitDestState and GitAttach are implemented for real
 	// (local_git.go, local_git_test.go) and no longer explicit stubs.
-	_, checks["InventoryTmux"] = l.InventoryTmux(ctx, nil, "")
-	checks["Capture"] = l.Capture(ctx, nil, sid)
-	_, checks["OpenWindow"] = l.OpenWindow(ctx, nil)
-	checks["StartClaude"] = l.StartClaude(ctx, nil, session.ID(sid), sid, nil)
-	_, checks["ConfirmClaude"] = l.ConfirmClaude(ctx, nil, session.ID(sid), time.Second)
-	checks["ExitClaude"] = l.ExitClaude(ctx, nil, 1, "0", time.Second)
-	checks["TypeCommand"] = l.TypeCommand(ctx, nil, nil)
-	_, checks["PaneState"] = l.PaneState(ctx, nil)
+	// InventoryTmux, Capture, OpenWindow, StartClaude, ConfirmClaude,
+	// ExitClaude, TypeCommand and PaneState are implemented for real
+	// (local_tmux.go/local_claude.go, local_tmux_test.go/local_claude_test.go)
+	// and no longer explicit stubs (Task 14).
 	checks["RunPtyResume"] = l.RunPtyResume(ctx, session.ID(sid), "/home/bob/work", time.Second)
 	for name, err := range checks {
 		if !isUnavailable(err) {

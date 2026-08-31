@@ -34,6 +34,10 @@ type LocalOptions struct {
 	// resolves it and passes it in here.
 	TmuxSocketDir string
 
+	// Sleep is used for every bounded poll (ConfirmClaude, ExitClaude);
+	// nil defaults to time.Sleep. Tests inject a no-op / counting stub.
+	Sleep func(time.Duration)
+
 	Probe session.PaneProbe
 	Tmux  tmuxx.Dialer // nil = tmux unavailable
 	Logf  func(string, ...any)
@@ -49,6 +53,10 @@ type Local struct {
 
 	mu       sync.Mutex
 	freezers map[int]*procx.Freezer
+
+	// procs scans the process table (opts.ProcRoot); shared by the tmux
+	// and Claude ops so a poll loop's every iteration rescans fresh.
+	procs func() (*procx.Table, error)
 }
 
 func NewLocal(p session.Paths, selfExe string, opts LocalOptions) *Local {
@@ -59,8 +67,12 @@ func NewLocal(p session.Paths, selfExe string, opts LocalOptions) *Local {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
+	if opts.Sleep == nil {
+		opts.Sleep = time.Sleep
+	}
 	host, _ := os.Hostname()
-	return &Local{paths: p, selfExe: selfExe, opts: opts, Hostname: host, freezers: map[int]*procx.Freezer{}}
+	return &Local{paths: p, selfExe: selfExe, opts: opts, Hostname: host, freezers: map[int]*procx.Freezer{},
+		procs: func() (*procx.Table, error) { return procx.Scan(opts.ProcRoot) }}
 }
 
 var _ Endpoint = (*Local)(nil)
@@ -132,9 +144,10 @@ func (l *Local) InventoryHost(ctx context.Context, cwd, claudeVersion string) (*
 // InventoryGit, GitDestState, GitFiles, GitSourceFacts and GitAttach are
 // implemented in local_git.go.
 
-func (l *Local) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket string) (*tmuxx.Facts, error) {
-	return nil, Unavailable(OpInventoryTmux)
-}
+// InventoryTmux, TmuxSessions, OpenWindow, Capture, TypeCommand, PaneState
+// and KillWindow are implemented in local_tmux.go. StartClaude,
+// ConfirmClaude, ExitClaude and ClaudeStatus are implemented in
+// local_claude.go.
 
 func (l *Local) jobDir(jobID string) string     { return job.Dir(l.paths.DataDir, jobID) }
 func (l *Local) stagingDir(jobID string) string { return job.StagingDir(l.paths.DataDir, jobID) }
@@ -279,27 +292,6 @@ func (l *Local) Thaw(ctx context.Context, pid int) error {
 	return f.Thaw()
 }
 
-func (l *Local) Capture(ctx context.Context, ref *session.TmuxRef, jobID string) error {
-	return Unavailable(OpCapture)
-}
-func (l *Local) OpenWindow(ctx context.Context, p *tmuxx.Plan) (*session.TmuxRef, error) {
-	return nil, Unavailable(OpOpenWindow)
-}
-func (l *Local) StartClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, jobID string, argv []string) error {
-	return Unavailable(OpStartClaude)
-}
-func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration) (*session.Registry, error) {
-	return nil, Unavailable(OpConfirmClaude)
-}
-func (l *Local) ExitClaude(ctx context.Context, ref *session.TmuxRef, pid int, startTime string, timeout time.Duration) error {
-	return Unavailable(OpExitClaude)
-}
-func (l *Local) TypeCommand(ctx context.Context, ref *session.TmuxRef, argv []string) error {
-	return Unavailable(OpTypeCommand)
-}
-func (l *Local) PaneState(ctx context.Context, ref *session.TmuxRef) (*tmuxx.PaneState, error) {
-	return nil, Unavailable(OpPaneState)
-}
 func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, timeout time.Duration) error {
 	return Unavailable(OpRunPtyResume)
 }
