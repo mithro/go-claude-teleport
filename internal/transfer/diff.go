@@ -60,10 +60,22 @@ func stagedState(stagingDir string, e Entry) (staged bool, mismatch bool, err er
 	switch {
 	case e.IsDir():
 		_, serr := os.Lstat(base + ".dir")
-		return serr == nil, mismatch, nil
+		if serr == nil {
+			return true, mismatch, nil
+		}
+		if errors.Is(serr, os.ErrNotExist) {
+			return false, mismatch, nil
+		}
+		return false, false, fmt.Errorf("stat staged %s: %w", base+".dir", serr)
 	case e.IsSymlink():
 		raw, serr := os.ReadFile(base + ".symlink")
-		return serr == nil && string(raw) == e.Symlink, mismatch, nil
+		if serr == nil {
+			return string(raw) == e.Symlink, mismatch, nil
+		}
+		if errors.Is(serr, os.ErrNotExist) {
+			return false, mismatch, nil
+		}
+		return false, false, fmt.Errorf("read staged %s: %w", base+".symlink", serr)
 	}
 	st, serr := os.Lstat(base)
 	if errors.Is(serr, os.ErrNotExist) {
@@ -126,8 +138,15 @@ func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, 
 				out[e.ID] = PresentDifferent
 			}
 		case e.IsSymlink():
+			if st.Mode()&os.ModeSymlink == 0 {
+				out[e.ID] = PresentDifferent
+				continue
+			}
 			target, rerr := os.Readlink(e.Dst)
-			if rerr == nil && target == e.Symlink {
+			if rerr != nil {
+				return nil, fmt.Errorf("readlink %s: %w", e.Dst, rerr)
+			}
+			if target == e.Symlink {
 				out[e.ID] = PresentSame
 			} else {
 				out[e.ID] = PresentDifferent

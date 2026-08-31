@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -164,5 +165,36 @@ func TestDiffFFCandidateRecordReflow(t *testing.T) {
 	}
 	if st[0] != FFCandidate {
 		t.Errorf("byte-reflowed record-equal prefix = %s, want ff-candidate", st[0])
+	}
+}
+
+// TestDiffPropagatesNonENOENTStagedErrors covers a fix-round-1 finding:
+// stagedState's dir/symlink branches, and Diff's symlink comparison, must
+// only treat os.ErrNotExist as "not staged"/"absent" — any other error (a
+// permission failure here) must propagate wrapped with the offending path,
+// not be silently swallowed as "not staged".
+func TestDiffPropagatesNonENOENTStagedErrors(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits do not gate reads")
+	}
+	dest := t.TempDir()
+	staging := t.TempDir()
+	m := &Manifest{Version: 1, JobID: sid, SessionID: sid}
+	m.Entries = []Entry{
+		{ID: 0, Category: session.CatSession, Dst: filepath.Join(dest, "link"), Mode: uint32(os.ModeSymlink | 0o777), Symlink: "target"},
+	}
+	staged := StagedPath(staging, 0) + ".symlink"
+	writeFile(t, staged, "target")
+	if err := os.Chmod(staged, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(staged, 0o600) // best-effort: let TempDir cleanup remove it either way
+
+	_, err := Diff(context.Background(), m, staging)
+	if err == nil {
+		t.Fatal("Diff must propagate a non-ENOENT staged-symlink read error, not swallow it")
+	}
+	if !strings.Contains(err.Error(), staged) {
+		t.Errorf("error must name the path %s: %v", staged, err)
 	}
 }
