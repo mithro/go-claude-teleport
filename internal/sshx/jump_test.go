@@ -73,16 +73,20 @@ func TestDialThroughJumpResolvesOnJump(t *testing.T) {
 }
 
 func TestRedialBoundedRetries(t *testing.T) {
+	sentinelErr := errors.New("refused")
 	calls := 0
 	_, err := Redial(context.Background(), 3, time.Millisecond, t.Logf, func(ctx context.Context) (*Client, error) {
 		calls++
-		return nil, errors.New("refused")
+		return nil, sentinelErr
 	})
 	if calls != 3 {
 		t.Errorf("calls = %d, want 3", calls)
 	}
 	if err == nil || strings.Count(err.Error(), "refused") != 3 {
 		t.Errorf("err = %v, want all three attempts listed", err)
+	}
+	if !errors.Is(err, sentinelErr) {
+		t.Errorf("err = %v, want errors.Is(err, sentinelErr) for the exhausted-retries case", err)
 	}
 
 	calls = 0

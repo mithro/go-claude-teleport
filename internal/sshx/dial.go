@@ -169,13 +169,15 @@ func (c *Client) closeAll() {
 // Redial calls dial up to attempts times with exponential backoff
 // (backoff, 2*backoff, ... capped at 30s). Every attempt's error is kept.
 func Redial(ctx context.Context, attempts int, backoff time.Duration, logf func(string, ...any), dial func(ctx context.Context) (*Client, error)) (*Client, error) {
-	if attempts < 1 {
-		attempts = 1
-	}
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	if attempts < 1 {
+		logf("redial: attempts=%d < 1, clamping to 1", attempts)
+		attempts = 1
+	}
 	var errs []string
+	var lastErr error
 	wait := backoff
 	for i := 1; i <= attempts; i++ {
 		if err := ctx.Err(); err != nil {
@@ -185,6 +187,7 @@ func Redial(ctx context.Context, attempts int, backoff time.Duration, logf func(
 		if err == nil {
 			return c, nil
 		}
+		lastErr = err
 		errs = append(errs, fmt.Sprintf("attempt %d: %v", i, err))
 		if i == attempts {
 			break
@@ -200,5 +203,16 @@ func Redial(ctx context.Context, attempts int, backoff time.Duration, logf func(
 			wait = 30 * time.Second
 		}
 	}
-	return nil, fmt.Errorf("ssh dial failed after %d attempts: %s", attempts, strings.Join(errs, "; "))
+	// Wrap the last attempt's underlying error with %w so callers can
+	// errors.Is/As into it (e.g. for exit-code classification); the other
+	// attempts are still listed in the message text for diagnostics.
+	prior := errs
+	if len(prior) > 0 {
+		prior = prior[:len(prior)-1]
+	}
+	msg := fmt.Sprintf("ssh dial failed after %d attempts", attempts)
+	if len(prior) > 0 {
+		msg += " (" + strings.Join(prior, "; ") + ")"
+	}
+	return nil, fmt.Errorf("%s: attempt %d: %w", msg, attempts, lastErr)
 }
