@@ -705,3 +705,236 @@ func TestAttachRefusesDirtyPathInsideDotGit(t *testing.T) {
 		t.Fatalf("index-only dirty map must be accepted: %v", err)
 	}
 }
+
+// TestAttachSameDirFastForwardCheckoutShapes drives applyTreeDiff over the
+// checkout shapes a tree diff can produce. Each case builds a base commit,
+// a tip commit, a destination sitting at base, and then fast-forwards it;
+// unless wantErr says otherwise the destination must end at the tip with a
+// clean `git status --porcelain`.
+func TestAttachSameDirFastForwardCheckoutShapes(t *testing.T) {
+	cases := []struct {
+		name    string
+		base    func(t *testing.T, dir string)
+		tip     func(t *testing.T, dir string)
+		dest    func(t *testing.T, dir string)
+		check   func(t *testing.T, dir string)
+		wantErr []string // non-empty: Attach must fail loudly, mentioning all of these
+	}{
+		{
+			name: "delete",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "gone.txt"), "bye\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.Remove(filepath.Join(dir, "gone.txt")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				if _, err := os.Lstat(filepath.Join(dir, "gone.txt")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("gone.txt survived the delete arm (%v)", err)
+				}
+			},
+		},
+		{
+			name: "delete empties a directory",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "sub", "only.txt"), "bye\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.RemoveAll(filepath.Join(dir, "sub")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				if _, err := os.Lstat(filepath.Join(dir, "sub")); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("emptied directory sub was not pruned (%v)", err)
+				}
+			},
+		},
+		{
+			name: "symlink added",
+			base: func(t *testing.T, dir string) {},
+			tip: func(t *testing.T, dir string) {
+				if err := os.Symlink("README.md", filepath.Join(dir, "link")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				got, err := os.Readlink(filepath.Join(dir, "link"))
+				if err != nil || got != "README.md" {
+					t.Errorf("link -> %q (%v), want README.md", got, err)
+				}
+			},
+		},
+		{
+			name: "symlink retargeted",
+			base: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, "a.txt"), "a\n")
+				if err := os.Symlink("README.md", filepath.Join(dir, "link")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			tip: func(t *testing.T, dir string) {
+				if err := os.Remove(filepath.Join(dir, "link")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("a.txt", filepath.Join(dir, "link")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				got, err := os.Readlink(filepath.Join(dir, "link"))
+				if err != nil || got != "a.txt" {
+					t.Errorf("link -> %q (%v), want a.txt", got, err)
+				}
+			},
+		},
+		{
+			name: "mode-only change",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "run.sh"), "#!/bin/sh\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.Chmod(filepath.Join(dir, "run.sh"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			check: func(t *testing.T, dir string) {
+				st, err := os.Stat(filepath.Join(dir, "run.sh"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if st.Mode().Perm()&0o111 == 0 {
+					t.Errorf("run.sh mode = %o, want the executable bit set", st.Mode().Perm())
+				}
+				if got, err := os.ReadFile(filepath.Join(dir, "run.sh")); err != nil || string(got) != "#!/bin/sh\n" {
+					t.Errorf("run.sh = %q (%v)", got, err)
+				}
+			},
+		},
+		{
+			name: "file becomes a directory",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "x"), "file\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.Remove(filepath.Join(dir, "x")); err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, filepath.Join(dir, "x", "y"), "now a dir\n")
+			},
+			check: func(t *testing.T, dir string) {
+				if got, err := os.ReadFile(filepath.Join(dir, "x", "y")); err != nil || string(got) != "now a dir\n" {
+					t.Errorf("x/y = %q (%v)", got, err)
+				}
+			},
+		},
+		{
+			name: "directory becomes a file",
+			base: func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "d", "f"), "inside\n") },
+			tip: func(t *testing.T, dir string) {
+				if err := os.RemoveAll(filepath.Join(dir, "d")); err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, filepath.Join(dir, "d"), "now a file\n")
+			},
+			check: func(t *testing.T, dir string) {
+				got, err := os.ReadFile(filepath.Join(dir, "d"))
+				if err != nil || string(got) != "now a file\n" {
+					t.Errorf("d = %q (%v), want the file content", got, err)
+				}
+			},
+		},
+		{
+			// A directory that becomes a file while the destination still
+			// holds an IGNORED file inside it cannot be checked out: the
+			// directory will not go away. The current behaviour is a loud
+			// error, asserted here so it stays loud. Turning this into an
+			// up-front refusal (a pre-scan of the diff against what is on
+			// disk, before anything is written) is deferred; see the fix
+			// wave report's concerns.
+			name: "directory becomes a file, ignored leftover blocks it",
+			base: func(t *testing.T, dir string) {
+				writeFile(t, filepath.Join(dir, ".gitignore"), "*.log\n")
+				writeFile(t, filepath.Join(dir, "d", "f"), "inside\n")
+			},
+			tip: func(t *testing.T, dir string) {
+				if err := os.RemoveAll(filepath.Join(dir, "d")); err != nil {
+					t.Fatal(err)
+				}
+				writeFile(t, filepath.Join(dir, "d"), "now a file\n")
+			},
+			dest:    func(t *testing.T, dir string) { writeFile(t, filepath.Join(dir, "d", "keep.log"), "artifact\n") },
+			wantErr: []string{"fast-forward", "directory not empty"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srcMain := t.TempDir()
+			initRepo(t, srcMain)
+			c.base(t, srcMain)
+			base := commitAllCLI(t, srcMain, "base")
+			c.tip(t, srcMain)
+			tip := commitAllCLI(t, srcMain, "tip")
+			if base == tip {
+				t.Fatal("fixture produced no change between base and tip")
+			}
+
+			dstMain := filepath.Join(t.TempDir(), "x")
+			initRepoAt(t, dstMain, srcMain, base)
+			if c.dest != nil {
+				c.dest(t, dstMain)
+			}
+
+			info, err := Inspect(srcMain)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ds, err := DestStateOf(dstMain, dstMain, "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			ds.BranchTipReachable, err = IsAncestor(srcMain, ds.BranchTip, info.Head)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !p.FastForward || p.Tip != tip {
+				t.Fatalf("fixture wants a fast-forward plan to %s, got %+v", tip[:7], p)
+			}
+			var pack bytes.Buffer
+			if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+				t.Fatal(err)
+			}
+			packPath := filepath.Join(t.TempDir(), "objects.pack")
+			if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			err = Attach(context.Background(), p, packPath, nil)
+			if len(c.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("err = nil, want a failure mentioning %v", c.wantErr)
+				}
+				for _, want := range c.wantErr {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("err = %v, want it to mention %q", err, want)
+					}
+				}
+				var re *RefuseError
+				if errors.As(err, &re) {
+					t.Errorf("err = %v, want a loud failure, not a refusal", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "HEAD")); got != tip {
+				t.Errorf("HEAD = %s, want %s", got, tip)
+			}
+			if got := porcelain(t, dstMain); got != nil {
+				t.Errorf("status after fast-forward = %v, want clean", got)
+			}
+			c.check(t, dstMain)
+			gitCLI(t, dstMain, "fsck", "--no-dangling")
+		})
+	}
+}

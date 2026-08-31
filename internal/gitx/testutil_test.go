@@ -110,6 +110,16 @@ func addWorktreeRelative(t *testing.T, mainDir, name string) string {
 	return w
 }
 
+// commitAllCLI stages everything with the real git (which handles symlinks,
+// mode bits and deletions exactly as the fixtures need) and returns the new
+// commit hash.
+func commitAllCLI(t *testing.T, dir, msg string) string {
+	t.Helper()
+	gitCLI(t, dir, "add", "-A")
+	gitCLI(t, dir, "commit", "-q", "--allow-empty", "-m", msg)
+	return strings.TrimSpace(gitCLI(t, dir, "rev-parse", "HEAD"))
+}
+
 // porcelain returns `git status --porcelain` lines sorted by git.
 func porcelain(t *testing.T, dir string) []string {
 	t.Helper()
