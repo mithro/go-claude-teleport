@@ -34,10 +34,20 @@ type Plan struct {
 
 	// Additions (Plan 03):
 	IndexRel     string         // ".git/index" or ".git/worktrees/<n>/index", relative to SrcMain/DstMain
-	StagedBlobs  []string       // blob hashes referenced by the index but not by Tip (filled by StagedBlobsOf)
+	StagedBlobs  []string       // blob hashes referenced by the index but not by Tip; set with SetStagedBlobs, never directly
 	PackEntryID  int            // manifest entry id of the pack, 0 = none (existing-main only)
 	IndexEntryID int            // manifest entry id of the index file (existing-main only)
 	DirtyEntries map[string]int // dst path -> manifest entry id of dirty worktree files (existing-main only)
+}
+
+// SetStagedBlobs records the blob hashes the transferred index references
+// that Tip does not carry (StagedBlobsOf computes them). Callers MUST use
+// this rather than assigning StagedBlobs: staged blobs force a pack even
+// when the destination branch already sits at Tip, otherwise the index
+// would land referencing objects the destination never received.
+func (p *Plan) SetStagedBlobs(blobs []string) {
+	p.StagedBlobs = blobs
+	p.NeedPack = p.NeedPack || len(blobs) > 0
 }
 
 type RefuseError struct{ Reason string }

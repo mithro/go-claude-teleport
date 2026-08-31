@@ -117,10 +117,11 @@ func TestAttachExistingMainCreatesWorktreeAndAppliesDirty(t *testing.T) {
 	if p.Mode != ModeExistingMain || !p.NeedPack {
 		t.Fatalf("plan = %+v", p)
 	}
-	p.StagedBlobs, err = StagedBlobsOf(srcMain, filepath.Join(srcMain, p.IndexRel), p.Tip)
+	sb, err := StagedBlobsOf(srcMain, filepath.Join(srcMain, p.IndexRel), p.Tip)
 	if err != nil {
 		t.Fatal(err)
 	}
+	p.SetStagedBlobs(sb)
 	var pack bytes.Buffer
 	if err := WritePack(context.Background(), srcMain, append([]string{p.Tip}, p.StagedBlobs...), p.HaveTips, &pack); err != nil {
 		t.Fatal(err)
@@ -289,4 +290,99 @@ func TestAttachRefusesDirtyPathOutsideWorktree(t *testing.T) {
 	if _, err := os.Lstat(p.DstWorktree); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("destination worktree %s created despite the refusal (%v)", p.DstWorktree, err)
 	}
+}
+
+// TestAttachVerifiesStagedBlobs covers the "index references objects that
+// were never sent" hole: when the destination branch already sits at Tip
+// the plan needs no pack, yet the transferred index still names the staged
+// blobs. SetStagedBlobs forces the pack; an attach handed a plan whose
+// staged blobs are absent must refuse rather than install a corrupt index.
+func TestAttachVerifiesStagedBlobs(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "b.txt"), "b\n")
+	gitCLI(t, w, "add", "b.txt")
+	gitCLI(t, w, "commit", "-q", "-m", "feat work")
+	featTip := strings.TrimSpace(gitCLI(t, w, "rev-parse", "HEAD"))
+	// Staged but never committed: its blob lives only in the index.
+	writeFile(t, filepath.Join(w, "staged.txt"), "staged only\n")
+	gitCLI(t, w, "add", "staged.txt")
+
+	info, err := Inspect(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := StagedBlobsOf(srcMain, filepath.Join(srcMain, indexRelOf(info)), info.Head)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(blobs) != 1 {
+		t.Fatalf("StagedBlobs = %v, want exactly the staged blob", blobs)
+	}
+
+	// newPlan builds a fresh destination that already has refs/heads/feat
+	// at Tip, so PlanTransfer decides NeedPack = false.
+	newPlan := func(t *testing.T) *Plan {
+		t.Helper()
+		dstMain := filepath.Join(t.TempDir(), "x")
+		initRepoAt(t, dstMain, srcMain, root)
+		gitCLI(t, dstMain, "branch", "feat", featTip)
+		ds, err := DestStateOf(dstMain, filepath.Join(dstMain, ".worktrees", "feat"), "feat")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.NeedPack {
+			t.Fatalf("fixture wants a dest already at tip (NeedPack false), got %+v", p)
+		}
+		return p
+	}
+
+	t.Run("unsent staged blob is refused", func(t *testing.T) {
+		p := newPlan(t)
+		p.StagedBlobs = blobs // the old, unguarded assignment: no pack follows
+		var re *RefuseError
+		err := Attach(context.Background(), p, "", nil)
+		if !errors.As(err, &re) || !strings.Contains(re.Reason, blobs[0][:7]) {
+			t.Fatalf("err = %v, want a *RefuseError naming %s", err, blobs[0][:7])
+		}
+		if _, err := os.Lstat(p.DstWorktree); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("worktree created despite the refusal (%v)", err)
+		}
+	})
+
+	t.Run("SetStagedBlobs forces the pack that carries them", func(t *testing.T) {
+		p := newPlan(t)
+		p.SetStagedBlobs(blobs)
+		if !p.NeedPack {
+			t.Fatal("SetStagedBlobs must force NeedPack")
+		}
+		var pack bytes.Buffer
+		if err := WritePack(context.Background(), srcMain, append([]string{p.Tip}, p.StagedBlobs...), p.HaveTips, &pack); err != nil {
+			t.Fatal(err)
+		}
+		if pack.Len() == 0 {
+			t.Fatal("pack for the staged blob must not be empty")
+		}
+		packPath := filepath.Join(t.TempDir(), "objects.pack")
+		if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := Attach(context.Background(), p, packPath, nil); err != nil {
+			t.Fatal(err)
+		}
+		gitCLI(t, p.DstMain, "cat-file", "-e", blobs[0])
+	})
+}
+
+// indexRelOf is the index path a plan would use for info (linked or not).
+func indexRelOf(info *Info) string {
+	if info.IsLinked {
+		return filepath.Join(".git", "worktrees", info.WorktreeName, "index")
+	}
+	return filepath.Join(".git", "index")
 }

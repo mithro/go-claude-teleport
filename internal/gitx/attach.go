@@ -129,6 +129,17 @@ func attachExisting(ctx context.Context, p *Plan, packPath string, dirtyFiles ma
 	if err := repo.Storer.HasEncodedObject(tip); err != nil {
 		return fmt.Errorf("tip %s not present in %s after pack: %w", short(p.Tip), p.DstMain, err)
 	}
+	// The transferred index names these blobs; installing it while they are
+	// absent would leave the destination repository corrupt.
+	for _, h := range p.StagedBlobs {
+		err := repo.Storer.HasEncodedObject(plumbing.NewHash(h))
+		if errors.Is(err, plumbing.ErrObjectNotFound) {
+			return &RefuseError{Reason: fmt.Sprintf("staged blob %s the index references is not present in %s after the pack", short(h), p.DstMain)}
+		}
+		if err != nil {
+			return fmt.Errorf("check staged blob %s in %s: %w", short(h), p.DstMain, err)
+		}
+	}
 	if !p.Detached {
 		if err := ensureBranch(repo, p, tip); err != nil {
 			return err

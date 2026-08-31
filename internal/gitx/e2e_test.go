@@ -132,10 +132,11 @@ func TestAttachSameDirSecondRunIsNoOp(t *testing.T) {
 	if p.Mode != ModeExistingMain || p.Linked {
 		t.Fatalf("expected W==M existing-main plan, got %+v", p)
 	}
-	p.StagedBlobs, err = StagedBlobsOf(srcMain, filepath.Join(srcMain, p.IndexRel), p.Tip)
+	sb, err := StagedBlobsOf(srcMain, filepath.Join(srcMain, p.IndexRel), p.Tip)
 	if err != nil {
 		t.Fatal(err)
 	}
+	p.SetStagedBlobs(sb)
 	var pack bytes.Buffer
 	if err := WritePack(context.Background(), srcMain, append([]string{p.Tip}, p.StagedBlobs...), p.HaveTips, &pack); err != nil {
 		t.Fatal(err)
