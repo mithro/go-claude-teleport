@@ -47,10 +47,15 @@ func filesFreshMain(p *Plan, excludes []string, includeIgnored bool) ([]session.
 		skip[o] = true
 		// Also skip the .git/worktrees/<name> metadata directory by extracting name from gitdir.
 		dotGitFile := filepath.Join(o, ".git")
-		if gd, err := readGitdirFile(dotGitFile); err == nil {
-			name := filepath.Base(gd)
-			skip[filepath.Join(info.CommonDir, "worktrees", name)] = true
+		gd, err := readGitdirFile(dotGitFile)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("%s: %w", dotGitFile, err)
+			}
+			continue // worktree's .git file vanished: skip only the worktree path itself
 		}
+		name := filepath.Base(gd)
+		skip[filepath.Join(info.CommonDir, "worktrees", name)] = true
 	}
 	var mainMatcher gitignore.Matcher
 	if !includeIgnored {
