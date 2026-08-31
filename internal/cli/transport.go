@@ -144,6 +144,8 @@ func dialTarget(ctx context.Context, target string, via []string, opts []string,
 
 // AddTransportCommands registers remote serve|stream and internal-runner.
 func AddTransportCommands(root *cobra.Command) {
+	root.AddCommand(statusCmd())
+
 	remoteCmd := &cobra.Command{Use: "remote", Short: "internal: remote helper", Hidden: true}
 	remoteCmd.AddCommand(&cobra.Command{
 		Use:  "serve",
