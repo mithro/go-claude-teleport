@@ -41,7 +41,7 @@ func (l *Local) planView(jobID string) (*planView, error) {
 
 // pipeStream adapts a run(r, w) function to io.ReadWriteCloser: bytes
 // written go to r; bytes run writes to w come out of Read; Close ends
-// the input, waits for run, and returns its error.
+// the input, fails the output, waits for run and returns its error.
 type pipeStream struct {
 	inR, outR *io.PipeReader
 	inW, outW *io.PipeWriter
@@ -64,11 +64,17 @@ func PipeStream(fn func(r io.Reader, w io.Writer) error) io.ReadWriteCloser {
 
 func (s *pipeStream) Read(p []byte) (int, error)  { return s.outR.Read(p) }
 func (s *pipeStream) Write(p []byte) (int, error) { return s.inW.Write(p) }
+
+// Close ends the input, then FAILS the output side before waiting for fn.
+// The order matters (I3): a consumer that stops reading part-way — which
+// is what the driver's io.Copy does the moment the destination errors —
+// leaves fn blocked writing into outW, and a bare `<-s.done` would then
+// never return. CloseWithError makes fn's next write fail so it unwinds
+// and reports; the error fn returns is still what Close returns.
 func (s *pipeStream) Close() error {
 	s.inW.Close()
-	err := <-s.done
-	s.outR.Close()
-	return err
+	s.outR.CloseWithError(io.ErrClosedPipe)
+	return <-s.done
 }
 
 // splitStreamID parses "send:<n>" / "recv:<n>".

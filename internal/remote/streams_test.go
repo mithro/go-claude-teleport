@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
@@ -105,5 +106,39 @@ func TestPackStreamRecvWritesObjectsPack(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(job.StagingDir(dst.DataDir, sid), "objects.pack"))
 	if err != nil || string(b) != "PACKdata" {
 		t.Errorf("objects.pack = %q %v", b, err)
+	}
+}
+
+// TestPipeStreamCloseDoesNotHangWhenConsumerStopsReading is the I3
+// regression. Task 16's contract is that the driver pumps
+// io.Copy(dst, src), so any error on the destination aborts the copy
+// mid-stream and the source stream is Closed (from a defer, in PR C) with
+// its producer still blocked writing. Close must fail the writer before
+// waiting on the producer, or it blocks for ever.
+func TestPipeStreamCloseDoesNotHangWhenConsumerStopsReading(t *testing.T) {
+	p := testPaths(t)
+	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
+	dir := job.Dir(p.DataDir, sid)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Far more than any pipe will move in one write, so copyFileTo is still
+	// blocked in Write when Close arrives.
+	if err := os.WriteFile(filepath.Join(dir, "capture.txt"), bytes.Repeat([]byte("x"), 4<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := ep.OpenStream(context.Background(), StreamCapture, sid, "send:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(s, make([]byte, 16)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Close() }()
+	select {
+	case <-done: // any error is fine; the copy was deliberately aborted
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close blocked with the producer still writing (I3 deadlock)")
 	}
 }
