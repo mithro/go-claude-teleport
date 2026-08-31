@@ -45,22 +45,39 @@ Consequences for this package:
 ## Update 2026-08-31, Claude Code 2.1.251 (task 18, `go test -tags realclaude`)
 
 Re-running the same spike (implementer for task 18, same machine, same
-environment as above) now observes **two** requests per `claude -p` /
-`claude -p --resume` invocation, reproducible across repeated runs against a
-fresh `CLAUDE_CONFIG_DIR`:
+version) sometimes observed a `GET /api/hello` before `POST /v1/messages` on
+each `claude -p` / `claude -p --resume` invocation, where the 2026-08-29 spike
+observed none. A controller re-probe from the same binary reproduced **both**
+the one-request and the two-request behaviour depending on ambient
+environment (which env vars were left unset vs. inherited from the calling
+shell). So the count and order of auxiliary requests (`/api/hello` and
+potentially others in future Claude Code versions) is **not** a stable
+upstream fact and must not be pinned by tests.
 
-| # | Method | Path |
-|---|---|---|
-| 1 | GET | `/api/hello` |
-| 2 | POST | `/v1/messages?beta=true` |
+The stable facts, confirmed across both variants:
 
-`GET /api/hello` now precedes `POST /v1/messages` on every invocation (both
-the initial `-p` call and the `--resume` call), each against its own fresh
-`CLAUDE_CONFIG_DIR`/cwd pair reused between the two calls in the same test.
-No handler changes were needed — `/api/hello` was already served (200,
-`{"ok":true,...}`) per the "kept (cheap)" note above; the fake server was
-already prepared for this. `internal/fakeapi/realclaude_test.go` now expects
-2 requests after the first call and 4 total after `--resume`, asserting
-`/api/hello` then `/v1/messages` in each pair; the prior-context assertion
-(the last `/v1/messages` body must contain both "say hello" and "what did I
-say?") is unchanged.
+- `claude -p ...` makes at least one `POST /v1/messages?beta=true` whose body
+  contains `"stream":true` and the prompt text.
+- `claude -p --resume <sid> ...` makes at least one further
+  `POST /v1/messages` whose body contains both the original prompt and the
+  new one (prior context is carried across resume).
+- No other endpoint's presence or absence, or its position relative to
+  `/v1/messages`, is guaranteed.
+
+Consequences for this package and its tests:
+
+- `/api/hello`, `/v1/models` and `/v1/messages/count_tokens` remain served
+  (cheap, harmless) regardless of whether a given `claude` invocation hits
+  them — no handler changes were needed here.
+- `internal/fakeapi/realclaude_test.go` filters recorded requests down to
+  `POST /v1/messages` (by path prefix) before asserting anything, and only
+  asserts on that filtered list: at least one such request per `-p` call, and
+  the prior-context check on the last one after `--resume`. It logs the full
+  observed path list (`t.Logf`) on every run so future drift is visible in
+  `-v` output without failing the build.
+- `internal/fakeapi/realclaude.go`'s `spikeEnv` drops every ambient
+  `CLAUDE_CODE_*` variable by prefix (not an enumerated list), plus
+  `CLAUDECODE`, `CLAUDE_PID` and `CLAUDE_EFFORT`, before appending the fixed
+  spike set — this is believed to be what caused the two request-count
+  variants above, though the auxiliary-request behavior itself remains
+  unpinned regardless.

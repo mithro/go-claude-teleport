@@ -8,16 +8,19 @@ import (
 	"strings"
 )
 
-// spikeEnv is the exact environment ENDPOINTS.md was observed with.
+// spikeEnv is the exact environment ENDPOINTS.md was observed with. It drops
+// every ambient CLAUDE_CODE_* variable (wildcard, not an enumerated list —
+// Claude Code adds new ones across releases) plus CLAUDECODE, CLAUDE_PID and
+// CLAUDE_EFFORT, then appends the fixed spike set below.
 func spikeEnv(baseURL, configDir string) []string {
 	drop := map[string]bool{
 		"ANTHROPIC_BASE_URL": true, "ANTHROPIC_API_KEY": true, "CLAUDE_CONFIG_DIR": true,
-		"CLAUDECODE": true, "CLAUDE_PID": true, "CLAUDE_CODE_SESSION_ID": true, "CLAUDE_CODE_EXECPATH": true,
+		"CLAUDECODE": true, "CLAUDE_PID": true, "CLAUDE_EFFORT": true,
 	}
 	var env []string
 	for _, kv := range os.Environ() {
 		k := kv[:strings.IndexByte(kv+"=", '=')]
-		if drop[k] || strings.HasPrefix(k, "CLAUDE_CODE_MESSAGING_") {
+		if drop[k] || strings.HasPrefix(k, "CLAUDE_CODE_") {
 			continue
 		}
 		env = append(env, kv)

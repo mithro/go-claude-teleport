@@ -27,9 +27,25 @@ func freshUUID(t *testing.T) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-// TestRealClaudeAgainstFakeAPI pins ENDPOINTS.md: a fixed request sequence
-// (/api/hello then POST /v1/messages) for `-p`, a transcript on disk, and
-// prior context carried across --resume.
+// messagesRequests filters reqs down to the recorded POST /v1/messages
+// bodies (path prefix, per ENDPOINTS.md: query is ignored). Auxiliary
+// requests (e.g. GET /api/hello) vary with ambient environment and Claude
+// Code version — see ENDPOINTS.md — so tests must not assert on them.
+func messagesRequests(reqs []Request) []Request {
+	var out []Request
+	for _, r := range reqs {
+		if strings.HasPrefix(r.Path, "/v1/messages") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestRealClaudeAgainstFakeAPI pins ENDPOINTS.md's stable facts: `-p` makes
+// at least one POST /v1/messages carrying the prompt, a transcript lands on
+// disk, and `--resume` makes a further POST /v1/messages whose body carries
+// both the original prompt and the new one. The count and order of any other
+// requests (e.g. GET /api/hello) is not pinned — see ENDPOINTS.md.
 func TestRealClaudeAgainstFakeAPI(t *testing.T) {
 	if _, err := exec.LookPath("claude"); err != nil {
 		t.Skip("claude not on PATH")
@@ -60,21 +76,18 @@ func TestRealClaudeAgainstFakeAPI(t *testing.T) {
 		t.Errorf("claude did not print the canned reply: %q", out)
 	}
 	reqs := s.Requests()
-	// As of Claude Code 2.1.251, a fresh CLAUDE_CONFIG_DIR makes claude probe
-	// GET /api/hello before POST /v1/messages (see ENDPOINTS.md's 2026-08-31
-	// update) — update the expected paths here if that count changes again.
-	if len(reqs) != 2 {
-		paths := make([]string, len(reqs))
-		for i, r := range reqs {
-			paths[i] = r.Path
-		}
-		t.Fatalf("expected exactly two requests, got %d: %v — update ENDPOINTS.md if Claude Code changed", len(reqs), paths)
+	paths := make([]string, len(reqs))
+	for i, r := range reqs {
+		paths[i] = r.Path
 	}
-	if reqs[0].Path != "/api/hello" {
-		t.Errorf("first request = %s, want /api/hello", reqs[0].Path)
+	t.Logf("observed requests after -p: %v", paths)
+	msgs := messagesRequests(reqs)
+	if len(msgs) == 0 {
+		t.Fatalf("expected at least one POST /v1/messages, got none among: %v", paths)
 	}
-	if reqs[1].Path != "/v1/messages" || !strings.Contains(string(reqs[1].Body), `"stream":true`) || !strings.Contains(string(reqs[1].Body), "say hello") {
-		t.Errorf("second request = %s %.200s", reqs[1].Path, reqs[1].Body)
+	last := msgs[len(msgs)-1]
+	if !strings.Contains(string(last.Body), `"stream":true`) || !strings.Contains(string(last.Body), "say hello") {
+		t.Errorf("last /v1/messages request = %.200s", last.Body)
 	}
 	transcript := filepath.Join(configDir, "projects", session.Munge(cwd), sid+".jsonl")
 	if fi, err := os.Stat(transcript); err != nil || fi.Size() == 0 {
@@ -86,18 +99,18 @@ func TestRealClaudeAgainstFakeAPI(t *testing.T) {
 		t.Fatalf("claude --resume: %v\nstdout: %s\nstderr: %s", err, out, errOut)
 	}
 	reqs = s.Requests()
-	if len(reqs) != 4 {
-		paths := make([]string, len(reqs))
-		for i, r := range reqs {
-			paths[i] = r.Path
-		}
-		t.Fatalf("expected four requests after resume, got %d: %v", len(reqs), paths)
+	paths = make([]string, len(reqs))
+	for i, r := range reqs {
+		paths[i] = r.Path
 	}
-	if reqs[2].Path != "/api/hello" || reqs[3].Path != "/v1/messages" {
-		t.Errorf("resume requests = %s, %s, want /api/hello, /v1/messages", reqs[2].Path, reqs[3].Path)
+	t.Logf("observed requests after --resume: %v", paths)
+	msgsAfterResume := messagesRequests(reqs)
+	if len(msgsAfterResume) <= len(msgs) {
+		t.Fatalf("expected at least one additional POST /v1/messages after --resume, had %d before and %d after: %v", len(msgs), len(msgsAfterResume), paths)
 	}
-	if !strings.Contains(string(reqs[3].Body), "say hello") || !strings.Contains(string(reqs[3].Body), "what did I say?") {
-		t.Errorf("resume request must carry the prior conversation: %.400s", reqs[3].Body)
+	resumed := msgsAfterResume[len(msgsAfterResume)-1]
+	if !strings.Contains(string(resumed.Body), "say hello") || !strings.Contains(string(resumed.Body), "what did I say?") {
+		t.Errorf("resume request must carry the prior conversation: %.400s", resumed.Body)
 	}
 	if _, err := os.Stat(filepath.Join(configDir, ".credentials.json")); err == nil {
 		t.Errorf("a credentials file appeared in the throw-away config dir — the test must never touch real credentials")
