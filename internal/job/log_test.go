@@ -29,6 +29,16 @@ func TestTailLog(t *testing.T) {
 	if len(lines) != 4 {
 		t.Errorf("n > lines: %v", lines)
 	}
+
+	// n<=0 (0 and negative) both mean "no limit": every line, not zero.
+	lines, err = TailLog(p, 0)
+	if err != nil || len(lines) != 4 {
+		t.Errorf("n == 0: lines=%v err=%v, want all 4 lines", lines, err)
+	}
+	lines, err = TailLog(p, -1)
+	if err != nil || len(lines) != 4 {
+		t.Errorf("n < 0: lines=%v err=%v, want all 4 lines (and no panic)", lines, err)
+	}
 }
 
 type syncBuf struct {

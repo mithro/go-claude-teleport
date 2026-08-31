@@ -31,10 +31,14 @@ func TestStatusRendersJournal(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
-	for _, want := range []string{"laptop.example", "big-storage.example", "preflight", "done", "transfer", "failed", "connection reset", "attempts 2", "l3", "continue " + tsid, "abandon " + tsid} {
+	for _, want := range []string{"laptop.example", "big-storage.example", "preflight", "done", "transfer", "failed", "connection reset", "attempts 2", "l3", "status " + tsid, "abandon " + tsid} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("status output lacks %q:\n%s", want, out.String())
 		}
+	}
+	// `continue` is registered by Plan 03; the hint must not mention it yet.
+	if strings.Contains(out.String(), "continue "+tsid) {
+		t.Errorf("status output must not hint at claude-teleport continue (not registered until Plan 03):\n%s", out.String())
 	}
 
 	out.Reset()

@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -73,6 +75,39 @@ func TestInternalRunnerWithoutStepsIsExplicit(t *testing.T) {
 		t.Errorf("runner must not remove the job dir: %v", err)
 	}
 	_ = io.EOF
+}
+
+// TestDialTargetSurfacesSSHConfigOpenError covers the non-ENOENT branch of
+// dialTarget's ~/.ssh/config open: a missing file must still proceed with a
+// nil config (the ENOENT case, exercised implicitly elsewhere), but any
+// other open error (permission denied here) must fail with the path named
+// rather than being silently swallowed as "no config".
+func TestDialTargetSurfacesSSHConfigOpenError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("permission checks are bypassed for root")
+	}
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	os.MkdirAll(sshDir, 0o700)
+	cfgPath := filepath.Join(sshDir, "config")
+	os.WriteFile(cfgPath, []byte("Host *\n"), 0o600)
+	if err := os.Chmod(cfgPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(cfgPath, 0o600) })
+
+	env := []string{"HOME=" + home, "USER=alice"}
+	_, _, err := dialTarget(context.Background(), "bob@dest.example", nil, nil, env, t.Logf)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) || exitErr.Code != ExitUsage {
+		t.Fatalf("err = %v, want *ExitError{Code: ExitUsage}", err)
+	}
+	if !strings.Contains(err.Error(), cfgPath) {
+		t.Errorf("err = %v, want it to name %s", err, cfgPath)
+	}
 }
 
 func TestEnvPaths(t *testing.T) {

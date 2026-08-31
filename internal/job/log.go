@@ -11,7 +11,10 @@ import (
 )
 
 // TailLog returns the last n lines of path ("" lines trimmed at the end).
-// A missing file yields nil, nil.
+// A missing file yields nil, nil. n<=0 (including negative n) returns every
+// line rather than trimming: 0 and below are both treated as "no limit",
+// not "no lines" — the same guard also keeps a negative n from computing an
+// out-of-range slice start.
 func TailLog(path string, n int) ([]string, error) {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -24,7 +27,7 @@ func TailLog(path string, n int) ([]string, error) {
 	if len(lines) == 1 && lines[0] == "" {
 		return nil, nil
 	}
-	if n < len(lines) {
+	if n > 0 && n < len(lines) {
 		lines = lines[len(lines)-n:]
 	}
 	return lines, nil

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,12 +110,22 @@ func dialTarget(ctx context.Context, target string, via []string, opts []string,
 	}
 	home := envValue(env, "HOME")
 	var cfg *ssh_config.Config
-	if f, err := os.Open(filepath.Join(home, ".ssh", "config")); err == nil {
+	sshConfigPath := filepath.Join(home, ".ssh", "config")
+	f, err := os.Open(sshConfigPath)
+	switch {
+	case err == nil:
 		cfg, err = ssh_config.Decode(f)
 		f.Close()
 		if err != nil {
 			return nil, sshx.Resolved{}, fail(ExitUsage, "~/.ssh/config: %v", err)
 		}
+	case errors.Is(err, fs.ErrNotExist):
+		// No ~/.ssh/config: proceed with a nil config (Resolve treats that
+		// as "no config to consult").
+	default:
+		// Any other open error (permission denied, a symlink loop, ...)
+		// must not be silently treated as "no config" — surface it.
+		return nil, sshx.Resolved{}, fail(ExitUsage, "%s: %v", sshConfigPath, err)
 	}
 	localUser := envValue(env, "USER")
 	if localUser == "" {

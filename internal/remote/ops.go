@@ -72,7 +72,9 @@ type InventoryGitResult struct {
 	Info *GitInfo `json:"info"`
 }
 type GitDestStateArgs struct {
-	MainDir, WorktreeDir, Branch string
+	MainDir     string `json:"main_dir"`
+	WorktreeDir string `json:"worktree_dir"`
+	Branch      string `json:"branch"`
 }
 type GitDestStateResult struct {
 	State *GitDestState `json:"state"`
