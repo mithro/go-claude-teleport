@@ -35,6 +35,8 @@ func WritePack(ctx context.Context, repoDir string, want []string, have []string
 		ph := plumbing.NewHash(h)
 		if err := s.HasEncodedObject(ph); err == nil {
 			haveH = append(haveH, ph)
+		} else if !errors.Is(err, plumbing.ErrObjectNotFound) {
+			return fmt.Errorf("check have-tip %s in %s: %w", h, repoDir, err)
 		}
 	}
 	hashes, err := revlist.Objects(s, wantH, haveH)
@@ -85,13 +87,13 @@ func StagedBlobsOf(repoDir, indexPath, tip string) ([]string, error) {
 			return nil, err
 		}
 	}
-	seen := map[string]bool{}
+	seen := map[plumbing.Hash]bool{}
 	var out []string
 	for _, e := range idx.Entries {
-		if inTree[e.Hash] || seen[e.Hash.String()] {
+		if inTree[e.Hash] || seen[e.Hash] {
 			continue
 		}
-		seen[e.Hash.String()] = true
+		seen[e.Hash] = true
 		out = append(out, e.Hash.String())
 	}
 	sort.Strings(out)

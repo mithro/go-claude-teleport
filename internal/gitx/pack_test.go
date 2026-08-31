@@ -10,6 +10,8 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/storage/memory"
 )
 
 func TestWritePackMissingObjectsOnly(t *testing.T) {
@@ -45,6 +47,57 @@ func TestWritePackMissingObjectsOnly(t *testing.T) {
 	}
 	gitCLI(t, dst, "cat-file", "-e", third) // the real git can read it too
 	gitCLI(t, dst, "fsck", "--no-dangling")
+
+	// Pin the other half of the revlist contract: root's own commit, tree,
+	// and blob must NOT be in the pack (already reachable from have), while
+	// the new commits' objects must be. Decode into a fresh, empty
+	// in-memory store rather than the pre-populated dst — dst already had
+	// root's objects before the pack was applied, so checking dst alone
+	// couldn't tell "not re-sent" from "was already there".
+	rootCommit, err := repo.CommitObject(plumbing.NewHash(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTree, err := rootCommit.Tree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rootBlob plumbing.Hash
+	if err := rootTree.Files().ForEach(func(f *object.File) error { rootBlob = f.Hash; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh := memory.NewStorage()
+	if err := packfile.UpdateObjectStorage(fresh, bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	for name, h := range map[string]plumbing.Hash{
+		"root commit": plumbing.NewHash(root),
+		"root tree":   rootCommit.TreeHash,
+		"root blob":   rootBlob,
+	} {
+		if fresh.HasEncodedObject(h) == nil {
+			t.Errorf("%s (%s) unexpectedly present in pack: already reachable from have", name, h)
+		}
+	}
+	secondCommit, err := repo.CommitObject(plumbing.NewHash(second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdCommit, err := repo.CommitObject(plumbing.NewHash(third))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, h := range map[string]plumbing.Hash{
+		"second commit": plumbing.NewHash(second),
+		"third commit":  plumbing.NewHash(third),
+		"second tree":   secondCommit.TreeHash,
+		"third tree":    thirdCommit.TreeHash,
+	} {
+		if err := fresh.HasEncodedObject(h); err != nil {
+			t.Errorf("%s (%s) missing from pack: %v", name, h, err)
+		}
+	}
 }
 
 func TestWritePackNothingMissingWritesNothing(t *testing.T) {
