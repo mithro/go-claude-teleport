@@ -70,6 +70,11 @@ func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, tim
 			return &Error{Code: "conflict", Message: fmt.Sprintf("claude exited before confirming (%v); last output:\n%s", err, tail(out.String(), 20))}
 		default:
 		}
+		if err := ctx.Err(); err != nil {
+			cmd.Process.Kill()
+			<-done
+			return &Error{Code: "conflict", Message: fmt.Sprintf("pty-resume: context cancelled while confirming: %v", err)}
+		}
 		reg, ok, err := l.ClaudeStatus(ctx, id)
 		if err != nil {
 			cmd.Process.Kill()
@@ -87,7 +92,9 @@ func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, tim
 		l.opts.Sleep(confirmPoll)
 	}
 	if _, err := f.Write([]byte("/exit\r")); err != nil {
-		return fmt.Errorf("pty-resume: write /exit: %w", err)
+		cmd.Process.Kill()
+		<-done
+		return &Error{Code: "conflict", Message: fmt.Sprintf("pty-resume: write /exit: %v", err)}
 	}
 	select {
 	case <-done:

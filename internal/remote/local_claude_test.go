@@ -33,9 +33,13 @@ func fakeProcRoot(t *testing.T, procs [][4]string) string {
 
 func writeRegistry(t *testing.T, p session.Paths, pid int, status, tmux string) {
 	t.Helper()
-	os.MkdirAll(p.SessionsDir(), 0o700)
 	b, _ := json.Marshal(map[string]any{"pid": pid, "sessionId": sid, "cwd": "/home/alice/x", "procStart": "777", "version": "2.1.247", "status": status, "tmux": tmux, "updatedAt": time.Now().UnixMilli()})
-	os.WriteFile(filepath.Join(p.SessionsDir(), "5150.json"), b, 0o600)
+	// Atomic (temp file + rename) so a concurrent reader (e.g. ConfirmClaude's
+	// poll loop, especially with a no-op Sleep) never observes a partial
+	// write — plain os.WriteFile raced procx.RegistryForSession here.
+	if err := session.WriteFileAtomic(filepath.Join(p.SessionsDir(), "5150.json"), b, 0o600); err != nil {
+		t.Fatalf("writeRegistry: %v", err)
+	}
 }
 
 func TestConfirmClaudeSucceedsWhenIdleInOurPane(t *testing.T) {
