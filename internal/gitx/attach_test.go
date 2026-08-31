@@ -230,21 +230,46 @@ func TestAttachSameDirFastForward(t *testing.T) {
 	}
 }
 
+// TestAttachSameDirRefusesWhenDirtiedSincePreflight uses a destination that
+// is BEHIND the tip, so a fast-forward would move refs/heads/main. A
+// refusal must be atomic: the gates are evaluated before the pack is
+// indexed and before the branch ref is touched, so nothing moved.
 func TestAttachSameDirRefusesWhenDirtiedSincePreflight(t *testing.T) {
 	srcMain := t.TempDir()
-	_, root := initRepo(t, srcMain)
+	repo, root := initRepo(t, srcMain)
+	writeFile(t, filepath.Join(srcMain, "b.txt"), "b\n")
+	second := commitAll(t, repo, "second")
 	dstMain := filepath.Join(t.TempDir(), "x")
 	initRepoAt(t, dstMain, srcMain, root)
 	info, _ := Inspect(srcMain)
 	ds, _ := DestStateOf(dstMain, dstMain, "main")
+	ds.BranchTipReachable, _ = IsAncestor(srcMain, ds.BranchTip, info.Head)
 	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !p.FastForward || p.Tip != second {
+		t.Fatalf("fixture wants a fast-forward plan to %s, got %+v", second[:7], p)
+	}
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(t.TempDir(), "objects.pack")
+	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	writeFile(t, filepath.Join(dstMain, "sneaky.txt"), "x") // dirtied after preflight
-	err = Attach(context.Background(), p, "", nil)
+	err = Attach(context.Background(), p, packPath, nil)
 	if err == nil || !strings.Contains(err.Error(), "not clean") {
 		t.Fatalf("err = %v, want not-clean refusal", err)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "refs/heads/main")); got != root {
+		t.Errorf("refs/heads/main moved to %s on a refused attach, want %s", got[:7], root[:7])
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "HEAD")); got != root {
+		t.Errorf("HEAD moved to %s on a refused attach, want %s", got[:7], root[:7])
 	}
 }
 

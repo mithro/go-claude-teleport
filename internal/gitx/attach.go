@@ -119,6 +119,11 @@ func attachExisting(ctx context.Context, p *Plan, packPath string, dirtyFiles ma
 		if err != nil {
 			return err
 		}
+		// Refusal must be atomic: decide before the pack is indexed and
+		// before ensureBranch moves refs/heads/<Branch>.
+		if err := checkFastForwardState(p, ffState); err != nil {
+			return err
+		}
 	}
 	if packPath != "" {
 		if err := indexPack(repo, packPath); err != nil {
@@ -283,15 +288,25 @@ func snapshotFastForwardState(p *Plan) (*fastForwardState, error) {
 	return &fastForwardState{alreadyAtTip: cur.Head == p.Tip, clean: ds.Clean, branch: ds.WorktreeBranch}, nil
 }
 
-// fastForwardMainCheckout handles W == M: the destination checkout must
-// still be clean and on the session branch; then HEAD moves to tip.
-func fastForwardMainCheckout(p *Plan, tip plumbing.Hash, st *fastForwardState) error {
+// checkFastForwardState is the W == M gate: the destination checkout must
+// still be clean and on the session branch. It is evaluated before
+// attachExisting mutates anything.
+func checkFastForwardState(p *Plan, st *fastForwardState) error {
 	if st.branch != p.Branch {
+		if st.branch == "" {
+			return &RefuseError{Reason: fmt.Sprintf("destination checkout %s has no branch checked out, session branch is %q", p.DstMain, p.Branch)}
+		}
 		return &RefuseError{Reason: fmt.Sprintf("destination checkout %s is on %q, not %q", p.DstMain, st.branch, p.Branch)}
 	}
 	if !st.clean {
 		return &RefuseError{Reason: fmt.Sprintf("destination checkout %s is not clean", p.DstMain)}
 	}
+	return nil
+}
+
+// fastForwardMainCheckout handles W == M: HEAD moves to tip. The gate
+// above has already run.
+func fastForwardMainCheckout(p *Plan, tip plumbing.Hash, st *fastForwardState) error {
 	if st.alreadyAtTip {
 		return nil // already there (re-run after the dirty state was applied)
 	}
