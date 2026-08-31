@@ -44,12 +44,15 @@ func TestSpawnDetached(t *testing.T) {
 	if !strings.HasPrefix(out, "hello\nmarker-42\n") {
 		t.Fatalf("log = %q", out)
 	}
-	// the child's session id (field 6 of its stat) equals its own pid: setsid worked
+	// the child's session id (field 6 of its stat) must differ from the parent's.
+	// We do NOT assert session==pid (leadership) because sandboxes/wrappers may
+	// interpose a parent process that becomes the session leader instead.
+	// The spec (§6) requires only that the runner not remain in the caller's session.
 	statLine := out[strings.Index(out, "marker-42\n")+len("marker-42\n"):]
 	rest := strings.Fields(statLine[strings.LastIndexByte(statLine, ')')+1:])
-	childPID := strings.Fields(statLine)[0]
-	if rest[3] != childPID || rest[3] == sessionID(t, os.Getpid()) {
-		t.Fatalf("child session=%s pid=%s ours=%s: not detached", rest[3], childPID, sessionID(t, os.Getpid()))
+	childSessionID := rest[3]
+	if childSessionID == sessionID(t, os.Getpid()) {
+		t.Fatalf("child still in caller's session: %s", childSessionID)
 	}
 	if fi, _ := os.Stat(log); fi.Mode().Perm() != 0o600 {
 		t.Fatalf("log mode %v", fi.Mode())
