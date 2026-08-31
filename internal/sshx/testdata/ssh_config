@@ -1,0 +1,24 @@
+Host laptop
+    HostName laptop.example
+    User alice
+    Port 22
+
+Host jump
+    HostName jump.example
+    User alice
+    IdentityFile ~/.ssh/id_jump
+
+Host big-storage
+    HostName big-storage.example
+    User alice
+    Port 2222
+    ProxyJump jump
+    IdentityFile ~/.ssh/id_storage
+    IdentityFile ~/.ssh/id_ed25519
+
+Host legacy
+    HostName legacy.example
+    ProxyCommand ssh -W %h:%p jump
+
+Host *
+    IdentityFile ~/.ssh/id_ed25519

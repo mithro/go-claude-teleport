@@ -12,8 +12,36 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/mithro/go-claude-teleport/internal/claudecfg"
+	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
+
+// resolveSessionCwdUsage resolves --session (if given) into a *session.Session,
+// the cwd to compare from (the session's launch cwd, the environment's PWD,
+// or the process cwd) and the usage scan for that session, shared by the
+// local and remote compare-config branches below.
+func (a *app) resolveSessionCwdUsage(sel string) (*session.Session, string, *session.Usage, error) {
+	var s *session.Session
+	var err error
+	cwd := a.env["PWD"]
+	if sel != "" {
+		if s, err = a.resolveSession(strings.Fields(sel)); err != nil {
+			return nil, "", nil, err
+		}
+		cwd = s.LaunchCwd
+	} else if cwd == "" {
+		if cwd, err = os.Getwd(); err != nil {
+			return nil, "", nil, Exit(ExitFailed, "getwd: %v", err)
+		}
+	}
+	var usage *session.Usage
+	if s != nil {
+		if usage, err = session.ScanUsage(s); err != nil {
+			return nil, "", nil, Exit(ExitFailed, "%v", err)
+		}
+	}
+	return s, cwd, usage, nil
+}
 
 // lookInPath finds bin in a PATH string (exec.LookPath consults the process
 // environment; we must honour the environment handed to Main).
@@ -76,8 +104,9 @@ func (a *app) localClaudeVersion(s *session.Session) (string, error) {
 }
 
 func (a *app) compareConfigCmd() *cobra.Command {
-	var sel, destHome string
+	var sel, destHome, destCwd string
 	var allowDrift bool
+	var via, opts []string
 	cmd := &cobra.Command{
 		Use:   "compare-config <host> [--session <session>]",
 		Short: "compare Claude configuration here with a destination and classify the drift",
@@ -89,7 +118,16 @@ without it everything counts as used. Exit 3 when anything blocks unless
 
 <host> may also be an absolute path to a Claude config directory on this
 machine (with --dest-home for its home directory); the comparison then runs
-entirely locally.`,
+entirely locally. Anything else is dialled as an ssh target (--via/-o work
+as they do for a teleport).
+
+For a remote <host>, --dest-cwd sets the working directory the REMOTE side
+is inventoried under (project-scoped hooks/permissions/MCP servers are keyed
+by cwd); it has no effect on the local branch above. Without it, the local
+cwd is reused for the remote side too: if the same project lives under a
+different path on the destination, this can report spurious project-scoped
+MCP-server drift purely from the path mismatch — pass --dest-cwd to compare
+against the project's actual path on the destination.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			target := args[0]
@@ -97,8 +135,8 @@ entirely locally.`,
 			info, statErr := os.Stat(target)
 			switch {
 			case !filepath.IsAbs(target):
-				// A hostname: needs the Plan 02 transport (hello + inventory-host).
-				return Exit(ExitUsage, "compare-config %s: remote comparison not implemented yet (an absolute config-dir path works locally)", target)
+				// A hostname: dial it over the Plan 02 remote transport.
+				return a.compareConfigRemote(cmd, target, via, opts, sel, destCwd, allowDrift)
 			case statErr != nil && !errors.Is(statErr, fs.ErrNotExist):
 				// The path exists as far as the filesystem is concerned but Stat
 				// itself failed (permissions, a symlink loop, ...): surface that,
@@ -111,23 +149,9 @@ entirely locally.`,
 			if err != nil {
 				return err
 			}
-			var s *session.Session
-			cwd := a.env["PWD"]
-			if sel != "" {
-				if s, err = a.resolveSession(strings.Fields(sel)); err != nil {
-					return err
-				}
-				cwd = s.LaunchCwd
-			} else if cwd == "" {
-				if cwd, err = os.Getwd(); err != nil {
-					return Exit(ExitFailed, "getwd: %v", err)
-				}
-			}
-			var usage *session.Usage
-			if s != nil {
-				if usage, err = session.ScanUsage(s); err != nil {
-					return Exit(ExitFailed, "%v", err)
-				}
+			s, cwd, usage, err := a.resolveSessionCwdUsage(sel)
+			if err != nil {
+				return err
 			}
 			ver, err := a.localClaudeVersion(s)
 			if err != nil {
@@ -179,6 +203,64 @@ entirely locally.`,
 	}
 	cmd.Flags().StringVar(&sel, "session", "", "session selector; limits blocking to what the session used")
 	cmd.Flags().StringVar(&destHome, "dest-home", "", "home directory for a local destination config dir")
+	cmd.Flags().StringVar(&destCwd, "dest-cwd", "", "cwd for the REMOTE inventory host (remote comparison only; default: reuse the local cwd)")
 	cmd.Flags().BoolVar(&allowDrift, "allow-config-drift", false, "downgrade blocking drift to warnings")
+	remoteFlags(cmd, &via, &opts)
 	return cmd
+}
+
+// compareConfigRemote is the compareConfigCmd branch for a <host> that
+// isn't a local config-dir path: it dials host over the Plan 02 remote
+// transport and compares this machine's inventory with the remote's,
+// keeping --session usage analysis, --allow-config-drift, --json and
+// ExitRefused-on-blocking identical to the local branch above. destCwd, when
+// set, is the cwd the REMOTE InventoryHost call uses (the local branch's cwd
+// is unaffected); empty reuses the local cwd for both, per the Long text's
+// documented limitation.
+func (a *app) compareConfigRemote(cmd *cobra.Command, host string, via, opts []string, sel, destCwd string, allowDrift bool) error {
+	ctx := cmd.Context()
+	p, err := a.resolvePaths()
+	if err != nil {
+		return err
+	}
+	_, cwd, usage, err := a.resolveSessionCwdUsage(sel)
+	if err != nil {
+		return err
+	}
+	dstCwd := cwd
+	if destCwd != "" {
+		dstCwd = destCwd
+	}
+	local := remote.NewLocal(p, selfExe(), remote.LocalOptions{ProcRoot: "/proc", TmuxSocketDir: tmuxSocketDir(a.envSlice()), Logf: stderrLogf(a.stderr)})
+	localInfo, _ := local.Hello(ctx)
+	src, err := local.InventoryHost(ctx, cwd, localInfo.ClaudeVersion)
+	if err != nil {
+		return Exit(ExitFailed, "local inventory: %v", err)
+	}
+	rc, closeRemote, err := openRemote(cmd, host, via, opts)
+	if err != nil {
+		return err
+	}
+	defer closeRemote()
+	dst, err := rc.InventoryHost(ctx, dstCwd, rc.Info().ClaudeVersion)
+	if err != nil {
+		return Exit(ExitFailed, "%s inventory: %v", host, err)
+	}
+	rep := claudecfg.Compare(src, dst, usage)
+	if allowDrift {
+		rep = rep.Downgrade()
+	}
+	if a.json() {
+		b, err := rep.JSON()
+		if err != nil {
+			return Exit(ExitFailed, "%v", err)
+		}
+		fmt.Fprintln(a.stdout, string(b))
+	} else {
+		rep.Render(a.stdout)
+	}
+	if rep.Blocking {
+		return Exit(ExitRefused, "configuration drift would block a teleport")
+	}
+	return nil
 }

@@ -8364,18 +8364,21 @@ Recorded per the interfaces doc's rule; Plan 03 may rely on these names.
 `internal/sshx`
 - `Options.Home string` — home dir for `~` expansion in identity files (packages never call `os.UserHomeDir`).
 - `Options.NetDial func(ctx, network, addr string) (net.Conn, error)` — first-hop dialer; tests inject a recorder to prove the final host is never dialled locally.
+- `Options.LocalUser string` — the user jump hops (`Target.Via`) authenticate as when a hop has no explicit user of its own; falls back to the resolved target user only when empty. Never the other way round: a jump hop must never inherit the TARGET's resolved user, since the jump host and the target can be different accounts on different machines.
 - `(*Client).SSH() *ssh.Client` — the underlying client (Plan 03's `RunPtyResume` uses `RequestPty`).
 - `func Redial(ctx, attempts int, backoff time.Duration, logf, dial func(ctx) (*Client, error)) (*Client, error)`.
 - `var ErrProxyCommand`, `var ErrPassphrase`.
-- Package `internal/sshx/sshtest`: `GenKey`, `WriteKeyFile`, `KnownHostsLine`, `ExecFunc`, `Options`, `Server{Addr, HostKey}`, `New`, `(*Server).Close/Forwarded/Execs`.
+- Package `internal/sshx/sshtest`: `GenKey`, `WriteKeyFile`, `KnownHostsLine`, `ExecFunc`, `Options`, `Server{Addr, HostKey}`, `New`, `(*Server).Close/Forwarded/Execs/Users` (`Users` lists the ssh usernames that authenticated successfully, for asserting which account a hop connected as).
 
 `internal/remote`
-- `plan03_types.go` aliases: `GitInfo`, `GitDestState`, `GitPlan`, `TmuxFacts`, `TmuxPlan`, `TmuxPaneState` (= `json.RawMessage`), `TmuxDialer` (= `any`). Plan 03 replaces the file with aliases to the real `gitx`/`tmuxx` types; the `Endpoint` method signatures are written against these alias names so they do not change.
+- `plan03_types.go` aliases: `GitInfo`, `GitDestState`, `GitPlan`, `TmuxFacts`, `TmuxPlan`, `TmuxPaneState` (= `json.RawMessage`), `TmuxDialer` (= `any`). Plan 03 replaces the file with aliases to the real `gitx`/`tmuxx` types; the `Endpoint` method signatures are written against these alias names so they do not change. Plan 03 MUST bump `version.Protocol` to 2 when it does this replacement (the wire format changes).
 - `func Unavailable(op string) *Error`.
 - Op name constants `OpHello … OpRecord` and the args/result structs in `ops.go`.
 - `(*Local).PutInstallExtras(ctx, jobID string, extra transfer.InstallExtras) error` and `(*Client).PutInstallExtras(...)` (op `install-extras`); `Local.Install` reads `jobs/<id>/extras.json`. Plan 03's orchestrator calls it before `Install` via `interface{ PutInstallExtras(...) }`.
 - `(*Local).Hostname string`; `func NewClientConn(ctx, conn io.ReadWriteCloser, openStream func(...), logf) (*Client, error)`; `(*Client).Info() HostInfo`.
 - `Local.ManifestDiff` persists the manifest to `jobs/<id>/manifest.json` on the destination (the tar receiver needs it).
+- `HostInfo.ClaudeVersionErr string` — `claude --version`'s error message when it fails, surfaced rather than swallowed (`HasClaude`/`ClaudeVersion` alone cannot distinguish "not installed" from "installed but erroring").
+- `LocalOptions.TmuxSocketDir string` — reported by `Hello` verbatim; `Local` never reads `$TMUX_TMPDIR` itself, `internal/cli` resolves it and passes it in (every `remote.NewLocal` call site, including `compare-config`, must pass it).
 
 `internal/transfer`
 - `Manifest.TmpDir string \`json:"-"\`` — where `Send` writes rewritten temp files (orchestrator sets it to the job dir).
@@ -8384,12 +8387,16 @@ Recorded per the interfaces doc's rule; Plan 03 may rely on these names.
 - `func Uninstall(m *Manifest, p session.Paths) (removed []string, err error)`.
 - Staging metadata files: `<id>.dir` (directories), `<id>.symlink` (link target), `<id>.part` (in flight).
 - Status semantics table (Task 11) — `StagedSame` means "verified in staging, destination absent".
+- `InstallExtras.Memory []Entry` invariant: every entry MUST be a row of the SAME `Manifest` passed to `Install` (same ID space) — `Install` validates each via `m.ByID(e.ID)` matching `e.Dst` and errors otherwise.
+
+`internal/session`
+- `func IsRecordPrefix(existing, incoming string) (bool, error)` — the record-wise (JSON-equality per JSONL line, not raw bytes) fast-forward prefix check for `.jsonl` transcripts/sidecars; see spec §7.3's amendment.
 
 `internal/job`
 - `HistoryRecord.From` / `.To` are two fields with tags `json:"from"` / `json:"to"` (the interfaces doc's one-line tag is not legal Go).
 
 `internal/cli`
-- `func AddTransportCommands(root *cobra.Command)`; `var RunnerSteps func(*job.Journal, func(string, ...any)) ([]job.Step, error)`; `func envPaths(env []string) (session.Paths, error)`; `func dialTarget(...)`; `func openRemote(...)`; `func addInspectHost(root)`; `fail(code, format, ...)` = Plan 01's `cli.Exit` (returns `*cli.ExitError`); `envValue` is Plan 01's; `Main` gains the `cmdEnvKey{}` context value.
+- `func AddTransportCommands(root *cobra.Command)`; `var RunnerSteps func(*job.Journal, func(string, ...any)) ([]job.Step, error)`; `func envPaths(env []string) (session.Paths, error)`; `func dialTarget(...)`; `func openRemote(...)`; `fail(code, format, ...)` = Plan 01's `cli.Exit` (returns `*cli.ExitError`); `envValue` is Plan 01's; `Main` gains the `cmdEnvKey{}` context value. (`inspect --host` is implemented on the existing `inspectCmd()` itself, not via a separate `addInspectHost` wrapper.)
 
 `internal/fakeapi`
 - `func RunClaude(ctx, baseURL, configDir, cwd string, args ...string) ([]byte, []byte, error)`; `ENDPOINTS.md` is the pinned spike record; build tag `realclaude` for the live test; binary `test/fakeapi-server`.

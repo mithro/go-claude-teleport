@@ -125,6 +125,7 @@ func (a *app) rootCmd() *cobra.Command {
 	a.flags = &tf
 
 	root.AddCommand(a.versionCmd(), a.internalFreezerCmd(), a.placeholderCmd(), a.inspectCmd(), a.listCmd(), a.compareConfigCmd(), a.doctorCmd())
+	AddTransportCommands(root)
 	return root
 }
 
