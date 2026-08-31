@@ -87,19 +87,31 @@ func NewClient(ctx context.Context, ssh *sshx.Client, remoteExe string, logf fun
 		}
 	}()
 	openStream := func(ctx context.Context, kind StreamKind, jobID, streamID string) (io.ReadWriteCloser, error) {
+		// streamID carries the direction (streams.go's table): "send:<n>"
+		// means the REMOTE host produces data (tar/pack/capture/log send —
+		// the driver here only reads), "recv:<n>" means the driver writes
+		// into the remote's runStream (tar/pack recv). Validate up front,
+		// before starting the remote process, so a malformed streamID never
+		// leaks an ssh session.
+		dir, err := splitStreamID(streamID)
+		if err != nil {
+			return nil, fmt.Errorf("open stream %s/%s on %s: %w", kind, streamID, ssh, err)
+		}
 		sp, err := ssh.Start(ctx, sshx.Quote([]string{remoteExe, "remote", "stream", string(kind), jobID, streamID}))
 		if err != nil {
 			return nil, fmt.Errorf("open stream %s/%s on %s: %w", kind, streamID, ssh, err)
 		}
 		st := &sshStream{p: sp, kind: kind, id: streamID}
 		// Half-close contract (documented on ServeStream in server.go): for
-		// receive-direction kinds (capture/log/pack) the driver has nothing
-		// to send, so the client half-closes stdin immediately, before any
-		// read, signalling the remote's inbound copy to finish. Doing this
-		// here means every caller of OpenStream gets it for free instead of
-		// having to know the contract. StreamTar (send-direction) is left
-		// open: its Close half-closes stdin only once writing is done.
-		if kind != StreamTar {
+		// send-direction streams (the remote host produces data; this driver
+		// has nothing to write) the client half-closes stdin immediately,
+		// before any read, signalling the remote's runStream it has no
+		// inbound payload to wait for. Doing this here means every caller of
+		// OpenStream gets it for free instead of having to know the
+		// contract. recv-direction streams (the driver writes into the
+		// stream, e.g. a tar or pack push) are left open: their Close
+		// half-closes stdin only once writing is done.
+		if dir == "send" {
 			if err := st.CloseWrite(); err != nil {
 				st.Close()
 				return nil, fmt.Errorf("half-close stream %s/%s on %s: %w", kind, streamID, ssh, err)
@@ -134,8 +146,22 @@ func (s *sshStream) Write(b []byte) (int, error) { return s.p.Stdin.Write(b) }
 
 // CloseWrite half-closes stdin, signalling end-of-inbound to the remote
 // ServeStream. Idempotent; safe to call before Close (Close calls it too).
+//
+// io.EOF from the underlying Close is swallowed, not an error: since Task
+// 16, a send-direction runStream (tar/pack/capture/log send) never reads
+// stdin at all and can finish and tear down its ssh channel entirely on
+// its own — this call can race a remote that already exited, in which
+// case the channel is already gone and Close reports EOF. That is exactly
+// the outcome CloseWrite is trying to produce anyway (the remote no longer
+// wants any more input), so it must not surface as a failure.
 func (s *sshStream) CloseWrite() error {
-	s.cwOnce.Do(func() { s.cwErr = s.p.Stdin.Close() })
+	s.cwOnce.Do(func() {
+		err := s.p.Stdin.Close()
+		if errors.Is(err, io.EOF) {
+			err = nil
+		}
+		s.cwErr = err
+	})
 	return s.cwErr
 }
 

@@ -3,6 +3,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/sshx"
@@ -100,9 +102,14 @@ func TestClientProtocolMismatchIsUsageError(t *testing.T) {
 	}
 }
 
-func TestClientTransferOverSSHTest(t *testing.T) {
-	// "dest" host: a Local behind an in-process sshd whose exec handler runs
-	// `<exe> remote serve` and `<exe> remote stream ...` in-process.
+// newSSHTestClient wires a Client to a fresh Local ("dest") through an
+// in-process sshd whose exec handler runs `<exe> remote serve` and
+// `<exe> remote stream ...` in-process — the same harness
+// TestClientTransferOverSSHTest used inline, factored out so other tests
+// (the pack round trip below) can reuse it without duplicating the ssh
+// dial boilerplate.
+func newSSHTestClient(t *testing.T) (*Client, *Local, session.Paths) {
+	t.Helper()
 	destPaths := testPaths(t)
 	dest := NewLocal(destPaths, "claude-teleport", LocalOptions{Logf: t.Logf})
 	exec := func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
@@ -140,13 +147,18 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sc.Close()
+	t.Cleanup(func() { sc.Close() })
 
 	c, err := NewClient(context.Background(), sc, "claude-teleport", t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	t.Cleanup(func() { c.Close() })
+	return c, dest, destPaths
+}
+
+func TestClientTransferOverSSHTest(t *testing.T) {
+	c, _, destPaths := newSSHTestClient(t)
 	if c.Info().Hostname == "" {
 		t.Errorf("hello over ssh: %+v", c.Info())
 	}
@@ -225,4 +237,78 @@ func TestClientTransferOverSSHTest(t *testing.T) {
 	if _, err := c.Hello(ctx); err == nil {
 		t.Errorf("calls after Close must fail")
 	}
+}
+
+// TestClientOpenStreamPackBothDirectionsOverSSH is the regression test for
+// the half-close bug fixed in this round: Client.openStream used to gate
+// its eager half-close on `kind != StreamTar`, which closed stdin on EVERY
+// pack stream immediately (pack didn't exist as a kind when that check was
+// written) — breaking a pack PUSH (recv-direction: the driver writes into
+// the stream) even though a pack PULL (send-direction: the driver only
+// reads) happened to still work by accident. The fix gates on
+// splitStreamID's parsed direction instead of the kind, so both directions
+// are exercised here over the real ssh round trip (in-process sshd).
+func TestClientOpenStreamPackBothDirectionsOverSSH(t *testing.T) {
+	c, dest, destPaths := newSSHTestClient(t)
+	ctx := context.Background()
+
+	t.Run("push (recv): driver writes pack bytes into the dest", func(t *testing.T) {
+		const jobID = "pack-push-job"
+		s, err := c.OpenStream(ctx, StreamPack, jobID, "recv:1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(s, "FAKE-PACK-BYTES"); err != nil {
+			// Under the bug, stdin was half-closed before this write ever
+			// happened: it would fail here with a broken-pipe-shaped error.
+			t.Fatalf("write pack push: %v", err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(filepath.Join(job.StagingDir(destPaths.DataDir, jobID), "objects.pack"))
+		if err != nil || string(got) != "FAKE-PACK-BYTES" {
+			t.Errorf("objects.pack = %q, err = %v", got, err)
+		}
+	})
+
+	t.Run("pull (send): driver reads a real packfile out of the source", func(t *testing.T) {
+		const jobID = "pack-pull-job"
+		repo := t.TempDir()
+		gitc(t, repo, "init", "-q", "-b", "main")
+		os.WriteFile(filepath.Join(repo, "a"), []byte("a"), 0o644)
+		gitc(t, repo, "add", "a")
+		gitc(t, repo, "commit", "-q", "-m", "i")
+		tip := strings.TrimSpace(gitc(t, repo, "rev-parse", "HEAD"))
+
+		// dest doubles as the pack-send "source" host here: any Local can
+		// serve either direction, keyed only by the journal's plan.
+		planBytes, err := json.Marshal(planView{Git: &gitx.Plan{SrcMain: repo, Tip: tip}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		j, err := job.New(destPaths.DataDir, jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		j.Plan = planBytes
+		if err := dest.JournalPut(ctx, j); err != nil {
+			t.Fatal(err)
+		}
+
+		s, err := c.OpenStream(ctx, StreamPack, jobID, "send:1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, s); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if buf.Len() == 0 || !bytes.HasPrefix(buf.Bytes(), []byte("PACK")) {
+			t.Errorf("pack pull = %d bytes, prefix %q, want a git packfile (PACK magic)", buf.Len(), buf.Bytes()[:min(4, buf.Len())])
+		}
+	})
 }

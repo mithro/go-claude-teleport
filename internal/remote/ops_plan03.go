@@ -15,34 +15,56 @@ import (
 // call the same names.
 type (
 	gitFilesArgs struct {
-		Plan           *gitx.Plan
-		Excludes       []string
-		IncludeIgnored bool
+		Plan           *gitx.Plan `json:"plan"`
+		Excludes       []string   `json:"excludes"`
+		IncludeIgnored bool       `json:"include_ignored"`
 	}
-	gitSourceFactsArgs struct{ MainDir, IndexRel, Tip, DestTip string }
-	tmuxSessionsArgs   struct{ SocketPath string }
-	killWindowArgs     struct{ Ref *session.TmuxRef }
-	claudeStatusArgs   struct{ ID session.ID }
+	gitSourceFactsArgs struct {
+		MainDir  string `json:"main_dir"`
+		IndexRel string `json:"index_rel"`
+		Tip      string `json:"tip"`
+		DestTip  string `json:"dest_tip"`
+	}
+	tmuxSessionsArgs struct {
+		SocketPath string `json:"socket_path"`
+	}
+	killWindowArgs struct {
+		Ref *session.TmuxRef `json:"ref"`
+	}
+	claudeStatusArgs struct {
+		ID session.ID `json:"id"`
+	}
 	claudeStatusResult struct {
-		Registry *session.Registry
-		OK       bool
+		Registry *session.Registry `json:"registry"`
+		OK       bool              `json:"ok"`
 	}
 	buildManifestArgs struct {
-		JobID            string
-		ID               session.ID
-		SrcHost, DstHost string
-		Files            []session.FileEntry
-		PathMap          session.PathMap
+		JobID   string              `json:"job_id"`
+		ID      session.ID          `json:"id"`
+		SrcHost string              `json:"src_host"`
+		DstHost string              `json:"dst_host"`
+		Files   []session.FileEntry `json:"files"`
+		PathMap session.PathMap     `json:"path_map"`
 	}
 	sessionExtrasArgs struct {
-		ID      session.ID
-		PathMap session.PathMap
+		ID      session.ID      `json:"id"`
+		PathMap session.PathMap `json:"path_map"`
 	}
-	extrasResult       struct{ Extras *transfer.InstallExtras }
-	cleanupArgs        struct{ JobID string }
-	filesResult        struct{ Files []session.FileEntry }
-	sessionsResult     struct{ Sessions []SessionSummary }
-	tmuxSessionsResult struct{ Sessions []tmuxx.SessionInfo }
+	extrasResult struct {
+		Extras *transfer.InstallExtras `json:"extras"`
+	}
+	cleanupArgs struct {
+		JobID string `json:"job_id"`
+	}
+	filesResult struct {
+		Files []session.FileEntry `json:"files"`
+	}
+	sessionsResult struct {
+		Sessions []SessionSummary `json:"sessions"`
+	}
+	tmuxSessionsResult struct {
+		Sessions []tmuxx.SessionInfo `json:"sessions"`
+	}
 )
 
 // localHandler decodes args, runs the op on the Local, returns a result.

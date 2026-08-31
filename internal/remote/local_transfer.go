@@ -14,14 +14,14 @@ import (
 
 // SessionSummary is one row of ListSessions (spec §5 `list`).
 type SessionSummary struct {
-	ID      session.ID
-	State   string
-	Cwd     string
-	Branch  string
-	Version string
-	LastTS  string
-	Name    string
-	Tmux    string
+	ID      session.ID `json:"id"`
+	State   string     `json:"state"`
+	Cwd     string     `json:"cwd"`
+	Branch  string     `json:"branch"`
+	Version string     `json:"version"`
+	LastTS  string     `json:"last_ts"`
+	Name    string     `json:"name"`
+	Tmux    string     `json:"tmux"`
 }
 
 // BuildManifest hashes files on this host and saves jobs/<jobID>/manifest.json.
