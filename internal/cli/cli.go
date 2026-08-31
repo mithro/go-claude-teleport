@@ -47,6 +47,32 @@ type app struct {
 	env       map[string]string
 	configDir string         // --config-dir (persistent flag)
 	flags     *teleportFlags // root flags incl. the persistent --json/-v/-q
+
+	// Additions (Task 21): paths is resolved lazily by ensurePaths() (so
+	// commands that never need it, like `version`, still work with no
+	// HOME); selfExe and logf are set once by Main; closers collects
+	// release functions (ssh connections, a dialled tmux control
+	// connection) that Main runs after root.Execute() regardless of
+	// outcome.
+	paths   session.Paths
+	selfExe string
+	logf    func(string, ...any)
+	closers []func() error
+}
+
+// ensurePaths resolves a.paths (honouring --config-dir) the first time a
+// command needs it; a command that never touches paths (version, a bad
+// --help invocation, ...) is unaffected by a missing HOME.
+func (a *app) ensurePaths() error {
+	if a.paths.Home != "" {
+		return nil
+	}
+	p, err := a.resolvePaths()
+	if err != nil {
+		return err
+	}
+	a.paths = p
+	return nil
 }
 
 func parseEnv(env []string) map[string]string {
@@ -63,6 +89,8 @@ func parseEnv(env []string) map[string]string {
 // os.Exit, so tests drive it directly.
 func Main(args []string, stdin io.Reader, stdout, stderr io.Writer, env []string) int {
 	a := &app{stdin: stdin, stdout: stdout, stderr: stderr, env: parseEnv(env)}
+	a.selfExe = selfExe()
+	a.logf = stderrLogf(stderr)
 	root := a.rootCmd()
 	root.SetContext(context.WithValue(context.Background(), cmdEnvKey{}, cmdEnv{env: env, stdin: stdin, stdout: stdout, stderr: stderr}))
 	root.SetArgs(args)
@@ -70,16 +98,31 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer, env []string
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	err := root.Execute()
+	for _, c := range a.closers {
+		_ = c()
+	}
 	if err == nil {
 		return ExitOK
 	}
 	var ee *ExitError
 	if errors.As(err, &ee) {
-		fmt.Fprintln(stderr, "claude-teleport:", ee.Err)
+		// errReported (teleport.go) marks an error a command already
+		// printed itself (a.fail); an empty message here would otherwise
+		// print a bare "claude-teleport: " a second time.
+		if ee.Err != nil && ee.Err.Error() != "" {
+			fmt.Fprintln(stderr, "claude-teleport:", ee.Err)
+		}
 		return ee.Code
 	}
 	fmt.Fprintln(stderr, "claude-teleport:", err)
 	return ExitFailed
+}
+
+// nextHint prints the canonical "what to do next" line for a job that has
+// not finished successfully (status/continue/abandon) — the one place
+// that spells it out, so no call site hand-rolls its own hint string.
+func nextHint(w io.Writer, id string) {
+	fmt.Fprintf(w, "next: claude-teleport status %s | claude-teleport continue %s | claude-teleport abandon %s\n", id, id, id)
 }
 
 // resolvePaths computes the local session.Paths from HOME, CLAUDE_CONFIG_DIR

@@ -94,8 +94,7 @@ func renderStatus(w io.Writer, j *job.Journal, m *transfer.Manifest, logTail []s
 		}
 	}
 	if !j.Finished {
-		// `continue` is registered by Plan 03; until then, point at status
-		// (to recheck) and abandon (to give up cleanly) only.
-		fmt.Fprintf(w, "\nnext: claude-teleport status %s   |   claude-teleport abandon %s\n", j.ID, j.ID)
+		fmt.Fprintln(w)
+		nextHint(w, j.ID)
 	}
 }

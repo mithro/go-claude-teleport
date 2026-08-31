@@ -3,6 +3,7 @@ package tmuxx
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -30,12 +31,18 @@ func (p *prober) PaneCommand(paneID string) ([]string, int, bool) {
 	return st.Argv, st.PID, true
 }
 
-// FindWindow targets "<session>:<window>". sess is tmux's stored spelling
-// (see SessionInfo.Name) and is NOT decoded: `-t` resolves stored names.
+// FindWindow targets "<session>:<window>". sess is what a HUMAN typed at
+// the CLI selector (spec §5 rule 4: `<tmux-session> <window>`) — it is
+// resolved against tmux's actual session list first (R-PRB-9, below)
+// before being used as a `-t` target.
 func (p *prober) FindWindow(sess, window string) ([]string, error) {
-	target := "=" + sess + ":" + window
+	stored, err := p.resolveSessionName(sess)
+	if err != nil {
+		return nil, fmt.Errorf("window %s %s: %w", sess, window, err)
+	}
+	target := "=" + stored + ":" + window
 	if _, err := strconv.Atoi(window); err != nil {
-		target = "=" + sess + ":=" + window // exact window-name match
+		target = "=" + stored + ":=" + window // exact window-name match
 	}
 	lines, err := p.t.Run(p.ctx, fmt.Sprintf(`list-panes -t %s -F "#{pane_id}"`, Quote(target)))
 	if err != nil {
@@ -51,6 +58,43 @@ func (p *prober) FindWindow(sess, window string) ([]string, error) {
 		return nil, fmt.Errorf("window %s %s: no panes", sess, window)
 	}
 	return out, nil
+}
+
+// resolveSessionName maps a human-typed tmux session name to tmux's
+// stored, vis(3)-encoded spelling (R-PRB-9, ruling D): the CLI selector's
+// two-word form (`<tmux-session> <window>`) is typed by a person, who may
+// spell a session with special characters either as the plain text they
+// read or as the raw vis-encoded form tmux itself would report — so a
+// match is accepted against EITHER spelling of each session tmux lists.
+// It is an error if the two spellings resolve to different sessions
+// (ambiguous), matching resolvePrefix's ambiguity handling in
+// session.Resolve. TmuxRef/SessionInfo keep the stored spelling everywhere
+// else (R-PRB-2); only this human-input boundary decodes for comparison.
+func (p *prober) resolveSessionName(typed string) (string, error) {
+	sessions, err := ListSessions(p.ctx, p.t)
+	if err != nil {
+		return "", fmt.Errorf("list-sessions: %w", err)
+	}
+	found := map[string]bool{}
+	for _, s := range sessions {
+		if s.Name == typed || UnvisName(s.Name) == typed {
+			found[s.Name] = true
+		}
+	}
+	switch len(found) {
+	case 0:
+		return "", fmt.Errorf("no session named %q", typed)
+	case 1:
+		for name := range found {
+			return name, nil
+		}
+	}
+	names := make([]string, 0, len(found))
+	for name := range found {
+		names = append(names, UnvisName(name))
+	}
+	sort.Strings(names)
+	return "", fmt.Errorf("%q is ambiguous between sessions: %s", typed, strings.Join(names, ", "))
 }
 
 func (p *prober) SocketPath() string { return p.socket }

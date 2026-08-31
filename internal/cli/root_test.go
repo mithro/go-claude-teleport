@@ -3,20 +3,68 @@ package cli
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestTeleportFlagsParseButTransportIsStubbed(t *testing.T) {
-	code, _, stderr := run(t, []string{"HOME=/home/alice"}, "3f9c2b7e-5a14-4d8e-9b21-7c0e5d6a8f13", "--to", "big-storage.example",
-		"--via", "jump.example", "-o", "User=alice", "--dest-path", "/srv/w", "--map", "/home/alice=/home/bob",
-		"--state", "idle", "--allow-config-drift", "--force", "--tmux-socket", "main", "--exclude", "*.log",
-		"--dry-run", "--exit-timeout", "10s", "--start-timeout", "1m", "--log", "/tmp/x.log", "-v")
-	if code != ExitUsage || !strings.Contains(stderr, "transport not implemented yet") {
-		t.Fatalf("exit %d stderr %q", code, stderr)
+// TestTeleportOptionsFromFlags replaces the old
+// TestTeleportFlagsParseButTransportIsStubbed (Plan 01's transport stub is
+// gone as of Task 21): it checks every flag reaches orchestrate.Options
+// correctly, at the a.teleportOptions unit level rather than through
+// Main()'s full dial path — dialing "big-storage.example"/"jump.example"
+// for real would make this test network-dependent (see
+// TestTeleportE2E-style tests elsewhere for the dial path itself, exercised
+// against in-process fixtures via Options.LocalDest).
+func TestTeleportOptionsFromFlags(t *testing.T) {
+	a := &app{env: parseEnv([]string{"HOME=/home/alice"})}
+	tf := teleportFlags{
+		To: "big-storage.example", Via: []string{"jump.example"}, SSHOptions: []string{"User=alice"},
+		DestPath: "/srv/w", Maps: []string{"/home/alice=/home/bob"}, State: "idle", AllowDrift: true, Force: true,
+		TmuxSocket: "main", Excludes: []string{"*.log"}, IncludeIgnored: true,
+		ExitTimeout: 10 * time.Second, StartTimeout: time.Minute,
 	}
-	// canonical spellings and --from
-	code, _, stderr = run(t, []string{"HOME=/home/alice"}, "--teleport-from", "laptop.example")
-	if code != ExitUsage || !strings.Contains(stderr, "transport not implemented yet") {
-		t.Fatalf("exit %d stderr %q", code, stderr)
+	o, err := a.teleportOptions(tf, []string{"3f9c2b7e-5a14-4d8e-9b21-7c0e5d6a8f13"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.Direction != "to" || o.Target != "big-storage.example" || len(o.Via) != 1 || o.Via[0] != "jump.example" {
+		t.Errorf("direction/target/via = %+v", o)
+	}
+	if o.SSHOptions["User"] != "alice" {
+		t.Errorf("ssh options = %+v", o.SSHOptions)
+	}
+	if o.DestPath != "/srv/w" || o.State != "idle" || !o.AllowDrift || !o.Force || o.TmuxSocket != "main" {
+		t.Errorf("options = %+v", o)
+	}
+	if len(o.Maps) != 1 || o.Maps[0].From != "/home/alice" || o.Maps[0].To != "/home/bob" {
+		t.Errorf("maps = %+v", o.Maps)
+	}
+	if len(o.Excludes) != 1 || o.Excludes[0] != "*.log" || !o.IncludeIgnored {
+		t.Errorf("excludes/include-ignored = %+v", o)
+	}
+	if o.ExitTimeout != 10*time.Second || o.StartTimeout != time.Minute {
+		t.Errorf("timeouts = %+v", o)
+	}
+	if string(o.Selector.ID) != "3f9c2b7e-5a14-4d8e-9b21-7c0e5d6a8f13" {
+		t.Errorf("selector = %+v", o.Selector)
+	}
+
+	// --from flips Direction/Target (canonical spellings/--to alias are
+	// cobra flag parsing, exercised by TestTeleportFlagValidation using
+	// --to directly, and by TestHelpDocumentsEverything for --teleport-*).
+	o2, err := a.teleportOptions(teleportFlags{From: "laptop.example", State: "auto"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o2.Direction != "from" || o2.Target != "laptop.example" {
+		t.Errorf("from direction = %+v", o2)
+	}
+}
+
+func TestTeleportOptionsRejectsRelativeDestPath(t *testing.T) {
+	a := &app{env: parseEnv([]string{"HOME=/home/alice"})}
+	tf := teleportFlags{To: "a.example", State: "auto", DestPath: "relative/path"}
+	if _, err := a.teleportOptions(tf, nil); err == nil || !strings.Contains(err.Error(), "must be absolute") {
+		t.Errorf("err = %v, want an absolute-path error", err)
 	}
 }
 
@@ -48,7 +96,7 @@ func TestHelpDocumentsEverything(t *testing.T) {
 	}
 	for _, w := range []string{
 		"--teleport-to", "--teleport-from", "--to", "--from", "--via", "-o KEY=VALUE", "--dest-path", "--map", "--state",
-		"--allow-config-drift", "--force", "--tmux-socket", "--no-tmux", "--exclude", "--dry-run", "--exit-timeout",
+		"--allow-config-drift", "--force", "--tmux-socket", "--no-tmux", "--exclude", "--include-ignored", "--dry-run", "--exit-timeout",
 		"--start-timeout", "--config-dir", "--log", "--json", "--verbose", "--quiet",
 		"continue <sid>", "status", "abandon", "inspect", "list", "compare-config", "doctor", "placeholder", "version",
 		"CLAUDE_CODE_SESSION_ID", "Exit codes", "claude --teleport",

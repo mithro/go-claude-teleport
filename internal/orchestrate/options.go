@@ -35,6 +35,11 @@ type Options struct {
 	Target     string            `json:"target"` // [user@]host[:port] of the remote endpoint
 	Via        []string          `json:"via"`
 	SSHOptions map[string]string `json:"ssh_options"`
+
+	// LocalDest, when set, makes the destination a second in-process Local
+	// endpoint with these paths instead of an ssh client (tests only; no
+	// flag exposes it).
+	LocalDest *session.Paths `json:"local_dest,omitempty"`
 }
 
 // Plan is the immutable outcome of preflight plus the few facts later

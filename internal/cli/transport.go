@@ -14,15 +14,10 @@ import (
 	"github.com/kevinburke/ssh_config"
 	"github.com/spf13/cobra"
 
-	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/sshx"
 )
-
-// RunnerSteps is registered by Plan 03's orchestrator; nil means the
-// detached runner cannot run any job yet.
-var RunnerSteps func(j *job.Journal, logf func(string, ...any)) ([]job.Step, error)
 
 // fail is shorthand for Plan 01's cli.Exit: it returns a *cli.ExitError
 // carrying a spec §5 exit code out of a cobra RunE (Plan 01's Main maps it).
@@ -193,39 +188,7 @@ func AddTransportCommands(root *cobra.Command) {
 		},
 	})
 	root.AddCommand(remoteCmd)
-
-	root.AddCommand(&cobra.Command{
-		Use:    "internal-runner <job-dir>",
-		Hidden: true,
-		Args:   cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			e := envOf(cmd)
-			jobDir := filepath.Clean(args[0])
-			id := filepath.Base(jobDir)
-			dataDir := filepath.Dir(filepath.Dir(jobDir))
-			j, found, err := job.Open(dataDir, id)
-			if err != nil {
-				return fail(ExitFailed, "%v", err)
-			}
-			if !found {
-				return fail(ExitFailed, "no journal at %s", jobDir)
-			}
-			logf := stderrLogf(e.stderr)
-			if RunnerSteps == nil {
-				return fail(ExitFailed, "internal-runner: no steps registered for job %s (orchestrator arrives in Plan 03)", id)
-			}
-			steps, err := RunnerSteps(j, logf)
-			if err != nil {
-				return fail(ExitFailed, "%v", err)
-			}
-			j.RunnerPID = os.Getpid()
-			if err := j.Save(); err != nil {
-				return fail(ExitFailed, "%v", err)
-			}
-			if err := job.Run(cmd.Context(), j, steps, logf); err != nil {
-				return fail(ExitFailed, "%v", err)
-			}
-			return nil
-		},
-	})
+	// internal-runner is registered by root.go (newInternalRunnerCmd, Task
+	// 21) — the real orchestrator now exists; there is no provisional stub
+	// to fall back to.
 }

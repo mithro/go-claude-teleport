@@ -11,26 +11,28 @@ import (
 )
 
 // teleportFlags holds every option of the teleport command (spec §5).
-// Plans 02/03 consume it; this plan only parses and validates it.
+// validate applies the cross-flag rules below; teleportOptions (teleport.go,
+// Task 21) turns a validated set into orchestrate.Options.
 type teleportFlags struct {
-	To, From     string
-	Via          []string
-	SSHOptions   []string // -o KEY=VALUE
-	DestPath     string
-	Maps         []string
-	State        string
-	AllowDrift   bool
-	Force        bool
-	TmuxSocket   string
-	NoTmux       bool
-	Excludes     []string
-	DryRun       bool
-	ExitTimeout  time.Duration
-	StartTimeout time.Duration
-	LogFile      string
-	JSON         bool
-	Verbose      bool
-	Quiet        bool
+	To, From       string
+	Via            []string
+	SSHOptions     []string // -o KEY=VALUE
+	DestPath       string
+	Maps           []string
+	State          string
+	AllowDrift     bool
+	Force          bool
+	TmuxSocket     string
+	NoTmux         bool
+	Excludes       []string
+	IncludeIgnored bool
+	DryRun         bool
+	ExitTimeout    time.Duration
+	StartTimeout   time.Duration
+	LogFile        string
+	JSON           bool
+	Verbose        bool
+	Quiet          bool
 }
 
 var validStates = map[string]bool{"auto": true, "running": true, "suspended": true, "idle": true}
@@ -79,21 +81,10 @@ func (a *app) rootCmd() *cobra.Command {
 		SilenceErrors: true,
 		Args:          cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if tf.To == "" && tf.From == "" && len(args) == 0 {
-				return cmd.Help()
-			}
 			if err := tf.validate(args); err != nil {
 				return err
 			}
-			// Parsed (not resolved) here only so a malformed selector fails as a
-			// usage error before the transport stub runs; resolveSession (used by
-			// inspect/list) does the full parse-then-Resolve for those commands.
-			if _, err := session.ParseSelector(args, a.selectorEnv()); err != nil {
-				return Exit(ExitUsage, "%v", err)
-			}
-			// The orchestrator (git, tmux, ssh transport) arrives with Plans 02
-			// and 03; until then a teleport is a clean usage error.
-			return Exit(ExitUsage, "transport not implemented yet: this build parses the command line only")
+			return exitErr(a.runTeleport(cmd.Context(), tf, args))
 		},
 	}
 	root.SetHelpTemplate("{{.Long}}\n")
@@ -114,6 +105,7 @@ func (a *app) rootCmd() *cobra.Command {
 	f.StringVar(&tf.TmuxSocket, "tmux-socket", "", "destination tmux socket name")
 	f.BoolVar(&tf.NoTmux, "no-tmux", false, "do not use tmux on the destination")
 	f.StringArrayVar(&tf.Excludes, "exclude", nil, "exclude glob, repeatable")
+	f.BoolVar(&tf.IncludeIgnored, "include-ignored", false, "also transfer gitignored files")
 	f.BoolVar(&tf.DryRun, "dry-run", false, "preflight only")
 	f.DurationVar(&tf.ExitTimeout, "exit-timeout", 30*time.Second, "source exit wait")
 	f.DurationVar(&tf.StartTimeout, "start-timeout", 90*time.Second, "destination start wait")
@@ -126,6 +118,7 @@ func (a *app) rootCmd() *cobra.Command {
 
 	root.AddCommand(a.versionCmd(), a.internalFreezerCmd(), a.placeholderCmd(), a.inspectCmd(), a.listCmd(), a.compareConfigCmd(), a.doctorCmd())
 	AddTransportCommands(root)
+	root.AddCommand(newContinueCmd(a), newInternalRunnerCmd(a))
 	return root
 }
 

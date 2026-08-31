@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,25 +58,10 @@ func TestRemoteStreamLog(t *testing.T) {
 	}
 }
 
-func TestInternalRunnerWithoutStepsIsExplicit(t *testing.T) {
-	env, home := testEnv(t)
-	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
-	j, _ := job.New(dataDir, tsid)
-	j.Save()
-	var stdout, stderr bytes.Buffer
-	code := Main([]string{"internal-runner", j.Dir}, strings.NewReader(""), &stdout, &stderr, env)
-	if code != ExitFailed || !strings.Contains(stderr.String(), "no steps registered") {
-		t.Errorf("exit %d stderr %q", code, stderr.String())
-	}
-	code = Main([]string{"internal-runner", filepath.Join(dataDir, "jobs", "nope")}, strings.NewReader(""), &stdout, &stderr, env)
-	if code != ExitFailed || !strings.Contains(stderr.String(), "no journal") {
-		t.Errorf("missing journal: exit %d stderr %q", code, stderr.String())
-	}
-	if _, err := os.Stat(j.Dir); err != nil {
-		t.Errorf("runner must not remove the job dir: %v", err)
-	}
-	_ = io.EOF
-}
+// internal-runner's real behaviour (Task 21) is covered by
+// internal/cli/teleport_test.go (TestInternalRunnerUsage) and
+// internal/orchestrate/runner_test.go — this file predates the real
+// orchestrator and no longer has a provisional stub to pin.
 
 // TestDialTargetSurfacesSSHConfigOpenError covers the non-ENOENT branch of
 // dialTarget's ~/.ssh/config open: a missing file must still proceed with a

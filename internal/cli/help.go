@@ -50,6 +50,7 @@ Options:
   --tmux-socket NAME      destination tmux socket name (default: same as source)
   --no-tmux               do not use tmux on the destination (end state must be idle)
   --exclude GLOB          omit matching files from the repository transfer, repeatable
+  --include-ignored       also transfer gitignored files
   --dry-run               preflight and plan only; nothing touched, nothing frozen
   --exit-timeout D        wait for the source Claude to exit (default 30s)
   --start-timeout D       wait for the destination Claude to resume (default 90s)

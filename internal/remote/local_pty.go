@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -44,10 +43,20 @@ func (r *ring) String() string {
 func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, timeout time.Duration) error {
 	cmd := exec.CommandContext(ctx, "claude", "--resume", string(id))
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	if filepath.Clean(l.paths.ConfigDir) != filepath.Join(l.paths.Home, ".claude") {
-		cmd.Env = append(cmd.Env, "CLAUDE_CONFIG_DIR="+l.paths.ConfigDir)
-	}
+	// HOME and CLAUDE_CONFIG_DIR are appended (not merely conditionally
+	// added) so they win over whatever this process's own os.Environ()
+	// carries: a later duplicate entry in exec's env slice overrides an
+	// earlier one (verified against this platform's execve/getenv).
+	// Un-conditioning this also fixes an in-process, two-host test fixture
+	// (Task 21's RunJob test) where l.paths.Home differs from the real
+	// process $HOME on both the "source" and "destination" Local — the old
+	// conditional compared l.paths.ConfigDir to l.paths.Home+"/.claude"
+	// (always equal, since both derive from the same paths.Home), so it
+	// never actually fired and `claude` always resumed against the real
+	// machine's $HOME/.claude instead of the fixture's. In production
+	// l.paths.Home already equals the process's real $HOME, so this is a
+	// no-op there.
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "HOME="+l.paths.Home, "CLAUDE_CONFIG_DIR="+l.paths.ConfigDir)
 	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 40, Cols: 120})
 	if err != nil {
 		return &Error{Code: "internal", Message: fmt.Sprintf("pty-resume: start claude: %v", err)}
