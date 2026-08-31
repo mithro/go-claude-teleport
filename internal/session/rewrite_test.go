@@ -27,7 +27,10 @@ func TestRewriteJSONL(t *testing.T) {
 	if len(lines) != 5 {
 		t.Fatalf("got %d lines:\n%s", len(lines), out.String())
 	}
-	checks := []struct{ line int; want []string }{
+	checks := []struct {
+		line int
+		want []string
+	}{
 		{0, []string{`"cwd":"/home/bob/p"`, `"/home/bob/q"`, `1756289730123`, `0.1`, `1e21`, `true`, `null`, `12345678901234567890`, `"unknownField"`}},
 		{1, []string{`this line is not json`}},
 		{2, []string{`"/home/bob/p/main.go":{"version":1}`, `"<b>&</b>"`}}, // keys rewritten; HTML not escaped

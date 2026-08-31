@@ -51,12 +51,12 @@ func TestParseMappings(t *testing.T) {
 func TestApplyPath(t *testing.T) {
 	m := NewPathMap(Mapping{"/home/alice", "/home/bob"}, Mapping{"/home/alice/github/example/widget", "/srv/widget"})
 	cases := map[string]string{
-		"/home/alice":                              "/home/bob",
-		"/home/alice/x":                            "/home/bob/x",
+		"/home/alice":   "/home/bob",
+		"/home/alice/x": "/home/bob/x",
 		"/home/alice/github/example/widget/main.go": "/srv/widget/main.go",
-		"/home/alicent/x":                          "/home/alicent/x", // not a boundary
-		"/opt/home/alice":                          "/opt/home/alice", // not a prefix
-		"relative/home/alice":                      "relative/home/alice",
+		"/home/alicent/x":     "/home/alicent/x", // not a boundary
+		"/opt/home/alice":     "/opt/home/alice", // not a prefix
+		"relative/home/alice": "relative/home/alice",
 	}
 	for in, want := range cases {
 		if got := m.ApplyPath(in); got != want {
