@@ -9,20 +9,21 @@ import (
 )
 
 type HostInfo struct {
-	Version         string `json:"version"` // claude-teleport version
-	Protocol        int    `json:"protocol"`
-	Hostname        string `json:"hostname"`
-	OS              string `json:"os"`
-	Arch            string `json:"arch"`
-	UID             int    `json:"uid"`
-	Home            string `json:"home"`
-	ConfigDir       string `json:"config_dir"`
-	DataDir         string `json:"data_dir"`
-	TmuxSocketDir   string `json:"tmux_socket_dir"`
-	HasTmux         bool   `json:"has_tmux"`
-	HasClaude       bool   `json:"has_claude"`
-	ClaudeVersion   string `json:"claude_version"`
-	HasClaudeResume bool   `json:"has_claude_resume"` // go-tmux-saver's claude-resume on PATH
+	Version          string `json:"version"` // claude-teleport version
+	Protocol         int    `json:"protocol"`
+	Hostname         string `json:"hostname"`
+	OS               string `json:"os"`
+	Arch             string `json:"arch"`
+	UID              int    `json:"uid"`
+	Home             string `json:"home"`
+	ConfigDir        string `json:"config_dir"`
+	DataDir          string `json:"data_dir"`
+	TmuxSocketDir    string `json:"tmux_socket_dir"`
+	HasTmux          bool   `json:"has_tmux"`
+	HasClaude        bool   `json:"has_claude"`
+	ClaudeVersion    string `json:"claude_version"`
+	ClaudeVersionErr string `json:"claude_version_err,omitempty"` // `claude --version` failed; message, not swallowed
+	HasClaudeResume  bool   `json:"has_claude_resume"`            // go-tmux-saver's claude-resume on PATH
 }
 
 // StreamKind names the bulk channels.
