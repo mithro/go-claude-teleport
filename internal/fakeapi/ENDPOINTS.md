@@ -41,3 +41,26 @@ Consequences for this package:
   paths may hit them) but are not required for `-p` runs.
 - Every request body is recorded so tests can assert prior-context inclusion.
 - Non-streaming requests (`stream` absent/false) get a plain JSON message.
+
+## Update 2026-08-31, Claude Code 2.1.251 (task 18, `go test -tags realclaude`)
+
+Re-running the same spike (implementer for task 18, same machine, same
+environment as above) now observes **two** requests per `claude -p` /
+`claude -p --resume` invocation, reproducible across repeated runs against a
+fresh `CLAUDE_CONFIG_DIR`:
+
+| # | Method | Path |
+|---|---|---|
+| 1 | GET | `/api/hello` |
+| 2 | POST | `/v1/messages?beta=true` |
+
+`GET /api/hello` now precedes `POST /v1/messages` on every invocation (both
+the initial `-p` call and the `--resume` call), each against its own fresh
+`CLAUDE_CONFIG_DIR`/cwd pair reused between the two calls in the same test.
+No handler changes were needed — `/api/hello` was already served (200,
+`{"ok":true,...}`) per the "kept (cheap)" note above; the fake server was
+already prepared for this. `internal/fakeapi/realclaude_test.go` now expects
+2 requests after the first call and 4 total after `--resume`, asserting
+`/api/hello` then `/v1/messages` in each pair; the prior-context assertion
+(the last `/v1/messages` body must contain both "say hello" and "what did I
+say?") is unchanged.
