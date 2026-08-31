@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -31,12 +32,17 @@ func ProcState(procRoot string, pid int) (byte, error) {
 // Freezer holds a stopped pid; Thaw releases it. If the owning process dies
 // first, the helper releases it on pipe EOF (spec §6.1).
 type Freezer struct {
-	cmd     *exec.Cmd
-	control *os.File // write end; helper holds the read end on fd 3
-	stderr  *bytes.Buffer
-	pid     int
+	cmd      *exec.Cmd
+	control  *os.File // write end; helper holds the read end on fd 3
+	stderr   *bytes.Buffer
+	pid      int
+	thawOnce sync.Once
+	thawErr  error
 }
 
+// checkStart hardcodes "/proc": Freeze/RunFreezerHelper act on the live
+// kernel via syscall.Kill, so a configurable procRoot would not make them
+// meaningfully testable (ProcState, the pure-I/O helper, takes procRoot).
 func checkStart(pid int, startTime string) error {
 	if startTime == "" {
 		return fmt.Errorf("pid %d: empty start time (refusing to signal an unverified pid)", pid)
@@ -88,15 +94,20 @@ func Freeze(selfExe string, pid int, startTime string) (*Freezer, error) {
 }
 
 // Thaw writes "thaw\n", closes the pipe and waits for the helper to exit.
+// It is idempotent: a repeat call is a no-op that returns the first call's
+// result, so callers can freely pair an explicit Thaw with a deferred one.
 func (f *Freezer) Thaw() error {
-	if _, err := f.control.Write([]byte("thaw\n")); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, syscall.EPIPE) {
-		return fmt.Errorf("thaw pid %d: %w", f.pid, err)
-	}
-	f.control.Close()
-	if err := f.cmd.Wait(); err != nil {
-		return fmt.Errorf("thaw pid %d: helper: %w: %s", f.pid, err, strings.TrimSpace(f.stderr.String()))
-	}
-	return nil
+	f.thawOnce.Do(func() {
+		if _, err := f.control.Write([]byte("thaw\n")); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, syscall.EPIPE) {
+			f.thawErr = fmt.Errorf("thaw pid %d: %w", f.pid, err)
+			return
+		}
+		f.control.Close()
+		if err := f.cmd.Wait(); err != nil {
+			f.thawErr = fmt.Errorf("thaw pid %d: helper: %w: %s", f.pid, err, strings.TrimSpace(f.stderr.String()))
+		}
+	})
+	return f.thawErr
 }
 
 // RunFreezerHelper is the helper's main: SIGSTOP, ack on stdout, block on

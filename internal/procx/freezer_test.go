@@ -52,6 +52,23 @@ func TestFreezeThaw(t *testing.T) {
 	waitState(t, pid, 'S')
 }
 
+func TestThawIsIdempotent(t *testing.T) {
+	pid, st := startSleep(t)
+	self, _ := os.Executable()
+	f, err := Freeze(self, pid, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, pid, 'T')
+	if err := f.Thaw(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Thaw(); err != nil {
+		t.Fatalf("second Thaw: %v, want nil", err)
+	}
+	waitState(t, pid, 'S')
+}
+
 func TestFreezeRefusesWrongStartTime(t *testing.T) {
 	pid, _ := startSleep(t)
 	self, _ := os.Executable()
