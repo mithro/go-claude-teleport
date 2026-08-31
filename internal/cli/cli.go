@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -63,6 +64,7 @@ func parseEnv(env []string) map[string]string {
 func Main(args []string, stdin io.Reader, stdout, stderr io.Writer, env []string) int {
 	a := &app{stdin: stdin, stdout: stdout, stderr: stderr, env: parseEnv(env)}
 	root := a.rootCmd()
+	root.SetContext(context.WithValue(context.Background(), cmdEnvKey{}, cmdEnv{env: env, stdin: stdin, stdout: stdout, stderr: stderr}))
 	root.SetArgs(args)
 	root.SetIn(stdin)
 	root.SetOut(stdout)
