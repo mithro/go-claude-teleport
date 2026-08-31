@@ -94,19 +94,22 @@ func TestPrintMode(t *testing.T) {
 		t.Fatalf("%v: %s", err, out)
 	}
 	recs := lines(t, e.transcript(sid))
-	if len(recs) != 2 || recs[0]["type"] != "user" || recs[1]["type"] != "assistant" {
+	if len(recs) != 3 || recs[0]["type"] != "permission-mode" || recs[1]["type"] != "user" || recs[2]["type"] != "assistant" {
 		t.Fatalf("%+v", recs)
 	}
-	u := recs[0]
+	if recs[0]["permissionMode"] == nil || recs[0]["sessionId"] != sid {
+		t.Fatalf("permission-mode record %+v", recs[0])
+	}
+	u := recs[1]
 	if u["cwd"] != e.cwd || u["sessionId"] != sid || u["version"] != "2.1.247" || u["gitBranch"] != "main" || u["timestamp"] == nil || u["uuid"] == nil {
 		t.Fatalf("user record %+v", u)
 	}
 	if u["message"].(map[string]any)["content"] != "hello" {
 		t.Fatalf("prompt not recorded: %+v", u)
 	}
-	content := recs[1]["message"].(map[string]any)["content"].([]any)[0].(map[string]any)
-	if content["text"] != "hello back" || recs[1]["parentUuid"] != u["uuid"] {
-		t.Fatalf("assistant record %+v", recs[1])
+	content := recs[2]["message"].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if content["text"] != "hello back" || recs[2]["parentUuid"] != u["uuid"] {
+		t.Fatalf("assistant record %+v", recs[2])
 	}
 	if entries, _ := os.ReadDir(filepath.Join(e.cfg, "sessions")); len(entries) != 0 {
 		t.Fatalf("registry must be removed after -p: %v", entries)
@@ -115,11 +118,11 @@ func TestPrintMode(t *testing.T) {
 	if len(hist) != 1 || hist[0]["display"] != "hello" || hist[0]["sessionId"] != sid || hist[0]["project"] != e.cwd {
 		t.Fatalf("history %+v", hist)
 	}
-	// resume appends to the same file
+	// resume appends to the same file (no extra permission-mode record)
 	if out, err := e.cmd(t, nil, "-p", "again", "--resume", sid).CombinedOutput(); err != nil {
 		t.Fatalf("%v: %s", err, out)
 	}
-	if got := lines(t, e.transcript(sid)); len(got) != 4 || got[2]["message"].(map[string]any)["content"] != "again" {
+	if got := lines(t, e.transcript(sid)); len(got) != 5 || got[3]["message"].(map[string]any)["content"] != "again" {
 		t.Fatalf("%+v", got)
 	}
 	if out, err := e.cmd(t, nil, "-p", "x", "--resume", "00000000-0000-4000-8000-000000000000").CombinedOutput(); err == nil || !strings.Contains(string(out), "No conversation found") {
@@ -160,8 +163,11 @@ func TestInteractive(t *testing.T) {
 	if st, _ := session.ProcStartTime("/proc", pid); st != r.ProcStart {
 		t.Fatalf("procStart %s != real %s", r.ProcStart, st)
 	}
+	if recs := lines(t, e.transcript(sid)); len(recs) != 1 || recs[0]["type"] != "permission-mode" {
+		t.Fatalf("session must open with a permission-mode record: %+v", recs)
+	}
 	io.WriteString(stdin, "first turn\n")
-	waitFor(t, "two records", func() bool { b, _ := os.ReadFile(e.transcript(sid)); return strings.Count(string(b), "\n") == 2 })
+	waitFor(t, "three records", func() bool { b, _ := os.ReadFile(e.transcript(sid)); return strings.Count(string(b), "\n") == 3 })
 	io.WriteString(stdin, "/exit\n")
 	if err := c.Wait(); err != nil {
 		t.Fatalf("exit: %v", err)
@@ -191,6 +197,10 @@ func TestSigtermCleansUp(t *testing.T) {
 	hits, _ := filepath.Glob(filepath.Join(e.cfg, "projects", "*", "*.jsonl"))
 	if len(hits) != 1 {
 		t.Fatalf("a fresh uuid session must have been created: %v", hits)
+	}
+	recs := lines(t, hits[0])
+	if len(recs) != 1 || recs[0]["type"] != "permission-mode" || recs[0]["permissionMode"] == nil || recs[0]["sessionId"] == nil {
+		t.Fatalf("session must open with a permission-mode record: %+v", recs)
 	}
 }
 

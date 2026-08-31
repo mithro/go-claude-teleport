@@ -122,12 +122,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if resume == "" {
-		// Claude Code creates the transcript file as soon as a session
-		// starts, even before the first exchange; --resume's Stat above
-		// already proved the file exists.
-		if fh, err := os.OpenFile(f.transcript, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
-			fh.Close()
-		}
+		// Claude Code opens every new session with a permission-mode record,
+		// even before the first exchange; --resume's Stat above already
+		// proved the transcript exists, so resumed sessions get no extra
+		// startup record.
+		f.append(map[string]any{
+			"type": "permission-mode", "permissionMode": "default", "sessionId": f.sid, "timestamp": now(),
+		})
 	}
 	f.procStart, _ = procx.StartTime("/proc", f.pid)
 	f.startedAt = nowMS()
