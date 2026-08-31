@@ -78,3 +78,53 @@ func TestPlaceholderRequiresResume(t *testing.T) {
 		t.Fatalf("exit %d", code)
 	}
 }
+
+func TestPlaceholderChdirFailure(t *testing.T) {
+	cfg, cwd := placeholderFixture(t)
+	execs, chdirs := stubExec(t)
+	oldChdir := chdirFn
+	chdirFn = func(dir string) error {
+		*chdirs = append(*chdirs, dir)
+		return os.ErrPermission
+	}
+	t.Cleanup(func() { chdirFn = oldChdir })
+	code, _, stderr := run(t, []string{"HOME=" + filepath.Dir(cwd), "CLAUDE_CONFIG_DIR=" + cfg},
+		"placeholder", "--resume", phSID, "--now")
+	if code != ExitFailed {
+		t.Fatalf("exit %d, wanted %d", code, ExitFailed)
+	}
+	if !strings.Contains(stderr, cwd) || !strings.Contains(stderr, "chdir") {
+		t.Fatalf("stderr missing path/chdir: %q", stderr)
+	}
+	if len(*execs) != 0 {
+		t.Fatalf("execveFn should not be called on chdir failure, got %q", *execs)
+	}
+	if len(*chdirs) != 1 {
+		t.Fatalf("chdirFn should be called once, got %d calls", len(*chdirs))
+	}
+}
+
+func TestPlaceholderEmptyChdirPath(t *testing.T) {
+	root := t.TempDir()
+	cfg := filepath.Join(root, "cfg")
+	missingCwd := filepath.Join(root, "nonexistent-dir")
+	proj := filepath.Join(cfg, "projects", session.Munge(missingCwd))
+	os.MkdirAll(proj, 0o700)
+	os.WriteFile(filepath.Join(proj, phSID+".jsonl"),
+		[]byte(`{"type":"user","cwd":"`+missingCwd+`","sessionId":"`+phSID+`","message":{"content":"hi"}}`+"\n"), 0o600)
+	execs, chdirs := stubExec(t)
+	code, out, stderr := run(t, []string{"HOME=" + root, "CLAUDE_CONFIG_DIR=" + cfg},
+		"placeholder", "--resume", phSID, "--now")
+	if code != ExitOK {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if len(*chdirs) != 0 {
+		t.Fatalf("chdirFn should not be called when launch dir doesn't exist, got %q", *chdirs)
+	}
+	if len(*execs) != 1 {
+		t.Fatalf("execveFn should be called, got %q", *execs)
+	}
+	if !strings.Contains(out, "launch directory not usable") {
+		t.Fatalf("output missing warning: %s", out)
+	}
+}

@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -42,13 +41,12 @@ classifies the pane as a Claude pane and saves/restores it as such.`,
 			}
 			if d.Chdir != "" {
 				if err := chdirFn(d.Chdir); err != nil {
-					fmt.Fprintln(a.stderr, "placeholder: chdir:", err)
-					return Exit(ExitFailed, "")
+					return Exit(ExitFailed, "placeholder: chdir %s: %v", d.Chdir, err)
 				}
 			}
 			path, err := lookPathFn(d.Argv[0])
 			if err != nil {
-				return Exit(ExitFailed, "placeholder: `claude` not found on PATH")
+				return Exit(ExitFailed, "placeholder: `claude` not found on PATH: %v", err)
 			}
 			if err := execveFn(path, d.Argv, os.Environ()); err != nil {
 				return Exit(ExitFailed, "placeholder: exec %s: %v", path, err)

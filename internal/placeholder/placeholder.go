@@ -156,6 +156,13 @@ func Decide(w io.Writer, o Options, stdoutTTY, stdinTTY bool, readLine func() (s
 	chdir := ""
 	if meta != nil {
 		chdir = ChdirTarget(*meta, transcript)
+		if chdir == "" && meta.LaunchCwd != "" {
+			d, r := "", ""
+			if stdoutTTY {
+				d, r = "\033[2m", "\033[0m"
+			}
+			fmt.Fprintf(w, "%s(launch directory not usable — resuming from the current directory)%s\n", d, r)
+		}
 	}
 	return Decision{Argv: argv, Chdir: chdir}
 }
