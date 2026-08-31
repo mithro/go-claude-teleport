@@ -80,6 +80,13 @@ func clientConfig(r Resolved, o Options) (*ssh.ClientConfig, func(), error) {
 
 // Dial connects through the jump chain; each hop's hostname is resolved by
 // the previous hop (client.Dial("tcp", host:port)), never locally.
+//
+// overrides is accepted for symmetry with Resolve but is deliberately never
+// applied to jump hops here: -o overrides only ever affect the final target
+// (already folded into r before Dial is called), while each jump hop in
+// r.Via is re-resolved from config alone (see the Resolve(v, cfg, nil, ...)
+// call below) so that -o flags aimed at the destination cannot leak into,
+// and silently change, the jump hosts along the way.
 func Dial(ctx context.Context, r Resolved, cfg *ssh_config.Config, overrides map[string]string, o Options) (*Client, error) {
 	logf := o.logf()
 	hops := make([]Resolved, 0, len(r.Via)+1)
@@ -157,4 +164,41 @@ func (c *Client) closeAll() {
 	for _, f := range c.closes {
 		f()
 	}
+}
+
+// Redial calls dial up to attempts times with exponential backoff
+// (backoff, 2*backoff, ... capped at 30s). Every attempt's error is kept.
+func Redial(ctx context.Context, attempts int, backoff time.Duration, logf func(string, ...any), dial func(ctx context.Context) (*Client, error)) (*Client, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	var errs []string
+	wait := backoff
+	for i := 1; i <= attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("redial aborted after %d attempt(s): %w (%s)", i-1, err, strings.Join(errs, "; "))
+		}
+		c, err := dial(ctx)
+		if err == nil {
+			return c, nil
+		}
+		errs = append(errs, fmt.Sprintf("attempt %d: %v", i, err))
+		if i == attempts {
+			break
+		}
+		logf("ssh dial failed (attempt %d/%d): %v; retrying in %s", i, attempts, err, wait)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("redial aborted: %w (%s)", ctx.Err(), strings.Join(errs, "; "))
+		case <-time.After(wait):
+		}
+		wait *= 2
+		if wait > 30*time.Second {
+			wait = 30 * time.Second
+		}
+	}
+	return nil, fmt.Errorf("ssh dial failed after %d attempts: %s", attempts, strings.Join(errs, "; "))
 }
