@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
 // Exit codes (spec §5).
@@ -40,10 +42,11 @@ func asExit(err error, target **ExitError) bool { return errors.As(err, target) 
 
 // app is the per-invocation state shared by every command.
 type app struct {
-	stdin  io.Reader
-	stdout io.Writer
-	stderr io.Writer
-	env    map[string]string
+	stdin     io.Reader
+	stdout    io.Writer
+	stderr    io.Writer
+	env       map[string]string
+	configDir string // --config-dir (persistent flag)
 }
 
 func parseEnv(env []string) map[string]string {
@@ -78,6 +81,20 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer, env []string
 	return ExitUsage
 }
 
+// resolvePaths computes the local session.Paths from HOME, CLAUDE_CONFIG_DIR
+// (overridden by --config-dir) and XDG_DATA_HOME.
+func (a *app) resolvePaths() (session.Paths, error) {
+	home := a.env["HOME"]
+	if home == "" {
+		return session.Paths{}, Exit(ExitUsage, "HOME is not set")
+	}
+	cfg := a.env["CLAUDE_CONFIG_DIR"]
+	if a.configDir != "" {
+		cfg = a.configDir
+	}
+	return session.NewPaths(home, cfg, a.env["XDG_DATA_HOME"]), nil
+}
+
 // rootCmd builds the command tree. Task 20 replaces the bare root with the
 // full teleport command; every other task adds one subcommand here.
 func (a *app) rootCmd() *cobra.Command {
@@ -90,7 +107,9 @@ func (a *app) rootCmd() *cobra.Command {
 			return cmd.Help()
 		},
 	}
+	root.PersistentFlags().StringVar(&a.configDir, "config-dir", "", "local CLAUDE_CONFIG_DIR override")
 	root.AddCommand(a.versionCmd())
 	root.AddCommand(a.internalFreezerCmd())
+	root.AddCommand(a.placeholderCmd())
 	return root
 }
