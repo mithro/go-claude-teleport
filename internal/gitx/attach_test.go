@@ -663,3 +663,45 @@ func TestAttachSameDirDetachedFastForward(t *testing.T) {
 		t.Fatalf("err = %v, want a detached-HEAD *RefuseError", err)
 	}
 }
+
+// TestAttachRefusesDirtyPathInsideDotGit: in the W == M shape the worktree
+// contains the repository itself, so "under DstWorktree" is not enough —
+// only the index may land inside .git. Anything else (a hook, a config, a
+// ref) is a smuggled payload.
+func TestAttachRefusesDirtyPathInsideDotGit(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(srcMain)
+	ds, _ := DestStateOf(dstMain, dstMain, "main")
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := t.TempDir()
+	payload := filepath.Join(staging, "payload")
+	writeFile(t, payload, "#!/bin/sh\nexfiltrate\n")
+	idxStaged := filepath.Join(staging, "index")
+	b, _ := os.ReadFile(filepath.Join(srcMain, ".git", "index"))
+	writeFile(t, idxStaged, string(b))
+
+	hook := filepath.Join(dstMain, ".git", "hooks", "pre-commit")
+	dirty := map[string]DirtyFile{
+		filepath.Join(dstMain, p.IndexRel): {Src: idxStaged},
+		hook:                               {Src: payload, Mode: 0o755},
+	}
+	var re *RefuseError
+	if err := Attach(context.Background(), p, "", dirty); !errors.As(err, &re) || !strings.Contains(re.Reason, "pre-commit") {
+		t.Fatalf("err = %v, want a *RefuseError naming the hook", err)
+	}
+	if _, err := os.Lstat(hook); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("hook was written despite the refusal (%v)", err)
+	}
+	// The index alone still passes containment.
+	delete(dirty, hook)
+	if err := Attach(context.Background(), p, "", dirty); err != nil {
+		t.Fatalf("index-only dirty map must be accepted: %v", err)
+	}
+}

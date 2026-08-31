@@ -85,7 +85,15 @@ func repairLinkedMetadata(p *Plan) error {
 // outside the directories the transfer owns.
 func checkDirtyContainment(p *Plan, dirtyFiles map[string]DirtyFile) error {
 	idx := indexDestPath(p)
-	prefix := filepath.Clean(p.DstWorktree) + string(filepath.Separator)
+	wt := filepath.Clean(p.DstWorktree)
+	prefix := wt + string(filepath.Separator)
+	// In the W == M shape the worktree *contains* the repository, so being
+	// under DstWorktree is not enough on its own: everything below W/.git
+	// is carved back out so a dirty map cannot smuggle in a hook, a config
+	// or a ref. Only the index — matched above by its exact path — lands
+	// inside .git, and Attach copies it to the git directory itself.
+	dotGit := filepath.Join(wt, ".git")
+	dotGitPrefix := dotGit + string(filepath.Separator)
 	dsts := make([]string, 0, len(dirtyFiles))
 	for dst := range dirtyFiles {
 		dsts = append(dsts, dst)
@@ -93,10 +101,15 @@ func checkDirtyContainment(p *Plan, dirtyFiles map[string]DirtyFile) error {
 	sort.Strings(dsts)
 	for _, dst := range dsts {
 		c := filepath.Clean(dst)
-		if c == idx || strings.HasPrefix(c, prefix) {
+		if c == idx {
 			continue
 		}
-		return &RefuseError{Reason: fmt.Sprintf("dirty file %s is outside the destination worktree %s", dst, p.DstWorktree)}
+		if !strings.HasPrefix(c, prefix) {
+			return &RefuseError{Reason: fmt.Sprintf("dirty file %s is outside the destination worktree %s", dst, p.DstWorktree)}
+		}
+		if c == dotGit || strings.HasPrefix(c, dotGitPrefix) {
+			return &RefuseError{Reason: fmt.Sprintf("dirty file %s is inside %s; only the index may be written there", dst, dotGit)}
+		}
 	}
 	return nil
 }
