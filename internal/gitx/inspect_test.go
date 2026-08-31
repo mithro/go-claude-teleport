@@ -155,3 +155,36 @@ func TestInspectSubmodules(t *testing.T) {
 		t.Errorf("DirtySubmodules (-want +got):\n%s", diff)
 	}
 }
+
+// TestInspectRelativeGitdirWorktrees: git can link worktrees with relative
+// paths (worktree.useRelativePaths). A relative <common>/worktrees/<n>/gitdir
+// value resolves against that directory, exactly as W/.git does.
+func TestInspectRelativeGitdirWorktrees(t *testing.T) {
+	dir := t.TempDir()
+	initRepo(t, dir)
+	w := addWorktreeRelative(t, dir, "feature")
+	other := addWorktreeRelative(t, dir, "other")
+
+	got, err := linkedWorktrees(filepath.Join(dir, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"feature": w, "other": other}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("linkedWorktrees (-want +got):\n%s", diff)
+	}
+	info, err := Inspect(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff([]string{other}, info.OtherWorktrees); diff != "" {
+		t.Errorf("OtherWorktrees (-want +got):\n%s", diff)
+	}
+	st, err := DestStateOf(dir, filepath.Join(dir, "elsewhere"), "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.BranchCheckedOutElsewhere != other {
+		t.Errorf("BranchCheckedOutElsewhere = %q, want %q", st.BranchCheckedOutElsewhere, other)
+	}
+}

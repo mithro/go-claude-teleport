@@ -235,10 +235,14 @@ func dirtyFromStatus(st git.Status) Dirty {
 }
 
 // linkedWorktrees maps worktree name -> worktree directory by reading
-// <common>/worktrees/<name>/gitdir (which holds "<W>/.git").
+// <common>/worktrees/<name>/gitdir (which holds "<W>/.git"). git writes
+// that value relative to the directory holding it when
+// worktree.useRelativePaths is set, so it is resolved the same way
+// readGitdirFile resolves a relative W/.git.
 func linkedWorktrees(commonDir string) (map[string]string, error) {
 	out := map[string]string{}
-	entries, err := os.ReadDir(filepath.Join(commonDir, "worktrees"))
+	base := filepath.Join(commonDir, "worktrees")
+	entries, err := os.ReadDir(base)
 	if errors.Is(err, os.ErrNotExist) {
 		return out, nil
 	}
@@ -249,11 +253,16 @@ func linkedWorktrees(commonDir string) (map[string]string, error) {
 		if !e.IsDir() {
 			continue
 		}
-		gd, err := os.ReadFile(filepath.Join(commonDir, "worktrees", e.Name(), "gitdir"))
+		dir := filepath.Join(base, e.Name())
+		gd, err := os.ReadFile(filepath.Join(dir, "gitdir"))
 		if err != nil {
 			return nil, fmt.Errorf("worktree %s: %w", e.Name(), err)
 		}
-		out[e.Name()] = filepath.Dir(strings.TrimSpace(string(gd)))
+		v := strings.TrimSpace(string(gd))
+		if !filepath.IsAbs(v) {
+			v = filepath.Join(dir, v)
+		}
+		out[e.Name()] = filepath.Dir(filepath.Clean(v))
 	}
 	return out, nil
 }

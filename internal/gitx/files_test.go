@@ -168,3 +168,38 @@ func TestFilesNotRepo(t *testing.T) {
 		t.Errorf("(-want +got):\n%s", diff)
 	}
 }
+
+// TestFilesFreshMainSkipsRelativeGitdirWorktrees: the other-worktree skip
+// list is derived from linkedWorktrees, so it works for relatively linked
+// worktrees too (and never silently skips a worktree whose links it failed
+// to read).
+func TestFilesFreshMainSkipsRelativeGitdirWorktrees(t *testing.T) {
+	dir := t.TempDir()
+	initRepo(t, dir)
+	w := addWorktreeRelative(t, dir, "feat")
+	addWorktreeRelative(t, dir, "other")
+	writeFile(t, filepath.Join(w, "src.go"), "package x")
+
+	info, err := Inspect(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PlanTransfer(info, &DestState{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := Files(p, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, no := range []string{".worktrees/other", ".worktrees/other/README.md", ".git/worktrees/other/HEAD", ".git/worktrees/other/gitdir"} {
+		if has(files, no) {
+			t.Errorf("entry %q must not be transferred", no)
+		}
+	}
+	for _, want := range []string{".git/worktrees/feat/HEAD", ".git/worktrees/feat/gitdir"} {
+		if !has(files, want) {
+			t.Errorf("missing repo entry %q", want)
+		}
+	}
+}

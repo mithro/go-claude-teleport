@@ -87,6 +87,29 @@ func addWorktree(t *testing.T, mainDir, name string) string {
 	return w
 }
 
+// addWorktreeRelative is addWorktree with git's relative worktree links.
+// The two link files are written by hand rather than with
+// worktree.useRelativePaths=true, byte for byte what that config produces
+// (verified against git 2.55): the config also records the
+// extensions.relativeworktrees repository extension, which go-git refuses
+// to open, and the parsing under test is the point here.
+func addWorktreeRelative(t *testing.T, mainDir, name string) string {
+	t.Helper()
+	w := addWorktree(t, mainDir, name)
+	gd := filepath.Join(mainDir, ".git", "worktrees", name)
+	rel, err := filepath.Rel(gd, filepath.Join(w, ".git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(gd, "gitdir"), rel+"\n")
+	relBack, err := filepath.Rel(w, gd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(w, ".git"), "gitdir: "+relBack+"\n")
+	return w
+}
+
 // porcelain returns `git status --porcelain` lines sorted by git.
 func porcelain(t *testing.T, dir string) []string {
 	t.Helper()

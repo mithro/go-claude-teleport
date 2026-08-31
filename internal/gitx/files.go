@@ -42,19 +42,21 @@ func filesFreshMain(p *Plan, excludes []string, includeIgnored bool) ([]session.
 	if err != nil {
 		return nil, err
 	}
+	// Other linked worktrees do not travel: skip both their checkouts and
+	// their .git/worktrees/<name> metadata. The names come straight from
+	// the repository's own worktree list, so no second round of link-file
+	// parsing (and no way for a missing link file to be swallowed) is
+	// needed here.
+	others, err := linkedWorktrees(info.CommonDir)
+	if err != nil {
+		return nil, err
+	}
 	skip := map[string]bool{}
-	for _, o := range info.OtherWorktrees {
-		skip[o] = true
-		// Also skip the .git/worktrees/<name> metadata directory by extracting name from gitdir.
-		dotGitFile := filepath.Join(o, ".git")
-		gd, err := readGitdirFile(dotGitFile)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				return nil, fmt.Errorf("%s: %w", dotGitFile, err)
-			}
-			continue // worktree's .git file vanished: skip only the worktree path itself
+	for name, dir := range others {
+		if name == info.WorktreeName {
+			continue
 		}
-		name := filepath.Base(gd)
+		skip[dir] = true
 		skip[filepath.Join(info.CommonDir, "worktrees", name)] = true
 	}
 	var mainMatcher gitignore.Matcher
