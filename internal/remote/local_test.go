@@ -269,10 +269,9 @@ func TestLocalPlan03OpsAreExplicitStubs(t *testing.T) {
 	l := NewLocal(testPaths(t), "self", LocalOptions{Logf: t.Logf})
 	ctx := context.Background()
 	checks := map[string]error{}
-	_, checks["InventoryGit"] = l.InventoryGit(ctx, "/home/bob/work")
-	_, checks["GitDestState"] = l.GitDestState(ctx, "/m", "/w", "main")
+	// InventoryGit, GitDestState and GitAttach are implemented for real
+	// (local_git.go, local_git_test.go) and no longer explicit stubs.
 	_, checks["InventoryTmux"] = l.InventoryTmux(ctx, nil, "")
-	checks["GitAttach"] = l.GitAttach(ctx, nil, sid)
 	checks["Capture"] = l.Capture(ctx, nil, sid)
 	_, checks["OpenWindow"] = l.OpenWindow(ctx, nil)
 	checks["StartClaude"] = l.StartClaude(ctx, nil, session.ID(sid), sid, nil)

@@ -25,7 +25,7 @@ func testEnv(t *testing.T) ([]string, string) {
 
 func TestRemoteServeOverStdio(t *testing.T) {
 	env, home := testEnv(t)
-	stdin := strings.NewReader(`{"id":1,"op":"hello","args":{"version":"dev","protocol":1}}` + "\n" + `{"id":2,"op":"paths","args":{}}` + "\n")
+	stdin := strings.NewReader(`{"id":1,"op":"hello","args":{"version":"dev","protocol":2}}` + "\n" + `{"id":2,"op":"paths","args":{}}` + "\n")
 	var stdout, stderr bytes.Buffer
 	code := Main([]string{"remote", "serve"}, stdin, &stdout, &stderr, env)
 	if code != ExitOK {

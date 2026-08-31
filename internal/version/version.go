@@ -7,4 +7,9 @@ package version
 var Version = "dev"
 
 // Protocol is the remote helper protocol version (spec §4.3).
-const Protocol = 1
+//
+// Bumped to 2 by Plan 03 Task 13: internal/remote's git/tmux payloads
+// stopped being opaque json.RawMessage blobs and gained a concrete shape
+// (gitx.Info, gitx.DestState, gitx.Plan, tmuxx.Facts, tmuxx.Plan,
+// tmuxx.PaneState) that a mismatched peer can no longer just pass through.
+const Protocol = 2

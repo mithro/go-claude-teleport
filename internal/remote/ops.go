@@ -4,8 +4,10 @@ import (
 	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/claudecfg"
+	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
@@ -69,7 +71,7 @@ type InventoryGitArgs struct {
 	Cwd string `json:"cwd"`
 }
 type InventoryGitResult struct {
-	Info *GitInfo `json:"info"`
+	Info *gitx.Info `json:"info"`
 }
 type GitDestStateArgs struct {
 	MainDir     string `json:"main_dir"`
@@ -77,14 +79,14 @@ type GitDestStateArgs struct {
 	Branch      string `json:"branch"`
 }
 type GitDestStateResult struct {
-	State *GitDestState `json:"state"`
+	State *gitx.DestState `json:"state"`
 }
 type InventoryTmuxArgs struct {
 	Ref             *session.TmuxRef `json:"ref"`
 	PreferredSocket string           `json:"preferred_socket"`
 }
 type InventoryTmuxResult struct {
-	Facts *TmuxFacts `json:"facts"`
+	Facts *tmuxx.Facts `json:"facts"`
 }
 type ManifestDiffArgs struct {
 	Manifest *transfer.Manifest `json:"manifest"`
@@ -105,8 +107,8 @@ type InstallResult struct {
 	Report *transfer.InstallReport `json:"report"`
 }
 type GitAttachArgs struct {
-	Plan  *GitPlan `json:"plan"`
-	JobID string   `json:"job_id"`
+	Plan  *gitx.Plan `json:"plan"`
+	JobID string     `json:"job_id"`
 }
 type FreezeArgs struct {
 	PID       int    `json:"pid"`
@@ -120,7 +122,7 @@ type CaptureArgs struct {
 	JobID string           `json:"job_id"`
 }
 type OpenWindowArgs struct {
-	Plan *TmuxPlan `json:"plan"`
+	Plan *tmuxx.Plan `json:"plan"`
 }
 type OpenWindowResult struct {
 	Ref *session.TmuxRef `json:"ref"`
@@ -153,7 +155,7 @@ type PaneStateArgs struct {
 	Ref *session.TmuxRef `json:"ref"`
 }
 type PaneStateResult struct {
-	State *TmuxPaneState `json:"state"`
+	State *tmuxx.PaneState `json:"state"`
 }
 type RunPtyResumeArgs struct {
 	ID      session.ID    `json:"id"`

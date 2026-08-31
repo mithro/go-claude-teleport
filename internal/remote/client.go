@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/claudecfg"
+	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/sshx"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 	"github.com/mithro/go-claude-teleport/internal/version"
 )
@@ -286,19 +288,19 @@ func (c *Client) InventoryHost(ctx context.Context, cwd, claudeVersion string) (
 	return r.Inventory, err
 }
 
-func (c *Client) InventoryGit(ctx context.Context, cwd string) (*GitInfo, error) {
+func (c *Client) InventoryGit(ctx context.Context, cwd string) (*gitx.Info, error) {
 	var r InventoryGitResult
 	err := c.call(ctx, OpInventoryGit, InventoryGitArgs{Cwd: cwd}, &r)
 	return r.Info, err
 }
 
-func (c *Client) GitDestState(ctx context.Context, mainDir, worktreeDir, branch string) (*GitDestState, error) {
+func (c *Client) GitDestState(ctx context.Context, mainDir, worktreeDir, branch string) (*gitx.DestState, error) {
 	var r GitDestStateResult
 	err := c.call(ctx, OpGitDestState, GitDestStateArgs{MainDir: mainDir, WorktreeDir: worktreeDir, Branch: branch}, &r)
 	return r.State, err
 }
 
-func (c *Client) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket string) (*TmuxFacts, error) {
+func (c *Client) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket string) (*tmuxx.Facts, error) {
 	var r InventoryTmuxResult
 	err := c.call(ctx, OpInventoryTmux, InventoryTmuxArgs{Ref: ref, PreferredSocket: preferredSocket}, &r)
 	return r.Facts, err
@@ -327,7 +329,7 @@ func (c *Client) Install(ctx context.Context, m *transfer.Manifest, jobID string
 	return r.Report, err
 }
 
-func (c *Client) GitAttach(ctx context.Context, plan *GitPlan, jobID string) error {
+func (c *Client) GitAttach(ctx context.Context, plan *gitx.Plan, jobID string) error {
 	return c.call(ctx, OpGitAttach, GitAttachArgs{Plan: plan, JobID: jobID}, nil)
 }
 
@@ -343,7 +345,7 @@ func (c *Client) Capture(ctx context.Context, ref *session.TmuxRef, jobID string
 	return c.call(ctx, OpCapture, CaptureArgs{Ref: ref, JobID: jobID}, nil)
 }
 
-func (c *Client) OpenWindow(ctx context.Context, p *TmuxPlan) (*session.TmuxRef, error) {
+func (c *Client) OpenWindow(ctx context.Context, p *tmuxx.Plan) (*session.TmuxRef, error) {
 	var r OpenWindowResult
 	err := c.call(ctx, OpOpenWindow, OpenWindowArgs{Plan: p}, &r)
 	return r.Ref, err
@@ -367,7 +369,7 @@ func (c *Client) TypeCommand(ctx context.Context, ref *session.TmuxRef, argv []s
 	return c.call(ctx, OpTypeCommand, TypeCommandArgs{Ref: ref, Argv: argv}, nil)
 }
 
-func (c *Client) PaneState(ctx context.Context, ref *session.TmuxRef) (*TmuxPaneState, error) {
+func (c *Client) PaneState(ctx context.Context, ref *session.TmuxRef) (*tmuxx.PaneState, error) {
 	var r PaneStateResult
 	err := c.call(ctx, OpPaneState, PaneStateArgs{Ref: ref}, &r)
 	return r.State, err

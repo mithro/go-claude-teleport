@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/mithro/go-claude-teleport/internal/session"
-	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
 // maxLine bounds one request/response line (manifests can be large).
@@ -113,13 +112,7 @@ var dispatch = map[string]handler{
 		if err != nil {
 			return nil, err
 		}
-		p, ok := ep.(interface {
-			PutInstallExtras(ctx context.Context, jobID string, extra transfer.InstallExtras) error
-		})
-		if !ok {
-			return nil, Unavailable(OpInstallExtras)
-		}
-		return Empty{}, p.PutInstallExtras(ctx, a.JobID, a.Extra)
+		return Empty{}, ep.PutInstallExtras(ctx, a.JobID, a.Extra)
 	},
 	OpInstall: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {
 		a, err := decode[InstallArgs](args)

@@ -52,8 +52,12 @@ func TestClientHelloAndCallsOverPipe(t *testing.T) {
 		t.Errorf("Paths = %+v, want %+v", c.Paths(), wantPaths)
 	}
 	ctx := context.Background()
-	if _, err := c.InventoryGit(ctx, "/x"); !isUnavailable(err) {
-		t.Errorf("stub error must cross the wire: %v", err)
+	// InventoryGit is a real op now (local_git.go): "/x" is not a git repo,
+	// so this exercises gitx.ErrNotRepo crossing the wire as "not-found".
+	if _, err := c.InventoryGit(ctx, "/x"); err == nil {
+		t.Errorf("expected not-found for a non-repo path")
+	} else if pe := new(Error); !errors.As(err, &pe) || pe.Code != "not-found" {
+		t.Errorf("err = %v", err)
 	}
 	if _, err := c.ResolveSession(ctx, session.Selector{ID: session.ID(sid)}); err == nil {
 		t.Errorf("expected not-found")

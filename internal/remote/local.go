@@ -17,6 +17,7 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/procx"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 	"github.com/mithro/go-claude-teleport/internal/version"
 )
@@ -34,7 +35,7 @@ type LocalOptions struct {
 	TmuxSocketDir string
 
 	Probe session.PaneProbe
-	Tmux  TmuxDialer // Plan 03; nil = tmux unavailable
+	Tmux  tmuxx.Dialer // nil = tmux unavailable
 	Logf  func(string, ...any)
 }
 
@@ -128,13 +129,10 @@ func (l *Local) InventoryHost(ctx context.Context, cwd, claudeVersion string) (*
 	return claudecfg.Collect(l.paths, cwd, l.Hostname, claudeVersion)
 }
 
-func (l *Local) InventoryGit(ctx context.Context, cwd string) (*GitInfo, error) {
-	return nil, Unavailable(OpInventoryGit)
-}
-func (l *Local) GitDestState(ctx context.Context, mainDir, worktreeDir, branch string) (*GitDestState, error) {
-	return nil, Unavailable(OpGitDestState)
-}
-func (l *Local) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket string) (*TmuxFacts, error) {
+// InventoryGit, GitDestState, GitFiles, GitSourceFacts and GitAttach are
+// implemented in local_git.go.
+
+func (l *Local) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket string) (*tmuxx.Facts, error) {
 	return nil, Unavailable(OpInventoryTmux)
 }
 
@@ -256,10 +254,6 @@ func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string)
 	return transfer.Install(ctx, m, st, l.stagingDir(jobID), l.paths, extra)
 }
 
-func (l *Local) GitAttach(ctx context.Context, plan *GitPlan, jobID string) error {
-	return Unavailable(OpGitAttach)
-}
-
 func (l *Local) Freeze(ctx context.Context, pid int, startTime string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -288,7 +282,7 @@ func (l *Local) Thaw(ctx context.Context, pid int) error {
 func (l *Local) Capture(ctx context.Context, ref *session.TmuxRef, jobID string) error {
 	return Unavailable(OpCapture)
 }
-func (l *Local) OpenWindow(ctx context.Context, p *TmuxPlan) (*session.TmuxRef, error) {
+func (l *Local) OpenWindow(ctx context.Context, p *tmuxx.Plan) (*session.TmuxRef, error) {
 	return nil, Unavailable(OpOpenWindow)
 }
 func (l *Local) StartClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, jobID string, argv []string) error {
@@ -303,7 +297,7 @@ func (l *Local) ExitClaude(ctx context.Context, ref *session.TmuxRef, pid int, s
 func (l *Local) TypeCommand(ctx context.Context, ref *session.TmuxRef, argv []string) error {
 	return Unavailable(OpTypeCommand)
 }
-func (l *Local) PaneState(ctx context.Context, ref *session.TmuxRef) (*TmuxPaneState, error) {
+func (l *Local) PaneState(ctx context.Context, ref *session.TmuxRef) (*tmuxx.PaneState, error) {
 	return nil, Unavailable(OpPaneState)
 }
 func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, timeout time.Duration) error {
