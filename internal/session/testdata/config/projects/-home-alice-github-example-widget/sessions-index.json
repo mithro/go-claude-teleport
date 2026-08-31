@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "sessionId": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      "fullPath": "/home/alice/.claude/projects/-home-alice-github-example-widget/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d.jsonl",
+      "fileMtime": 1756292405000,
+      "firstPrompt": "Explain the release process",
+      "summary": "",
+      "messageCount": 2,
+      "created": "2026-08-27T11:00:00.000Z",
+      "modified": "2026-08-27T11:00:05.000Z",
+      "gitBranch": "main",
+      "projectPath": "/home/alice/github/example/widget",
+      "isSidechain": false
+    },
+    {
+      "sessionId": "3f9c2b7e-5a14-4d8e-9b21-7c0e5d6a8f13",
+      "fullPath": "/home/alice/.claude/projects/-home-alice-github-example-widget/3f9c2b7e-5a14-4d8e-9b21-7c0e5d6a8f13.jsonl",
+      "fileMtime": 1756289762750,
+      "firstPrompt": "Add a --verbose flag to the widget CLI",
+      "summary": "Add verbose flag to widget CLI",
+      "messageCount": 5,
+      "created": "2026-08-27T10:15:30.123Z",
+      "modified": "2026-08-27T10:16:02.750Z",
+      "gitBranch": "feature/teleport",
+      "projectPath": "/home/alice/github/example/widget",
+      "isSidechain": false
+    }
+  ],
+  "originalPath": "/home/alice/github/example/widget"
+}

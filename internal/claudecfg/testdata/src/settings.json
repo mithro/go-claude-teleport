@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/home/alice/bin/guard.sh"}]}
+    ]
+  },
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": ["Bash(go test:*)", "Bash(go vet:*)"],
+    "deny": ["Read(./.env)"]
+  },
+  "env": {"GOFLAGS": "-mod=mod"},
+  "enabledPlugins": {"superpowers@claude-plugins-official": true},
+  "model": "opus",
+  "effortLevel": "high",
+  "includeCoAuthoredBy": true
+}

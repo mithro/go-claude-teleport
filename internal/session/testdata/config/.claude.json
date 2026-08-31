@@ -1,0 +1,37 @@
+{
+  "numStartups": 12,
+  "installMethod": "native",
+  "autoUpdates": true,
+  "hasCompletedOnboarding": true,
+  "oauthAccount": {
+    "accountUuid": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9",
+    "emailAddress": "alice@example.com",
+    "organizationName": "Example Org"
+  },
+  "mcpServers": {
+    "playwright": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"]
+    }
+  },
+  "projects": {
+    "/home/alice/github/example/widget": {
+      "allowedTools": ["Bash(go test:*)", "Bash(go vet:*)"],
+      "mcpServers": {
+        "filesystem": {
+          "type": "stdio",
+          "command": "npx",
+          "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/alice/github/example/widget"]
+        }
+      },
+      "enabledMcpjsonServers": ["repo-tools"],
+      "disabledMcpjsonServers": [],
+      "mcpContextUris": [],
+      "hasTrustDialogAccepted": true,
+      "hasClaudeMdExternalIncludesApproved": false,
+      "lastCost": 0.42,
+      "lastSessionId": "3f9c2b7e-5a14-4d8e-9b21-7c0e5d6a8f13"
+    }
+  }
+}

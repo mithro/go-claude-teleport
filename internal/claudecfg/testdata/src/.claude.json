@@ -1,0 +1,18 @@
+{
+  "numStartups": 12,
+  "oauthAccount": {"accountUuid": "0b1c2d3e-4f50-4617-8293-a4b5c6d7e8f9", "emailAddress": "alice@example.com"},
+  "mcpServers": {
+    "playwright": {"type": "stdio", "command": "npx", "args": ["@playwright/mcp@latest"]}
+  },
+  "projects": {
+    "/home/alice/github/example/widget": {
+      "allowedTools": ["Bash(go test:*)"],
+      "mcpServers": {
+        "filesystem": {"type": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/alice/github/example/widget"]}
+      },
+      "enabledMcpjsonServers": ["repo-tools"],
+      "disabledMcpjsonServers": [],
+      "hasTrustDialogAccepted": true
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "plugins": {
+    "superpowers@claude-plugins-official": [
+      {"version": "6.2.0", "installedAt": "2026-07-01T09:00:00.000Z", "lastUpdated": "2026-07-01T09:00:00.000Z",
+       "installPath": "/home/alice/.claude/plugins/cache/claude-plugins-official/superpowers/6.2.0", "isLocal": false}
+    ]
+  }
+}
