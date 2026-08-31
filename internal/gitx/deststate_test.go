@@ -78,6 +78,24 @@ func TestDestStateSameDirCleanAndBranch(t *testing.T) {
 	}
 }
 
+func TestDestStateUnbornHead(t *testing.T) {
+	dir := t.TempDir()
+	gitCLI(t, dir, "init", "-b", "main")
+	st, err := DestStateOf(dir, filepath.Join(dir, ".worktrees", "x"), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.MainExists {
+		t.Error("MainExists should be true for present repo")
+	}
+	if st.RootCommit != "" {
+		t.Errorf("RootCommit should be empty for unborn HEAD, got %q", st.RootCommit)
+	}
+	if len(st.RefTips) != 0 {
+		t.Errorf("RefTips should be empty for unborn HEAD, got %v", st.RefTips)
+	}
+}
+
 func TestIsAncestor(t *testing.T) {
 	dir := t.TempDir()
 	repo, root := initRepo(t, dir)

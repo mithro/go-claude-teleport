@@ -72,7 +72,11 @@ func DestStateOf(mainDir, worktreeDir, branch string) (*DestState, error) {
 
 	if _, err := os.Lstat(worktreeDir); err == nil {
 		st.WorktreeExists = true
-		if wi, err := Inspect(worktreeDir); err == nil && wi.Root == filepath.Clean(worktreeDir) {
+		if wi, err := Inspect(worktreeDir); err != nil {
+			if !errors.Is(err, ErrNotRepo) && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("inspect %s: %w", worktreeDir, err)
+			}
+		} else if wi.Root == filepath.Clean(worktreeDir) {
 			st.WorktreeBranch = wi.Branch
 			if wi.Root == wi.MainDir {
 				st.Clean = len(wi.Dirty.Staged)+len(wi.Dirty.Modified)+len(wi.Dirty.Untracked)+len(wi.Dirty.Deleted) == 0
@@ -86,7 +90,11 @@ func DestStateOf(mainDir, worktreeDir, branch string) (*DestState, error) {
 		want := "ref: refs/heads/" + branch
 		commonDir := filepath.Join(mainDir, ".git")
 		if filepath.Clean(worktreeDir) != filepath.Clean(mainDir) {
-			if h, err := os.ReadFile(filepath.Join(commonDir, "HEAD")); err == nil && strings.TrimSpace(string(h)) == want {
+			h, err := os.ReadFile(filepath.Join(commonDir, "HEAD"))
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("read %s HEAD: %w", mainDir, err)
+			}
+			if err == nil && strings.TrimSpace(string(h)) == want {
 				st.BranchCheckedOutElsewhere = filepath.Clean(mainDir)
 			}
 		}
@@ -99,6 +107,9 @@ func DestStateOf(mainDir, worktreeDir, branch string) (*DestState, error) {
 				continue
 			}
 			h, err := os.ReadFile(filepath.Join(commonDir, "worktrees", name, "HEAD"))
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("read worktree %s HEAD: %w", name, err)
+			}
 			if err == nil && strings.TrimSpace(string(h)) == want {
 				st.BranchCheckedOutElsewhere = path
 			}
