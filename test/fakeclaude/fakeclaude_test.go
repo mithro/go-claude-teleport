@@ -30,10 +30,9 @@ func setup(t *testing.T) env {
 
 func (e env) cmd(t *testing.T, extra []string, args ...string) *exec.Cmd {
 	t.Helper()
-	c := exec.Command("claude", args...)
+	c := exec.Command(filepath.Join(harness.Build(t), "claude"), args...)
 	c.Dir = e.cwd
 	c.Env = harness.Env(t, e.home, e.cfg, extra...)
-	c.Path = filepath.Join(harness.Build(t), "claude")
 	return c
 }
 
