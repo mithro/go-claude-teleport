@@ -138,6 +138,47 @@ func TestLocalGitAttachAppliesManifestEntryMode(t *testing.T) {
 	}
 }
 
+// TestLocalGitAttachErrorsOnCorruptManifest is R-P3-20d: entryModes must
+// not treat every transfer.Load failure the same as "no manifest was ever
+// saved" — only os.ErrNotExist means "absent, fall back to mode 0".
+// Anything else (here, corrupt JSON) must error out of GitAttach rather
+// than silently installing the dirty file with the staged copy's own mode.
+func TestLocalGitAttachErrorsOnCorruptManifest(t *testing.T) {
+	p := testPaths(t)
+	main := filepath.Join(p.Home, "x")
+	os.MkdirAll(main, 0o755)
+	gitc(t, main, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(main, "a.txt"), []byte("a"), 0o644)
+	gitc(t, main, "add", "a.txt")
+	gitc(t, main, "commit", "-q", "-m", "init")
+	tip := strings.TrimSpace(gitc(t, main, "rev-parse", "HEAD"))
+	jobID := "3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c"
+	staging := job.StagingDir(p.DataDir, jobID)
+	os.MkdirAll(staging, 0o700)
+	os.WriteFile(filepath.Join(staging, "7"), []byte("untracked\n"), 0o644)
+
+	l := NewLocal(p, "/usr/local/bin/claude-teleport", LocalOptions{ProcRoot: "/proc"})
+	if err := os.MkdirAll(l.jobDir(jobID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(l.jobDir(jobID), "manifest.json"), []byte("{not valid json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w := filepath.Join(main, ".worktrees", "feat")
+	plan := &gitx.Plan{Mode: gitx.ModeExistingMain, SrcMain: "/home/alice/x", SrcWorktree: "/home/alice/x/.worktrees/feat",
+		DstMain: main, DstWorktree: w, Linked: true, WorktreeName: "feat", Branch: "feat", Tip: tip, NeedPack: false,
+		IndexRel: ".git/worktrees/feat/index", IndexEntryID: gitx.NoEntry, PackEntryID: gitx.NoEntry,
+		DirtyEntries: map[string]int{filepath.Join(w, "new.txt"): 7}}
+	err := l.GitAttach(context.Background(), plan, jobID)
+	if err == nil {
+		t.Fatal("GitAttach with a corrupt manifest.json must error, not silently fall back to mode 0")
+	}
+	if _, statErr := os.Stat(filepath.Join(w, "new.txt")); statErr == nil {
+		t.Error("dirty file must not be installed when its mode could not be determined because the manifest is corrupt")
+	}
+}
+
 // TestLocalGitAttachRestoresIndexAtManifestEntryZero is the I4 regression:
 // manifest ids are 0-based (transfer.Build assigns them by slice index), so
 // the index file can legitimately be entry 0. With the old `!= 0` sentinel

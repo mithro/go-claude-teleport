@@ -153,18 +153,16 @@ func TestJobRunStopsAtNextStepBoundaryOnCancelledContext(t *testing.T) {
 	// fail loudly, which this test would surface as a wrong error above.
 }
 
-// TestGitAttachRestoresDeferredEntryModesAfterInstallEvictsManifest is
-// controller ruling C: remote.Local.GitAttach now reads each dirty/index
-// entry's Mode off jobs/<jobID>/manifest.json (task 20 point C). But the
-// install step's own Verify (verifyInstall -> installManifest ->
-// dst.ManifestDiff) persists a REDUCED manifest on the destination that
-// excludes exactly those deferred entries (existing-main git-attach applies
-// them itself) — so by the time git-attach runs, that file is missing the
-// entries whose Mode it needs. runGitAttach re-diffs the FULL manifest
-// (discarding the resulting statuses) before calling GitAttach specifically
-// to restore them; this test fails without that restore; see steps.go's
-// runGitAttach comment for the full account.
-func TestGitAttachRestoresDeferredEntryModesAfterInstallEvictsManifest(t *testing.T) {
+// TestInstallVerifyKeepsFullManifestOnDestForGitAttachModes is controller
+// ruling R-P3-20c, superseding the first fix-round's approach (relocated,
+// not deleted): remote.Local.GitAttach reads each dirty/index entry's Mode
+// off jobs/<jobID>/manifest.json (task 20 point C). verifyInstall now diffs
+// and persists the FULL manifest (filtering deferred()/memory entries out
+// IN MEMORY when deciding done) instead of a manifest reduced to just the
+// non-deferred entries, so that file never loses the entries git-attach
+// needs Mode for in the first place — no separate restore step in
+// runGitAttach is needed any more.
+func TestInstallVerifyKeepsFullManifestOnDestForGitAttachModes(t *testing.T) {
 	src := newHost(t, "laptop.example", "alice", nil)
 	dst := newHost(t, "big-storage.example", "bob", nil)
 
@@ -215,8 +213,6 @@ func TestGitAttachRestoresDeferredEntryModesAfterInstallEvictsManifest(t *testin
 	j := &job.Journal{ID: jobID}
 	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
 
-	// Reproduce the eviction: install's Verify diffs and persists the
-	// REDUCED manifest (no deferred entries) before git-attach ever runs.
 	if _, err := r.verifyInstall(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -224,8 +220,8 @@ func TestGitAttachRestoresDeferredEntryModesAfterInstallEvictsManifest(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(saved.Entries) != 0 {
-		t.Fatalf("test setup: expected install's diff to evict the deferred entries from the saved manifest, got %d entries", len(saved.Entries))
+	if len(saved.Entries) != 2 {
+		t.Fatalf("saved manifest has %d entries, want 2 (install's diff must keep the deferred entries, not evict them)", len(saved.Entries))
 	}
 
 	if err := r.runGitAttach(context.Background()); err != nil {
@@ -237,5 +233,127 @@ func TestGitAttachRestoresDeferredEntryModesAfterInstallEvictsManifest(t *testin
 	}
 	if st.Mode().Perm() != 0o755 {
 		t.Errorf("dirty file mode = %o, want 0755 (from the manifest, not the staged copy's 0644)", st.Mode().Perm())
+	}
+}
+
+// TestGitAttachFreshMainLinkedDetachedAlwaysRepairsMetadata is controller
+// ruling R-P3-20a (CRITICAL, overrides the brief's table): a fresh-main
+// linked worktree's only work is repairLinkedMetadata (gitx.Attach), which
+// rewrites the worktree's ".git" file and its "gitdir" backlink to the
+// DESTINATION's own absolute paths. GitDestState's WorktreeExists/MainExists
+// are satisfied by install having placed the transferred files — not by
+// that repair having run — so the pre-fix Verify (case Detached:
+// WorktreeExists && MainExists) falsely reported done and skipped the
+// repair entirely whenever those two directories already existed, which is
+// exactly the state after a resumed job's install step. This reproduces
+// that: dstMain differs from the source's path (spec's "differing dest
+// paths"), and the worktree's ".git" file still carries the SOURCE's path
+// (as a raw file-copy transfer would leave it) until repaired.
+func TestGitAttachFreshMainLinkedDetachedAlwaysRepairsMetadata(t *testing.T) {
+	src := newHost(t, "laptop.example", "alice", nil)
+	dst := newHost(t, "big-storage.example", "bob", nil)
+
+	dstMain := filepath.Join(dst.paths.Home, "repo") // differs from the source's /home/alice/repo
+	dstWorktree := filepath.Join(dstMain, ".worktrees", "feat")
+	// A real (if unpopulated) repo, so gitx.DestStateOf's git.PlainOpen
+	// succeeds and reports MainExists/WorktreeExists — exactly what a
+	// resumed job sees after install has placed a fresh-main transfer's
+	// files but repairLinkedMetadata has not run yet.
+	if err := os.MkdirAll(dstMain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitc(t, dstMain, "init", "-q", "-b", "main")
+	if err := os.MkdirAll(dstWorktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staleGitFile := filepath.Join(dstWorktree, ".git")
+	if err := os.WriteFile(staleGitFile, []byte("gitdir: /home/alice/repo/.git/worktrees/feat\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gp := &gitx.Plan{Mode: gitx.ModeFreshMain, SrcMain: "/home/alice/repo", SrcWorktree: "/home/alice/repo/.worktrees/feat",
+		DstMain: dstMain, DstWorktree: dstWorktree, Linked: true, WorktreeName: "feat", Branch: "feat", Detached: true,
+		PackEntryID: gitx.NoEntry, IndexEntryID: gitx.NoEntry}
+	p := &Plan{JobID: sid, Git: gp}
+	j := &job.Journal{ID: sid}
+	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+
+	done, err := r.verifyGitAttach(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done {
+		t.Fatal("verifyGitAttach reported done for a linked+detached fresh-main worktree before repairLinkedMetadata ever ran (both WorktreeExists and MainExists are true only because install already placed the files)")
+	}
+
+	if err := r.runGitAttach(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(staleGitFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "gitdir: " + filepath.Join(dstMain, ".git", "worktrees", "feat") + "\n"
+	if string(got) != want {
+		t.Errorf(".git file = %q, want %q — repairLinkedMetadata must run and rewrite it to the destination's own paths", got, want)
+	}
+}
+
+// TestInstallVerifyRequiresMergePhaseNotJustFilePlacement is controller
+// ruling R-P3-20b: file placement alone does not mean "installed" (spec
+// §7.5) — the sessions-index merge must also have reached the destination.
+// This drives a real transfer (through the real preflight/transfer steps,
+// two Local endpoints) and then calls dst.Install directly WITHOUT ever
+// calling PutInstallExtras first, reproducing "every file landed but the
+// merge phase never completed" (e.g. a crash between the two, or — as
+// here — between a first partial run and `continue`): remote.Local.Install
+// reads jobs/<jobID>/extras.json, which is simply absent, so the merges
+// (index entry, project entry, history) are silently skipped by design
+// (spec's own "not found" tolerance) while every manifest entry still
+// lands PresentSame. Before this ruling, verifyInstall only checked file
+// placement and would have reported this done, so `continue` would skip
+// install and its merges would never run at all.
+func TestInstallVerifyRequiresMergePhaseNotJustFilePlacement(t *testing.T) {
+	src := newHost(t, "laptop.example", "alice", nil)
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	cwd := filepath.Join(src.paths.Home, "x")
+	seedSession(t, src, cwd)
+	srcProj := src.paths.ProjectDir(cwd)
+	if err := session.MergeIndexEntry(srcProj, session.IndexEntry{SessionID: sid, FullPath: filepath.Join(srcProj, sid+".jsonl"), ProjectPath: cwd}); err != nil {
+		t.Fatal(err)
+	}
+	o := baseOptions()
+	o.State = "idle"
+	p, err := Preflight(context.Background(), o, src.ep, dst.ep, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Extras == nil || p.Extras.IndexEntry == nil {
+		t.Fatal("test setup: expected the seeded sessions-index entry to produce Extras.IndexEntry")
+	}
+
+	j := &job.Journal{ID: sid}
+	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	if err := r.runPreflight(context.Background()); err != nil { // OpenStream needs a journal on both hosts first
+		t.Fatal(err)
+	}
+	if err := r.runTransfer(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	im, err := r.installManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately skip PutInstallExtras: places every file, merges nothing.
+	if _, err := r.dst.Install(context.Background(), im, r.p.JobID); err != nil {
+		t.Fatal(err)
+	}
+
+	done, err := r.verifyInstall(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done {
+		t.Fatal("install.Verify reported done with every file placed but the sessions-index merge never having reached the destination")
 	}
 }

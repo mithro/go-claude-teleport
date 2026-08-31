@@ -48,7 +48,7 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 	// either side, or an escaped name could never match.
 	wantTmux := ""
 	if ref != nil {
-		wantTmux = fmt.Sprintf("%s:%s.%s", ref.Session, ref.WindowID, ref.PaneID)
+		wantTmux = tmuxx.RefString(ref)
 	}
 	// M3: one control connection for the whole poll, not one per 250ms
 	// iteration — the old shape spawned a `tmux -C attach-session` process

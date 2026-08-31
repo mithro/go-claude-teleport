@@ -42,6 +42,14 @@ func BaseSession(sessions []SessionInfo, group string) (string, bool) {
 	return best, best != ""
 }
 
+// RefString is the single canonical "<session>:<window>.<pane>" spelling
+// (matching session.Registry.Tmux, e.g. "main:@3.%7") built from ref's
+// fields, which already carry tmux's STORED (vis-encoded) spelling
+// (R-PRB-2, see TmuxRef's doc comment) — never decoded here.
+func RefString(ref *session.TmuxRef) string {
+	return fmt.Sprintf("%s:%s.%s", ref.Session, ref.WindowID, ref.PaneID)
+}
+
 const newWindowFormat = "#{pane_id}\t#{window_id}\t#{session_name}"
 
 // OpenWindow creates the destination window (spec §9). The live session

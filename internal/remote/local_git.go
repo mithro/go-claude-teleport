@@ -59,16 +59,29 @@ func (l *Local) GitSourceFacts(ctx context.Context, mainDir, indexRel, tip, dest
 // saved (e.g. directly, as some tests do) — entryModes then simply returns
 // nil and every lookup misses, leaving DirtyFile.Mode zero (gitx.Attach's
 // documented "keep the staged file's own mode" fallback).
-func (l *Local) entryModes(jobID string) map[int]fs.FileMode {
+func (l *Local) entryModes(jobID string) (map[int]fs.FileMode, error) {
 	m, err := transfer.Load(filepath.Join(l.jobDir(jobID), "manifest.json"))
 	if err != nil {
-		return nil
+		// R-P3-20d: a manifest that was never saved (GitAttach called
+		// directly, without any ManifestDiff/BuildManifest ever having
+		// run — some tests do this) is not an error: entryModes returns
+		// nil and every lookup misses, leaving DirtyFile.Mode zero
+		// (gitx.Attach's documented "keep the staged file's own mode"
+		// fallback). Any OTHER load failure (corrupt/truncated JSON, an
+		// unsupported version, a permissions error) must NOT be treated
+		// the same way and silently fall back to mode 0 — that would let
+		// a corrupt manifest install a dirty git file with whatever mode
+		// its staged copy happens to carry, unnoticed.
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
 	}
 	modes := make(map[int]fs.FileMode, len(m.Entries))
 	for _, e := range m.Entries {
 		modes[e.ID] = fs.FileMode(e.Mode)
 	}
-	return modes
+	return modes, nil
 }
 
 // GitAttach resolves the pack and dirty files from this host's staging
@@ -86,7 +99,10 @@ func (l *Local) GitAttach(ctx context.Context, p *gitx.Plan, jobID string) error
 			return &Error{Code: "not-found", Message: fmt.Sprintf("git-attach: pack %s: %v", packPath, err)}
 		}
 	}
-	modes := l.entryModes(jobID)
+	modes, err := l.entryModes(jobID)
+	if err != nil {
+		return &Error{Code: "internal", Message: fmt.Sprintf("git-attach: mode lookup: %v", err)}
+	}
 	dirty := map[string]gitx.DirtyFile{}
 	for dst, id := range p.DirtyEntries {
 		dirty[dst] = gitx.DirtyFile{Src: filepath.Join(staging, strconv.Itoa(id)), Mode: modes[id]}

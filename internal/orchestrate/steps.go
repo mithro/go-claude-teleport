@@ -27,8 +27,14 @@ type runner struct {
 	p        *Plan
 	j        *job.Journal
 	src, dst remote.Endpoint
-	selfExe  string
-	logf     func(string, ...any)
+	// selfExe is unused by any step in this file: no step here re-execs
+	// itself. It is threaded through Steps()'s signature (part of this
+	// task's specified interface) for Task 21's runner/continue driver,
+	// which needs it to re-dial or re-exec `claude-teleport` when resuming
+	// a job (implementer-rules: "tmux -C control mode and claude --version
+	// are its only subprocesses (plus self re-exec)").
+	selfExe string
+	logf    func(string, ...any)
 }
 
 // Steps builds the job.Step list for the plan (spec §6 table).
@@ -255,23 +261,62 @@ func (r *runner) installManifest() (*transfer.Manifest, error) {
 }
 
 func (r *runner) verifyInstall(ctx context.Context) (bool, error) {
-	im, err := r.installManifest()
+	m, err := r.manifest()
 	if err != nil {
 		return false, err
 	}
-	st, err := r.dst.ManifestDiff(ctx, im, r.p.JobID)
+	// R-P3-20c: diff and persist the FULL manifest here, not the reduced
+	// installManifest() — jobs/<jobID>/manifest.json on the destination
+	// must stay complete at all times, because remote.Local.GitAttach
+	// (task 20 point C) reads each dirty/index entry's Mode off that same
+	// file, and a diff scoped to only the non-deferred entries would
+	// overwrite it with a copy missing exactly the entries git-attach
+	// needs. Filter deferred() (git-attach's own entries) and memory
+	// entries out IN MEMORY instead, when deciding done.
+	st, err := r.dst.ManifestDiff(ctx, m, r.p.JobID)
 	if err != nil {
 		return false, err
 	}
+	d := r.deferred()
 	memory := map[int]bool{}
 	for _, e := range r.p.Extras.Memory {
 		memory[e.ID] = true
 	}
-	for _, e := range im.Entries {
-		if memory[e.ID] {
+	for _, e := range m.Entries {
+		if d[e.ID] || memory[e.ID] {
 			continue
 		}
 		if st[e.ID] != transfer.PresentSame {
+			return false, nil
+		}
+	}
+	// R-P3-20b: file placement alone is not "installed" (spec §7.5) — the
+	// merges (sessions-index entry, ~/.claude.json project entry, history
+	// lines) must also have reached the destination, or a crash between
+	// PutInstallExtras/Install's file-placement pass and its merge pass
+	// would otherwise be reported done. dst.SessionExtras reads back the
+	// destination's OWN current merge state for this session id; calling
+	// it here is safe (every non-deferred, non-memory entry — including
+	// the transcript itself — is already confirmed PresentSame by the
+	// loop above) and needs no path rewriting (an empty PathMap): we are
+	// reading dest-native state, not producing something to send.
+	if r.p.Extras != nil && (r.p.Extras.IndexEntry != nil || len(r.p.Extras.ProjectEntry) > 0 || len(r.p.Extras.History) > 0) {
+		de, err := r.dst.SessionExtras(ctx, r.id(), session.PathMap{})
+		if err != nil {
+			return false, err
+		}
+		if r.p.Extras.IndexEntry != nil && de.IndexEntry == nil {
+			return false, nil
+		}
+		if len(r.p.Extras.ProjectEntry) > 0 && len(de.ProjectEntry) == 0 {
+			return false, nil
+		}
+		// history.jsonl: session.AppendHistory dedups by timestamp+
+		// sessionId, so a count comparison is a cheap, idempotent presence
+		// predicate — content-comparing every line is not needed, and
+		// repeated checks (or the eventual re-Run) can only push the
+		// destination's count up toward this, never regress it.
+		if len(de.History) < len(r.p.Extras.History) {
 			return false, nil
 		}
 	}
@@ -302,60 +347,55 @@ func (r *runner) runInstall(ctx context.Context) error {
 
 // ---- 6 git-attach -------------------------------------------------------
 
+// r.p.Git guard convention: nil is treated the same as gitx.ModeNotRepo
+// (nothing to verify or do) everywhere in this file — deferred(), here, and
+// runGitAttach all agree, even though Preflight always sets it (the guard
+// exists for callers, like tests, that build a *runner directly).
 func (r *runner) verifyGitAttach(ctx context.Context) (bool, error) {
-	g := r.p.Git
-	switch g.Mode {
+	if r.p.Git == nil {
+		return true, nil
+	}
+	switch r.p.Git.Mode {
 	case gitx.ModeNotRepo:
 		return true, nil
 	case gitx.ModeFreshMain:
-		ds, err := r.dst.GitDestState(ctx, g.DstMain, g.DstWorktree, g.Branch)
-		if err != nil {
-			return false, err
-		}
-		if g.Detached {
-			return ds.WorktreeExists && ds.MainExists, nil
-		}
-		return ds.WorktreeExists && ds.WorktreeBranch == g.Branch, nil
+		// R-P3-20a (overrides the brief's table): fresh-main's only work
+		// is repairLinkedMetadata, which gitx.Attach calls for a LINKED
+		// worktree and skips entirely for an unlinked one (W == M has
+		// nothing to repair) — so an unlinked fresh-main is always done.
+		// A linked one must never be reported done from GitDestState:
+		// WorktreeExists/MainExists there are satisfied by the FILES
+		// install already placed (the linked worktree's directory tree
+		// *is* what install just wrote), not by repairLinkedMetadata
+		// having run — most visibly wrong for a detached HEAD, where
+		// nothing else in DestState even reflects that the two
+		// absolute-path metadata files (.git and .git/worktrees/<n>/gitdir)
+		// still point at the SOURCE's paths. repairLinkedMetadata is
+		// idempotent and cheap (two writeIfDifferent calls), so it is
+		// simply always re-run for a linked worktree; this also drops the
+		// GitDestState round-trip entirely for fresh-main.
+		return !r.p.Git.Linked, nil
 	}
 	return false, nil
 }
 
 func (r *runner) runGitAttach(ctx context.Context) error {
+	if r.p.Git == nil {
+		return nil
+	}
 	if r.p.Git.NeedPack {
 		if err := r.pump(ctx, remote.StreamPack, r.attempt("git-attach")); err != nil {
 			return err
 		}
 	}
-	// The install step's own verify/run (above) diffs and persists
-	// jobs/<jobID>/manifest.json on the destination using the REDUCED
-	// manifest that excludes the entries git-attach applies itself
-	// (deferred(): the dirty worktree files and the index, existing-main
-	// only) — see verifyInstall -> installManifest -> ManifestDiff. That
-	// overwrite evicts exactly the entries whose Mode remote.Local's
-	// GitAttach now reads off the saved manifest (task 20 point C), so
-	// the destination's manifest.json is NOT reliably complete by the
-	// time we get here. Re-diff the FULL manifest first (discarding the
-	// resulting statuses — install already used the reduced diff to
-	// decide completion) purely to restore those entries on disk before
-	// GitAttach reads them. No wire change: ManifestDiff already exists
-	// and is already called this way elsewhere in this runner.
-	if len(r.deferred()) > 0 {
-		m, err := r.manifest()
-		if err != nil {
-			return err
-		}
-		if _, err := r.dst.ManifestDiff(ctx, m, r.p.JobID); err != nil {
-			return err
-		}
-	}
+	// jobs/<jobID>/manifest.json on the destination is kept complete by
+	// verifyInstall's own full-manifest diff (R-P3-20c), so — unlike an
+	// earlier version of this step — nothing needs restoring here before
+	// remote.Local.GitAttach reads entry modes off it (task 20 point C).
 	return r.dst.GitAttach(ctx, r.p.Git, r.p.JobID)
 }
 
 // ---- 7 start ------------------------------------------------------------
-
-func refString(ref *session.TmuxRef) string {
-	return fmt.Sprintf("%s:%s.%s", ref.Session, ref.WindowID, ref.PaneID)
-}
 
 func (r *runner) captureOnDest() string {
 	// CaptureEntryID < 0 (gitx.NoEntry's convention) means the capture
@@ -377,7 +417,7 @@ func (r *runner) verifyStart(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !ok || reg.Tmux != refString(r.p.DestRef) {
+	if !ok || reg.Tmux != tmuxx.RefString(r.p.DestRef) {
 		return false, nil
 	}
 	r.logf("start: session already alive in %s; confirming only", reg.Tmux)
@@ -418,7 +458,7 @@ func (r *runner) runStart(ctx context.Context) error {
 			return err
 		}
 		r.p.DestRef, r.p.CreatedWindow, r.p.CreatedSession = ref, true, !exists
-		r.logf("start: opened %s (new session: %v)", refString(ref), !exists)
+		r.logf("start: opened %s (new session: %v)", tmuxx.RefString(ref), !exists)
 		if err := r.persist(ctx); err != nil {
 			return err
 		}
@@ -457,6 +497,12 @@ func (r *runner) verifyShape(ctx context.Context) (bool, error) {
 		if r.p.Tmux == nil {
 			return true, nil
 		}
+		// Symmetric with the "suspended" case above: DestRef can still be
+		// nil here (e.g. re-verifying before start ever opened a window),
+		// and PaneState on a nil ref is a caller bug, not a "not-found".
+		if r.p.DestRef == nil {
+			return false, nil
+		}
 		st, err := r.dst.PaneState(ctx, r.p.DestRef)
 		if isCode(err, "not-found") {
 			return true, nil
@@ -470,8 +516,10 @@ func (r *runner) verifyShape(ctx context.Context) (bool, error) {
 }
 
 func (r *runner) runShape(ctx context.Context) error {
-	reg := r.p.DestRegistry
-	if _, ok, err := r.dst.ClaudeStatus(ctx, r.id()); err != nil {
+	// Use the registry ClaudeStatus just returned, not the plan's DestRegistry
+	// snapshot from the start step — that can be stale by the time shape
+	// runs (e.g. resumed later, or the destination claude re-registered).
+	if reg, ok, err := r.dst.ClaudeStatus(ctx, r.id()); err != nil {
 		return err
 	} else if ok {
 		r.logf("shape: /exit on the destination (pid %d)", reg.PID)
