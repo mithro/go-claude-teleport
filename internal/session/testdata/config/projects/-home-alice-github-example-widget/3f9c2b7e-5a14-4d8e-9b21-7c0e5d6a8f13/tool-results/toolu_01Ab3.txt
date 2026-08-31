@@ -1,1 +1,1 @@
-test result
+main.go:12: flag.Bool("verbose", ...)
