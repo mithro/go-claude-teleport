@@ -109,28 +109,26 @@ func attachExisting(ctx context.Context, p *Plan, packPath string, dirtyFiles ma
 	if err != nil {
 		return fmt.Errorf("open %s: %w", p.DstMain, err)
 	}
-	// Snapshot the W==M checkout state before ensureBranch below advances
-	// refs/heads/<Branch> to Tip (Reset's setHEADCommit needs an existing
-	// ref to update, so that has to happen first). Deriving "already at
-	// tip"/clean/branch from disk after that mutation would either treat an
-	// untouched destination as already fast-forwarded (ref alone matches
-	// Tip) or a genuinely clean one as dirty (index still at the old tree
-	// looks like a staged deletion against the moved ref).
+	// Preflight's DestState can be stale by the time the payload arrives,
+	// so both shapes re-read the destination and decide here — before the
+	// pack is indexed and before ensureBranch advances refs/heads/<Branch>
+	// — which keeps a refusal free of side effects.
+	//
+	// The W==M snapshot must also precede ensureBranch for a second reason:
+	// deriving "already at tip"/clean/branch from disk after the ref moved
+	// would either treat an untouched destination as already fast-forwarded
+	// (the ref alone matches Tip) or a genuinely clean one as dirty (the
+	// index, still at the old tree, looks like a staged deletion).
 	var ffState *fastForwardState
 	if p.Linked {
-		// Preflight's DestState can be stale by now; re-check before the
-		// pack is indexed and before anything is written.
 		if err := checkLinkedDestination(p); err != nil {
 			return err
 		}
-	}
-	if !p.Linked {
+	} else {
 		ffState, err = snapshotFastForwardState(p)
 		if err != nil {
 			return err
 		}
-		// Refusal must be atomic: decide before the pack is indexed and
-		// before ensureBranch moves refs/heads/<Branch>.
 		if err := checkFastForwardState(p, ffState); err != nil {
 			return err
 		}
@@ -271,6 +269,18 @@ func createLinkedWorktree(p *Plan, tip plumbing.Hash) error {
 	if linkedRerun(p) {
 		return nil
 	}
+	// The reset that populates the tree from tip uses go-git's hard reset,
+	// which deletes every on-disk path the tip tree does not carry (ignored
+	// files included). That is only safe on the empty directory created
+	// below: anything already there belongs to somebody else. Checked
+	// before any metadata is written so the refusal leaves no debris.
+	names, err := someEntryNames(p.DstWorktree, 5)
+	if err != nil {
+		return err
+	}
+	if len(names) > 0 {
+		return &RefuseError{Reason: fmt.Sprintf("destination worktree directory %s is not empty (%s)", p.DstWorktree, strings.Join(names, ", "))}
+	}
 	if err := os.MkdirAll(gd, 0o755); err != nil {
 		return err
 	}
@@ -286,17 +296,6 @@ func createLinkedWorktree(p *Plan, tip plumbing.Hash) error {
 	}
 	if err := os.MkdirAll(p.DstWorktree, 0o755); err != nil {
 		return err
-	}
-	// The reset below populates the tree from tip, and go-git's hard reset
-	// deletes every on-disk path the tip tree does not carry (ignored files
-	// included). That is only safe on the empty directory just created:
-	// anything already here belongs to somebody else.
-	names, err := someEntryNames(p.DstWorktree, 5)
-	if err != nil {
-		return err
-	}
-	if len(names) > 0 {
-		return &RefuseError{Reason: fmt.Sprintf("destination worktree directory %s is not empty (%s)", p.DstWorktree, strings.Join(names, ", "))}
 	}
 	if err := repairLinkedMetadata(p); err != nil {
 		return err
@@ -316,9 +315,13 @@ func createLinkedWorktree(p *Plan, tip plumbing.Hash) error {
 }
 
 // someEntryNames lists up to max names in dir (sorted, as os.ReadDir
-// returns them) so a refusal can point at what is in the way.
+// returns them) so a refusal can point at what is in the way. A directory
+// that is not there yet is empty.
 func someEntryNames(dir string, max int) ([]string, error) {
 	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
