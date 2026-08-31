@@ -1,7 +1,6 @@
 // Copied from github.com/mithro/go-tmux-saver internal/tmuxctl
 // (Apache-2.0, same author). Keep in sync by hand; do not import.
 
-// Package tmuxctl talks to a tmux server over a single control-mode connection.
 package tmuxx
 
 import (
