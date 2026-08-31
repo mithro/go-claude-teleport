@@ -136,7 +136,12 @@ func State(ctx context.Context, t Transport, paneID string, procs *procx.Table) 
 		if pid == panePID {
 			continue
 		}
-		p, _ := procs.Get(pid)
+		p, ok := procs.Get(pid)
+		if !ok {
+			// The pid vanished between Subtree and Get; a zero Proc would be
+			// reported as the foreground process (empty comm, no argv).
+			continue
+		}
 		if shells[p.Comm] {
 			continue
 		}

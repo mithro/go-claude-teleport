@@ -216,3 +216,26 @@ func TestClaudeStatus(t *testing.T) {
 		t.Fatalf("present: %+v %v %v", reg, ok, err)
 	}
 }
+
+// TestConfirmClaudeDialsTmuxOnce is M3: the old loop opened and closed a
+// control connection — i.e. spawned a `tmux -C attach-session` process —
+// on every 250ms poll, ~240 of them over a 60s --start-timeout.
+func TestConfirmClaudeDialsTmuxOnce(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	f := &tmuxx.Fake{Replies: map[string][]string{`capture-pane -epJ -S - -t "%7"`: {"> "}}}
+	dials := 0
+	dialer := func(context.Context, string) (tmuxx.Transport, error) { dials++; return f, nil }
+	slept := 0
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: dialer, Sleep: func(time.Duration) { slept++ }})
+	writeRegistry(t, p, 5150, "idle", "other:@9.%9") // never our pane: polls to the deadline
+	if _, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), 300*time.Millisecond); err == nil {
+		t.Fatal("expected a timeout")
+	}
+	if slept < 2 {
+		t.Fatalf("polled %d times, want several so the dial count means something", slept)
+	}
+	if dials != 1 {
+		t.Errorf("dialed tmux %d times over %d polls, want exactly 1", dials, slept)
+	}
+}

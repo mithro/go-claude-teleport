@@ -50,6 +50,19 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 	if ref != nil {
 		wantTmux = fmt.Sprintf("%s:%s.%s", ref.Session, ref.WindowID, ref.PaneID)
 	}
+	// M3: one control connection for the whole poll, not one per 250ms
+	// iteration — the old shape spawned a `tmux -C attach-session` process
+	// per poll, ~240 of them over a 60s --start-timeout. Run is serialised
+	// and the transport is reusable; a Capture error still aborts, so there
+	// is nothing to re-dial for.
+	var t tmuxx.Transport
+	if ref != nil {
+		var err error
+		if t, err = l.dial(ctx, ref.SocketPath); err != nil {
+			return nil, err
+		}
+		defer t.Close()
+	}
 	deadline := time.Now().Add(timeout)
 	last := "no registry entry for the session yet"
 	for {
@@ -57,12 +70,7 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 			return nil, err
 		}
 		if ref != nil {
-			t, err := l.dial(ctx, ref.SocketPath)
-			if err != nil {
-				return nil, err
-			}
 			text, err := tmuxx.Capture(ctx, t, ref.PaneID)
-			t.Close()
 			if err != nil {
 				return nil, &Error{Code: "internal", Message: err.Error()}
 			}

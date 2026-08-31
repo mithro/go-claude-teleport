@@ -2,6 +2,7 @@ package remote
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -258,18 +259,7 @@ func TestServeListSessionsOp(t *testing.T) {
 	}
 }
 
-func containsBytes(b json.RawMessage, s string) bool { return len(b) > 0 && bytesContains(b, s) }
-
-func bytesContains(b []byte, s string) bool {
-	return len(s) == 0 || len(b) >= len(s) && func() bool {
-		for i := 0; i+len(s) <= len(b); i++ {
-			if string(b[i:i+len(s)]) == s {
-				return true
-			}
-		}
-		return false
-	}()
-}
+func containsBytes(b json.RawMessage, s string) bool { return bytes.Contains(b, []byte(s)) }
 
 // TestPlan03OpsServeThroughAChainedClient is the I5 regression: the nine
 // Plan 03 ops are on Endpoint and dispatched like every other op, so a
