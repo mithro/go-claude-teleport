@@ -54,6 +54,7 @@ func StagingDir(dataDir, id string) string { return filepath.Join(dataDir, "stag
 func journalPath(dir string) string { return filepath.Join(dir, "job.json") }
 
 // Open loads jobs/<id>/job.json if it exists.
+// Ensures Steps capacity has 64-step headroom to maintain pointer stability when resumed.
 func Open(dataDir, id string) (*Journal, bool, error) {
 	dir := Dir(dataDir, id)
 	raw, err := os.ReadFile(journalPath(dir))
@@ -68,10 +69,19 @@ func Open(dataDir, id string) (*Journal, bool, error) {
 		return nil, false, fmt.Errorf("parse journal %s: %w", journalPath(dir), err)
 	}
 	j.Dir = dir
+	// Re-slice Steps to have 64-step headroom for resume safety.
+	// json.Unmarshal produces tight cap≈len; appending after resume would
+	// reallocate and invalidate earlier *StepState pointers from Step().
+	if len(j.Steps) > 0 {
+		grown := make([]StepState, len(j.Steps), len(j.Steps)+64)
+		copy(grown, j.Steps)
+		j.Steps = grown
+	}
 	return &j, true, nil
 }
 
 // New creates the job directory (0700) and an empty journal (not yet saved).
+// Steps are pre-allocated with 64-step headroom (see Step() invariant).
 func New(dataDir, id string) (*Journal, error) {
 	dir := Dir(dataDir, id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -81,7 +91,7 @@ func New(dataDir, id string) (*Journal, error) {
 	return &Journal{
 		ID: id, SessionID: id, CreatedAt: now, UpdatedAt: now, Dir: dir,
 		Plan:  json.RawMessage("null"),
-		Steps: make([]StepState, 0, 1024),
+		Steps: make([]StepState, 0, 64),
 	}, nil
 }
 
@@ -112,11 +122,11 @@ func (j *Journal) Save() error {
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
-		return err
+		return fmt.Errorf("save journal %s: %w", tmpName, err)
 	}
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		os.Remove(tmpName)
-		return err
+		return fmt.Errorf("save journal %s: %w", tmpName, err)
 	}
 	if err := os.Rename(tmpName, journalPath(j.Dir)); err != nil {
 		os.Remove(tmpName)
@@ -130,10 +140,13 @@ func (j *Journal) ManifestPath() string { return filepath.Join(j.Dir, "manifest.
 func (j *Journal) CapturePath() string  { return filepath.Join(j.Dir, "capture.txt") }
 
 // Step finds the named step or appends a Pending one.
+// Invariant: returned *StepState pointers remain valid while total steps ≤ cap(Steps).
+// Open() and New() ensure 64-step headroom; with spec's fixed 10-step plan, pointers
+// survive any reasonable resume path without reallocation.
 func (j *Journal) Step(name string) *StepState {
-	// Ensure initial capacity to maintain pointer stability
+	// Lazy-initialize capacity on fresh Journal.
 	if cap(j.Steps) == 0 {
-		j.Steps = make([]StepState, 0, 16)
+		j.Steps = make([]StepState, 0, 64)
 	}
 	for i := range j.Steps {
 		if j.Steps[i].Name == name {

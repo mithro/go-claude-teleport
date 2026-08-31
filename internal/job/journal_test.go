@@ -1,6 +1,7 @@
 package job
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -101,5 +102,50 @@ func TestOpenMalformedIsError(t *testing.T) {
 	_, _, err := Open(data, sid)
 	if err == nil {
 		t.Fatal("malformed job.json must be an error")
+	}
+}
+
+func TestStepPointerStabilitySurvivesResume(t *testing.T) {
+	// Regression: step pointers must remain valid across resume + new appends.
+	// Save a journal with 3 steps, Open it, take a pointer to step "a",
+	// append 5 new steps, assert the old pointer still equals j.Step("a").
+	data := t.TempDir()
+
+	// Create and save initial journal with 3 steps.
+	j1, err := New(data, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j1.Step("a").Status = Done
+	j1.Step("b").Status = Running
+	j1.Step("c").Status = Pending
+	if err := j1.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open the saved journal (simulates resume).
+	j2, ok, err := Open(data, sid)
+	if err != nil || !ok {
+		t.Fatalf("Open failed: ok=%v err=%v", ok, err)
+	}
+
+	// Get pointer to step "a".
+	stepAPtr := j2.Step("a")
+	if stepAPtr.Status != Done {
+		t.Errorf("resumed step a: expected Done, got %s", stepAPtr.Status)
+	}
+
+	// Append 5 new steps (stress the capacity).
+	for i := 1; i <= 5; i++ {
+		name := fmt.Sprintf("step%d", i)
+		j2.Step(name).Status = Running
+	}
+
+	// Assert old pointer still equals current Step("a") — no reallocation.
+	if j2.Step("a") != stepAPtr {
+		t.Errorf("step pointer invalidated after resume + append; pointer changed")
+	}
+	if stepAPtr.Status != Done {
+		t.Errorf("step via old pointer: expected Done, got %s", stepAPtr.Status)
 	}
 }
