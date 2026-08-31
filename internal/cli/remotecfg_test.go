@@ -81,6 +81,49 @@ func TestCompareConfigRemote(t *testing.T) {
 	}
 }
 
+// TestCompareConfigRemoteDestCwd covers --dest-cwd: without it, the remote
+// InventoryHost call reuses the local cwd, and since the "same" project
+// lives under a different path on the remote, its project-scoped mcpServers
+// entry is invisible there — spurious "MCP server absent on destination"
+// drift, purely from the path mismatch. --dest-cwd points the remote
+// inventory at the project's actual remote path and the drift disappears.
+func TestCompareConfigRemoteDestCwd(t *testing.T) {
+	remoteEnv, remoteHome := testEnv(t)
+	remoteCwd := "/home/bob/otherproj"
+	mcp := `{"projects":{"` + remoteCwd + `":{"mcpServers":{"widget":{"type":"stdio","command":"widget-mcp"}}}}}`
+	if err := os.WriteFile(filepath.Join(remoteHome, ".claude.json"), []byte(mcp), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target, opts, localHome := remoteHost(t, remoteEnv)
+	localCwd := "/home/alice/work"
+	if err := os.WriteFile(filepath.Join(localHome, ".claude.json"), []byte(
+		`{"projects":{"`+localCwd+`":{"mcpServers":{"widget":{"type":"stdio","command":"widget-mcp"}}}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PWD=" + localCwd, "PATH=/usr/bin:/bin"}
+
+	var out, errOut bytes.Buffer
+	args := append([]string{"compare-config", target}, opts...)
+	code := Main(args, strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitRefused {
+		t.Fatalf("without --dest-cwd, mismatched project paths must spuriously block: exit %d out %s err %s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "mcp.widget") {
+		t.Errorf("expected spurious mcp.widget drift:\n%s", out.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	args = append([]string{"compare-config", target, "--dest-cwd", remoteCwd}, opts...)
+	code = Main(args, strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitOK {
+		t.Fatalf("--dest-cwd should point at the matching remote project and clear the drift: exit %d out %s err %s", code, out.String(), errOut.String())
+	}
+	if strings.Contains(out.String(), "mcp.widget") {
+		t.Errorf("--dest-cwd should have removed the mcp.widget drift:\n%s", out.String())
+	}
+}
+
 func TestCompareConfigUnreachable(t *testing.T) {
 	_, localHome := testEnv(t)
 	localEnv := []string{"HOME=" + localHome, "USER=alice", "PATH=/bin"}
