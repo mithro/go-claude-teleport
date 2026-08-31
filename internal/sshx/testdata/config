@@ -1,0 +1,11 @@
+Host *
+    IdentityFile ~/.ssh/id_ed25519
+    IdentityFile ~/.ssh/id_rsa
+    User defaultuser
+
+Host example.com
+    HostName example.com
+    Port 2222
+    User alice
+    IdentityFile ~/.ssh/id_ed25519
+    ProxyJump jump.example
