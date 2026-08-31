@@ -87,6 +87,9 @@ func OpenWindow(ctx context.Context, t Transport, p *Plan) (*session.TmuxRef, er
 
 // KillWindow removes a window by id.
 func KillWindow(ctx context.Context, t Transport, windowID string) error {
+	if err := checkTargetID("kill-window", windowSigil, windowID); err != nil {
+		return err
+	}
 	if _, err := t.Run(ctx, fmt.Sprintf("kill-window -t %s", Quote(windowID))); err != nil {
 		return fmt.Errorf("kill-window %s: %w", windowID, err)
 	}

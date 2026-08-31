@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -181,5 +182,46 @@ func TestProberListPanesRejectsMalformedLine(t *testing.T) {
 	all, err := p.ListPanes()
 	if err == nil {
 		t.Fatalf("ListPanes = %+v, want an error on a malformed line", all)
+	}
+}
+
+// TestTargetIDSigilRequired is the I6 guard: tmux resolves an empty -t
+// target to the CURRENT pane/window, so every entry point that takes an id
+// rejects one without its sigil — before it says anything to tmux. Ids
+// cross the JSON wire into a long-lived `remote serve`, and the safety
+// criterion is "never touch panes the tool did not name".
+func TestTargetIDSigilRequired(t *testing.T) {
+	ctx := context.Background()
+	tb := fakeProc(t, nil)
+	for _, bad := range []string{"", "7", "@1", "pane%1"} {
+		for _, tc := range []struct {
+			op  string
+			run func(f *Fake) error
+		}{
+			{"Capture", func(f *Fake) error { _, err := Capture(ctx, f, bad); return err }},
+			{"SendKeys", func(f *Fake) error { return SendKeys(ctx, f, bad, "Enter") }},
+			{"TypeCommand", func(f *Fake) error { return TypeCommand(ctx, f, bad, []string{"echo", "hi"}) }},
+			{"State", func(f *Fake) error { _, err := State(ctx, f, bad, tb); return err }},
+		} {
+			f := &Fake{Default: []string{}} // would answer ANY command
+			if err := tc.run(f); err == nil {
+				t.Errorf("%s(%q) = nil, want an error", tc.op, bad)
+			} else if !strings.Contains(err.Error(), bad) && bad != "" {
+				t.Errorf("%s(%q) error %q does not name the offending id", tc.op, bad, err)
+			}
+			if len(f.Calls) != 0 {
+				t.Errorf("%s(%q) talked to tmux anyway: %v", tc.op, bad, f.Calls)
+			}
+		}
+	}
+	// KillWindow takes a window id: "@" is required, a pane id is not one.
+	for _, bad := range []string{"", "1", "%7", "win@1"} {
+		f := &Fake{Default: []string{}}
+		if err := KillWindow(ctx, f, bad); err == nil {
+			t.Errorf("KillWindow(%q) = nil, want an error", bad)
+		}
+		if len(f.Calls) != 0 {
+			t.Errorf("KillWindow(%q) talked to tmux anyway: %v", bad, f.Calls)
+		}
 	}
 }

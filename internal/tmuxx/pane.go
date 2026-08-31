@@ -9,6 +9,32 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/procx"
 )
 
+// Target-id sigils. tmux ids are stable and always carry one.
+const (
+	paneSigil   = "%"
+	windowSigil = "@"
+)
+
+// checkTargetID rejects an id that does not carry its sigil ("%" for a
+// pane, "@" for a window), the empty string included.
+//
+// tmux resolves an EMPTY -t target to the CURRENT pane/window — probe
+// verified: `kill-window -t ”` returns 0 having killed the window the
+// tool never named, and `send-keys -t ” 'echo HOSTILE' Enter` types into
+// whatever pane is current. TmuxRef crosses the JSON wire into a
+// long-lived `remote serve` on the destination, so an id that arrives
+// empty or mangled must fail here rather than act on someone else's pane.
+func checkTargetID(op, sigil, id string) error {
+	kind := "pane"
+	if sigil == windowSigil {
+		kind = "window"
+	}
+	if !strings.HasPrefix(id, sigil) {
+		return fmt.Errorf("%s: %q is not a tmux %s id (it must start with %q)", op, id, kind, sigil)
+	}
+	return nil
+}
+
 type PaneState struct {
 	PaneID  string
 	Command string
@@ -20,6 +46,9 @@ type PaneState struct {
 // Capture returns the pane's whole scrollback with escapes (-e), joined
 // wrapped lines (-J), trailing spaces preserved (-p prints).
 func Capture(ctx context.Context, t Transport, paneID string) ([]byte, error) {
+	if err := checkTargetID("capture-pane", paneSigil, paneID); err != nil {
+		return nil, err
+	}
 	lines, err := t.Run(ctx, fmt.Sprintf("capture-pane -epJ -S - -t %s", Quote(paneID)))
 	if err != nil {
 		return nil, fmt.Errorf("capture-pane %s: %w", paneID, err)
@@ -30,6 +59,9 @@ func Capture(ctx context.Context, t Transport, paneID string) ([]byte, error) {
 // SendKeys sends keys to the pane. Key names tmux knows (Enter, C-c, …)
 // are passed bare; everything else is Quoted as literal text.
 func SendKeys(ctx context.Context, t Transport, paneID string, keys ...string) error {
+	if err := checkTargetID("send-keys", paneSigil, paneID); err != nil {
+		return err
+	}
 	parts := []string{"send-keys", "-t", Quote(paneID)}
 	for _, k := range keys {
 		if isKeyName(k) {
@@ -62,6 +94,9 @@ func ShellQuote(argv []string) string {
 // TypeCommand types argv into the pane's shell and presses Enter. The
 // leading space keeps it out of history-ignore-space shells' history.
 func TypeCommand(ctx context.Context, t Transport, paneID string, argv []string) error {
+	if err := checkTargetID("type command", paneSigil, paneID); err != nil {
+		return err
+	}
 	cmd := fmt.Sprintf("send-keys -t %s %s Enter", Quote(paneID), Quote(" "+ShellQuote(argv)))
 	if _, err := t.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("type command into %s: %w", paneID, err)
@@ -74,6 +109,9 @@ var shells = map[string]bool{"bash": true, "zsh": true, "sh": true, "fish": true
 // State reports the pane's foreground process (first non-shell process in
 // the pane's subtree, else the shell) and its last 50 lines.
 func State(ctx context.Context, t Transport, paneID string, procs *procx.Table) (*PaneState, error) {
+	if err := checkTargetID("pane state", paneSigil, paneID); err != nil {
+		return nil, err
+	}
 	lines, err := t.Run(ctx, fmt.Sprintf(`list-panes -t %s -F "#{pane_pid}"`, Quote(paneID)))
 	if err != nil {
 		return nil, fmt.Errorf("list-panes %s: %w", paneID, err)
