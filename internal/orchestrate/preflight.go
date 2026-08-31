@@ -27,7 +27,12 @@ func isCode(err error, code string) bool {
 // Preflight is spec §6 step 1. It touches nothing outside the two hosts'
 // job directories.
 func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID string) (*Plan, error) {
-	p := &Plan{Options: o, JobID: jobID}
+	// CaptureEntryID follows gitx.NoEntry's convention (-1 = "no entry"; 0
+	// is a real manifest id): the capture step (spec §6 step 3) rebuilds
+	// the manifest and re-runs on every pass while the source has a pane,
+	// so it must be able to tell "not captured yet" apart from "captured
+	// as manifest entry 0" to stay idempotent.
+	p := &Plan{Options: o, JobID: jobID, CaptureEntryID: -1}
 	var err error
 	if p.SourceInfo, err = src.Hello(ctx); err != nil {
 		return nil, &UnreachableError{Host: "source", Err: err}
@@ -200,7 +205,11 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 	if err != nil {
 		return nil, err
 	}
-	p.annotateManifest(m, inv)
+	memorySrcs := map[string]bool{}
+	for _, e := range inv.Memory {
+		memorySrcs[e.Path()] = true
+	}
+	p.annotateManifest(m, memorySrcs)
 	p.ManifestPath = filepath.Join(job.Dir(driverDataDir(src, dst, o), jobID), "manifest.json")
 	if err := m.Save(p.ManifestPath); err != nil {
 		return nil, err
@@ -228,19 +237,19 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 }
 
 // annotateManifest records which manifest entries the git attach step
-// applies itself (existing-main) and which are memory files.
-func (p *Plan) annotateManifest(m *transfer.Manifest, inv *session.Inventory) {
-	memoryRoots := map[string]bool{}
-	for _, e := range inv.Memory {
-		memoryRoots[e.Path()] = true
-	}
+// applies itself (existing-main) and which are memory files. memorySrcs is
+// the set of source paths (session.FileEntry.Path()) the caller considers
+// memory files — built from inv.Memory at Preflight time, or (task 20)
+// rebuilt from the previously annotated p.Extras.Memory entries when the
+// capture step rebuilds the manifest.
+func (p *Plan) annotateManifest(m *transfer.Manifest, memorySrcs map[string]bool) {
 	p.Extras.Memory = nil
 	if p.Git.Mode == gitx.ModeExistingMain {
 		p.Git.DirtyEntries = map[string]int{}
 	}
 	indexSrc := filepath.Join(p.Git.SrcMain, filepath.FromSlash(p.Git.IndexRel))
 	for _, e := range m.Entries {
-		if memoryRoots[e.Src] {
+		if memorySrcs[e.Src] {
 			p.Extras.Memory = append(p.Extras.Memory, e)
 			continue
 		}
