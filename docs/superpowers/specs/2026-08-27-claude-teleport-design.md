@@ -194,17 +194,19 @@ JSON requests on stdin and writes responses on stdout; stderr is the remote
 log (forwarded into the job log). Each request is `{"id":n, "op":"…",
 "args":{…}}`; each response `{"id":n, "ok":bool, "result":{…}|"error":{…}}`.
 Bulk data (tar streams, captures, packfiles) travels on separate ssh
-channels opened by the driver: `claude-teleport remote stream-recv <job>
-<stream-id>` / `stream-send`, so the control channel is never blocked.
+channels opened by the driver via one command, `claude-teleport remote
+stream <kind> <job> <id>` (`<kind>` is `tar`, `capture`, `pack` or `log`),
+so the control channel is never blocked.
 The first op is always `hello` → `{version, protocol, home, configDir,
 uid, hostname, os, arch}`; a protocol mismatch aborts with both versions and
 the install hint.
 
 Ops: `hello`, `inventory-host`, `inventory-session`, `inventory-git`,
-`inventory-tmux`, `manifest-diff`, `stream-recv`, `stream-send`, `install`,
-`git-attach`, `tmux-open`, `tmux-capture`, `tmux-keys`, `claude-start`,
-`claude-confirm`, `claude-exit`, `freeze`, `thaw`, `shape-state`,
-`job-journal-get/put`, `record`.
+`inventory-tmux`, `manifest-diff`, `install`, `git-attach`, `tmux-open`,
+`tmux-capture`, `tmux-keys`, `claude-start`, `claude-confirm`, `claude-exit`,
+`freeze`, `thaw`, `shape-state`, `job-journal-get/put`, `record`. (The bulk
+streams above are not JSON ops on this control channel; they are the
+separate `remote stream <kind> <job> <id>` command.)
 
 ## 5. Command line
 
@@ -408,6 +410,13 @@ file is a byte-prefix of the incoming one (`ff-candidate`): a fast-forward
 of the same session, which is allowed and logged. `--force` extends the
 exception to the non-prefix case for the same session id only; it never
 allows overwriting unrelated files.
+
+**Amendment (Plan 02):** for `.jsonl` transcript/sidecar files, "byte-prefix"
+above is a record-wise JSON-equality prefix (`session.IsRecordPrefix`), not a
+raw byte-prefix — rewrite normalisation (path rewriting during Send) can
+change a rewritten line's exact byte encoding without changing its decoded
+JSON value, so a plain byte comparison would wrongly reject a legitimate
+fast-forward.
 
 ### 7.4 Streaming
 
