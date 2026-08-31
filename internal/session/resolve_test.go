@@ -8,8 +8,11 @@ import (
 
 // fakeProbe is the Plan 01 stand-in for tmuxx.Prober (Plan 03).
 type fakeProbe struct {
-	panes   map[string]struct{ argv []string; pid int } // pane id -> foreground command
-	windows map[string][]PaneInfo                       // "sess window" -> panes
+	panes map[string]struct {
+		argv []string
+		pid  int
+	} // pane id -> foreground command
+	windows map[string][]PaneInfo // "sess window" -> panes
 	socket  string
 }
 
@@ -94,7 +97,10 @@ func TestLoadStaleRegistryIsIdle(t *testing.T) {
 func TestLoadSuspendedViaPlaceholderPane(t *testing.T) {
 	useFixtureProc(t)
 	probe := &fakeProbe{socket: "/tmp/tmux-1000/default",
-		panes:   map[string]struct{ argv []string; pid int }{"%9": {[]string{"claude-teleport", "placeholder", "--resume", string(sidB)}, 500}},
+		panes: map[string]struct {
+			argv []string
+			pid  int
+		}{"%9": {[]string{"claude-teleport", "placeholder", "--resume", string(sidB)}, 500}},
 		windows: map[string][]PaneInfo{"main 4": {{Session: "main", WindowID: "@4", PaneID: "%9"}}}}
 	s, err := Load(fixturePaths(), sidB, probe)
 	if err != nil {
@@ -116,7 +122,10 @@ func TestResolve(t *testing.T) {
 	useFixtureProc(t)
 	p := fixturePaths()
 	probe := &fakeProbe{socket: "/tmp/tmux-1000/default",
-		panes: map[string]struct{ argv []string; pid int }{
+		panes: map[string]struct {
+			argv []string
+			pid  int
+		}{
 			"%7": {[]string{"claude"}, 41234},
 			"%9": {[]string{"claude-resume", string(sidB)}, 500},
 		},

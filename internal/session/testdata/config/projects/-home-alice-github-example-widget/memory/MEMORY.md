@@ -1,0 +1,1 @@
+- Widget CLI uses the stdlib flag package.
