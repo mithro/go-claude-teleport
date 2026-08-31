@@ -4,6 +4,7 @@ package gitx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -243,5 +244,49 @@ func TestAttachSameDirRefusesWhenDirtiedSincePreflight(t *testing.T) {
 	err = Attach(context.Background(), p, "", nil)
 	if err == nil || !strings.Contains(err.Error(), "not clean") {
 		t.Fatalf("err = %v, want not-clean refusal", err)
+	}
+}
+
+// TestAttachRefusesDirtyPathOutsideWorktree is the containment invariant:
+// a plan whose dirty map names a path outside the destination worktree
+// (and that is not the index) is refused before anything is written.
+func TestAttachRefusesDirtyPathOutsideWorktree(t *testing.T) {
+	srcMain := t.TempDir()
+	repo, root := initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "b.txt"), "b\n")
+	gitCLI(t, w, "add", "b.txt")
+	gitCLI(t, w, "commit", "-q", "-m", "feat work")
+	_ = repo
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(w)
+	ds, err := DestStateOf(dstMain, filepath.Join(dstMain, ".worktrees", "feat"), "feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := t.TempDir()
+	payload := filepath.Join(staging, "payload")
+	writeFile(t, payload, "pwned\n")
+	outside := filepath.Join(filepath.Dir(dstMain), "escape.txt")
+	dirty := map[string]DirtyFile{outside: {Src: payload, Mode: 0o644}}
+
+	var re *RefuseError
+	err = Attach(context.Background(), p, "", dirty)
+	if !errors.As(err, &re) || !strings.Contains(re.Reason, "escape.txt") {
+		t.Fatalf("err = %v, want a *RefuseError naming escape.txt", err)
+	}
+	if _, err := os.Lstat(outside); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("%s was written despite the refusal (%v)", outside, err)
+	}
+	// Nothing else was mutated either: the worktree was never created.
+	if _, err := os.Lstat(p.DstWorktree); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("destination worktree %s created despite the refusal (%v)", p.DstWorktree, err)
 	}
 }

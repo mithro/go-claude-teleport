@@ -9,6 +9,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -74,7 +76,32 @@ func repairLinkedMetadata(p *Plan) error {
 	return nil
 }
 
+// checkDirtyContainment refuses a dirty map that names anything other than
+// the transferred index or a path under the destination worktree, before
+// any of it is copied: a hostile or corrupt plan must not be able to write
+// outside the directories the transfer owns.
+func checkDirtyContainment(p *Plan, dirtyFiles map[string]DirtyFile) error {
+	idx := indexDestPath(p)
+	prefix := filepath.Clean(p.DstWorktree) + string(filepath.Separator)
+	dsts := make([]string, 0, len(dirtyFiles))
+	for dst := range dirtyFiles {
+		dsts = append(dsts, dst)
+	}
+	sort.Strings(dsts)
+	for _, dst := range dsts {
+		c := filepath.Clean(dst)
+		if c == idx || strings.HasPrefix(c, prefix) {
+			continue
+		}
+		return &RefuseError{Reason: fmt.Sprintf("dirty file %s is outside the destination worktree %s", dst, p.DstWorktree)}
+	}
+	return nil
+}
+
 func attachExisting(ctx context.Context, p *Plan, packPath string, dirtyFiles map[string]DirtyFile) error {
+	if err := checkDirtyContainment(p, dirtyFiles); err != nil {
+		return err
+	}
 	repo, err := git.PlainOpenWithOptions(p.DstMain, &git.PlainOpenOptions{EnableDotGitCommonDir: true})
 	if err != nil {
 		return fmt.Errorf("open %s: %w", p.DstMain, err)
