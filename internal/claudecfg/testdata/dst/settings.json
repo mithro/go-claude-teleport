@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "Bash", "hooks": [{"type": "command", "command": "/home/alice/bin/other-guard.sh"}]}
+    ]
+  },
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": ["Bash(go test:*)"],
+    "deny": ["Read(./.env)"]
+  },
+  "enabledPlugins": {"superpowers@claude-plugins-official": true},
+  "model": "sonnet"
+}

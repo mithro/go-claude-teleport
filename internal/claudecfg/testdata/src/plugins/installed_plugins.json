@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "plugins": {
+    "superpowers@claude-plugins-official": [
+      {
+        "version": "6.3.0",
+        "installedAt": "2026-08-01T09:00:00.000Z",
+        "lastUpdated": "2026-08-20T09:00:00.000Z",
+        "installPath": "/home/alice/.claude/plugins/cache/claude-plugins-official/superpowers/6.3.0",
+        "isLocal": false
+      }
+    ],
+    "netgear-switch@example-marketplace": [
+      {
+        "version": "0.4.1",
+        "installedAt": "2026-08-10T09:00:00.000Z",
+        "lastUpdated": "2026-08-10T09:00:00.000Z",
+        "installPath": "/home/alice/.claude/plugins/cache/example-marketplace/netgear-switch/0.4.1",
+        "isLocal": false
+      }
+    ]
+  }
+}
