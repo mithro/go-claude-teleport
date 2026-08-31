@@ -26,11 +26,15 @@ import (
 
 // pipeClient wires a Client to a Local through net.Pipe; streams are opened
 // directly on the Local.
-func pipeClient(t *testing.T, l *Local) *Client {
+func pipeClient(t *testing.T, l *Local) *Client { return pipeEndpointClient(t, l) }
+
+// pipeEndpointClient is pipeClient over ANY Endpoint — a Client included,
+// which is how the chained-server case is tested (I5).
+func pipeEndpointClient(t *testing.T, ep Endpoint) *Client {
 	t.Helper()
 	a, b := net.Pipe()
-	go func() { Serve(context.Background(), b, b, l); b.Close() }()
-	c, err := NewClientConn(context.Background(), a, l.OpenStream, t.Logf)
+	go func() { Serve(context.Background(), b, b, ep); b.Close() }()
+	c, err := NewClientConn(context.Background(), a, ep.OpenStream, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}

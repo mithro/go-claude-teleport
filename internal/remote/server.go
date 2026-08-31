@@ -29,9 +29,29 @@ func decode[T any](args json.RawMessage) (T, error) {
 	return v, nil
 }
 
-// dispatch is the op-name -> handler table. Every op's args/result types
-// live in ops.go so Client and Server cannot drift apart.
-var dispatch = map[string]handler{
+// dispatch is THE op-name -> handler table: Plan 02's ops below, merged
+// with Plan 03's (ops_plan03.go). Every op's args/result types live in
+// ops.go or ops_plan03.go so Client and Server cannot drift apart, and
+// every handler takes an Endpoint, so handle needs exactly one lookup and
+// no concrete-type assertion.
+var dispatch = mergeOps(plan02Ops, plan03Ops)
+
+// mergeOps builds the dispatch table, refusing (loudly, at init) to let two
+// tables claim the same op name.
+func mergeOps(tables ...map[string]handler) map[string]handler {
+	out := map[string]handler{}
+	for _, t := range tables {
+		for op, h := range t {
+			if _, dup := out[op]; dup {
+				panic("remote: duplicate op in the dispatch table: " + op)
+			}
+			out[op] = h
+		}
+	}
+	return out
+}
+
+var plan02Ops = map[string]handler{
 	OpHello: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {
 		a, err := decode[HelloArgs](args)
 		if err != nil {
@@ -247,22 +267,12 @@ func handle(ctx context.Context, ep Endpoint, req Request) (resp Response) {
 			resp.Error = &Error{Code: "internal", Message: fmt.Sprintf("panic in %s: %v\n%s", req.Op, r, debug.Stack())}
 		}
 	}()
-	var result any
-	var err error
-	switch h, ok := dispatch[req.Op]; {
-	case ok:
-		result, err = h(ctx, ep, req.Args)
-	case plan03Ops[req.Op] != nil:
-		l, ok := ep.(*Local)
-		if !ok {
-			resp.Error = &Error{Code: "internal", Message: "plan03 op " + req.Op + " requires a Local endpoint"}
-			return resp
-		}
-		result, err = plan03Ops[req.Op](ctx, l, req.Args)
-	default:
+	h, ok := dispatch[req.Op]
+	if !ok {
 		resp.Error = &Error{Code: "usage", Message: "unknown op " + req.Op}
 		return resp
 	}
+	result, err := h(ctx, ep, req.Args)
 	if err != nil {
 		resp.Error = toError(err)
 		return resp

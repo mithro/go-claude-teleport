@@ -11,8 +11,8 @@ import (
 )
 
 // Argument/result shapes for the Plan 03 ops that Plan 02 does not already
-// dispatch. Every op here is registered in plan03Ops below; Client methods
-// call the same names.
+// dispatch. Every op here is registered into dispatch by registerPlan03Ops
+// below, under the same Op* constant its Client method calls.
 type (
 	gitFilesArgs struct {
 		Plan           *gitx.Plan `json:"plan"`
@@ -67,81 +67,79 @@ type (
 	}
 )
 
-// localHandler decodes args, runs the op on the Local, returns a result.
-type localHandler func(ctx context.Context, l *Local, args json.RawMessage) (any, error)
-
-// plan03Ops is merged into Server's dispatch table (see handle in server.go).
-// It holds ONLY ops Plan 02's `dispatch` table does not know: Plan 02 already
-// dispatches inventory-git, git-dest-state, git-attach, inventory-tmux,
-// tmux-open, tmux-capture, tmux-keys, shape-state (PaneState), claude-start,
-// claude-confirm, claude-exit and claude-pty-resume through Endpoint, and its
-// Client already implements those twelve (InventoryGit, GitDestState,
-// GitAttach, InventoryTmux, OpenWindow, Capture, StartClaude, ConfirmClaude,
-// ExitClaude, TypeCommand, PaneState, RunPtyResume) — this file must not
-// redeclare any of them.
-var plan03Ops = map[string]localHandler{
-	"git-files": func(ctx context.Context, l *Local, a json.RawMessage) (any, error) {
+// plan03Ops is merged into Server's single dispatch table (see server.go).
+// Every op here runs on the Endpoint interface exactly like the Plan 02 ops
+// do (I5): the nine methods are on Endpoint, both Local and Client
+// implement them, so a chained/proxied server can serve them and `handle`
+// has no type assertion to make. The table holds ONLY ops Plan 02's table
+// does not know — Plan 02 already dispatches inventory-git, git-dest-state,
+// git-attach, inventory-tmux, tmux-open, tmux-capture, tmux-keys,
+// shape-state (PaneState), claude-start, claude-confirm, claude-exit and
+// claude-pty-resume, and its Client already implements those twelve, so
+// this file must not redeclare any of them (mergeOps panics if it does).
+var plan03Ops = map[string]handler{
+	OpGitFiles: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
 		v, err := decode[gitFilesArgs](a)
 		if err != nil {
 			return nil, err
 		}
-		files, err := l.GitFiles(ctx, v.Plan, v.Excludes, v.IncludeIgnored)
+		files, err := ep.GitFiles(ctx, v.Plan, v.Excludes, v.IncludeIgnored)
 		return filesResult{Files: files}, err
 	},
-	"git-source-facts": func(ctx context.Context, l *Local, a json.RawMessage) (any, error) {
+	OpGitSourceFacts: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
 		v, err := decode[gitSourceFactsArgs](a)
 		if err != nil {
 			return nil, err
 		}
-		return l.GitSourceFacts(ctx, v.MainDir, v.IndexRel, v.Tip, v.DestTip)
+		return ep.GitSourceFacts(ctx, v.MainDir, v.IndexRel, v.Tip, v.DestTip)
 	},
-	"tmux-sessions": func(ctx context.Context, l *Local, a json.RawMessage) (any, error) {
+	OpTmuxSessions: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
 		v, err := decode[tmuxSessionsArgs](a)
 		if err != nil {
 			return nil, err
 		}
-		s, err := l.TmuxSessions(ctx, v.SocketPath)
+		s, err := ep.TmuxSessions(ctx, v.SocketPath)
 		return tmuxSessionsResult{Sessions: s}, err
 	},
-	"tmux-kill": func(ctx context.Context, l *Local, a json.RawMessage) (any, error) {
+	OpKillWindow: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
 		v, err := decode[killWindowArgs](a)
 		if err != nil {
 			return nil, err
 		}
-		return Empty{}, l.KillWindow(ctx, v.Ref)
+		return Empty{}, ep.KillWindow(ctx, v.Ref)
 	},
-	"claude-status": func(ctx context.Context, l *Local, a json.RawMessage) (any, error) {
+	OpClaudeStatus: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
 		v, err := decode[claudeStatusArgs](a)
 		if err != nil {
 			return nil, err
 		}
-		r, ok, err := l.ClaudeStatus(ctx, v.ID)
+		r, ok, err := ep.ClaudeStatus(ctx, v.ID)
 		return claudeStatusResult{Registry: r, OK: ok}, err
 	},
-	"build-manifest": func(ctx context.Context, l *Local, a json.RawMessage) (any, error) {
+	OpBuildManifest: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
 		v, err := decode[buildManifestArgs](a)
 		if err != nil {
 			return nil, err
 		}
-		return l.BuildManifest(ctx, v.JobID, v.ID, v.SrcHost, v.DstHost, v.Files, v.PathMap)
+		return ep.BuildManifest(ctx, v.JobID, v.ID, v.SrcHost, v.DstHost, v.Files, v.PathMap)
 	},
-	"session-extras": func(ctx context.Context, l *Local, a json.RawMessage) (any, error) {
+	OpSessionExtras: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
 		v, err := decode[sessionExtrasArgs](a)
 		if err != nil {
 			return nil, err
 		}
-		ex, err := l.SessionExtras(ctx, v.ID, v.PathMap)
+		ex, err := ep.SessionExtras(ctx, v.ID, v.PathMap)
 		return extrasResult{Extras: ex}, err
 	},
-	"cleanup": func(ctx context.Context, l *Local, a json.RawMessage) (any, error) {
+	OpCleanup: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
 		v, err := decode[cleanupArgs](a)
 		if err != nil {
 			return nil, err
 		}
-		return Empty{}, l.Cleanup(ctx, v.JobID)
+		return Empty{}, ep.Cleanup(ctx, v.JobID)
 	},
-	"list-sessions": func(ctx context.Context, l *Local, a json.RawMessage) (any, error) {
-		s, err := l.ListSessions(ctx)
+	OpListSessions: func(ctx context.Context, ep Endpoint, _ json.RawMessage) (any, error) {
+		s, err := ep.ListSessions(ctx)
 		return sessionsResult{Sessions: s}, err
 	},
 }
@@ -150,7 +148,7 @@ var plan03Ops = map[string]localHandler{
 
 func (c *Client) GitFiles(ctx context.Context, p *gitx.Plan, excludes []string, includeIgnored bool) ([]session.FileEntry, error) {
 	var out filesResult
-	if err := c.call(ctx, "git-files", gitFilesArgs{p, excludes, includeIgnored}, &out); err != nil {
+	if err := c.call(ctx, OpGitFiles, gitFilesArgs{p, excludes, includeIgnored}, &out); err != nil {
 		return nil, err
 	}
 	return out.Files, nil
@@ -158,7 +156,7 @@ func (c *Client) GitFiles(ctx context.Context, p *gitx.Plan, excludes []string, 
 
 func (c *Client) GitSourceFacts(ctx context.Context, mainDir, indexRel, tip, destTip string) (*gitx.SourceFacts, error) {
 	var out gitx.SourceFacts
-	if err := c.call(ctx, "git-source-facts", gitSourceFactsArgs{mainDir, indexRel, tip, destTip}, &out); err != nil {
+	if err := c.call(ctx, OpGitSourceFacts, gitSourceFactsArgs{mainDir, indexRel, tip, destTip}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -166,19 +164,19 @@ func (c *Client) GitSourceFacts(ctx context.Context, mainDir, indexRel, tip, des
 
 func (c *Client) TmuxSessions(ctx context.Context, socketPath string) ([]tmuxx.SessionInfo, error) {
 	var out tmuxSessionsResult
-	if err := c.call(ctx, "tmux-sessions", tmuxSessionsArgs{socketPath}, &out); err != nil {
+	if err := c.call(ctx, OpTmuxSessions, tmuxSessionsArgs{socketPath}, &out); err != nil {
 		return nil, err
 	}
 	return out.Sessions, nil
 }
 
 func (c *Client) KillWindow(ctx context.Context, ref *session.TmuxRef) error {
-	return c.call(ctx, "tmux-kill", killWindowArgs{ref}, nil)
+	return c.call(ctx, OpKillWindow, killWindowArgs{ref}, nil)
 }
 
 func (c *Client) ClaudeStatus(ctx context.Context, id session.ID) (*session.Registry, bool, error) {
 	var out claudeStatusResult
-	if err := c.call(ctx, "claude-status", claudeStatusArgs{id}, &out); err != nil {
+	if err := c.call(ctx, OpClaudeStatus, claudeStatusArgs{id}, &out); err != nil {
 		return nil, false, err
 	}
 	return out.Registry, out.OK, nil
@@ -186,7 +184,7 @@ func (c *Client) ClaudeStatus(ctx context.Context, id session.ID) (*session.Regi
 
 func (c *Client) BuildManifest(ctx context.Context, jobID string, id session.ID, srcHost, dstHost string, files []session.FileEntry, pm session.PathMap) (*transfer.Manifest, error) {
 	var out transfer.Manifest
-	if err := c.call(ctx, "build-manifest", buildManifestArgs{jobID, id, srcHost, dstHost, files, pm}, &out); err != nil {
+	if err := c.call(ctx, OpBuildManifest, buildManifestArgs{jobID, id, srcHost, dstHost, files, pm}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -194,19 +192,19 @@ func (c *Client) BuildManifest(ctx context.Context, jobID string, id session.ID,
 
 func (c *Client) SessionExtras(ctx context.Context, id session.ID, pm session.PathMap) (*transfer.InstallExtras, error) {
 	var out extrasResult
-	if err := c.call(ctx, "session-extras", sessionExtrasArgs{id, pm}, &out); err != nil {
+	if err := c.call(ctx, OpSessionExtras, sessionExtrasArgs{id, pm}, &out); err != nil {
 		return nil, err
 	}
 	return out.Extras, nil
 }
 
 func (c *Client) Cleanup(ctx context.Context, jobID string) error {
-	return c.call(ctx, "cleanup", cleanupArgs{jobID}, nil)
+	return c.call(ctx, OpCleanup, cleanupArgs{jobID}, nil)
 }
 
 func (c *Client) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 	var out sessionsResult
-	if err := c.call(ctx, "list-sessions", struct{}{}, &out); err != nil {
+	if err := c.call(ctx, OpListSessions, struct{}{}, &out); err != nil {
 		return nil, err
 	}
 	return out.Sessions, nil

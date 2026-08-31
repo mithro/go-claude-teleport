@@ -86,7 +86,7 @@ func TestServeSessionExtrasOp(t *testing.T) {
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
 	pm := session.NewPathMap(session.Mapping{From: p.Home, To: "/home/bob"})
 	var out extrasResult
-	if e := callOp(t, ep, "session-extras", sessionExtrasArgs{ID: session.ID(sid), PathMap: pm}, &out); e != nil {
+	if e := callOp(t, ep, OpSessionExtras, sessionExtrasArgs{ID: session.ID(sid), PathMap: pm}, &out); e != nil {
 		t.Fatal(e)
 	}
 	if out.Extras.IndexEntry == nil || out.Extras.IndexEntry.ProjectPath != "/home/bob/x" {
@@ -110,7 +110,7 @@ func TestServeGitFilesOp(t *testing.T) {
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
 	plan := &gitx.Plan{Mode: gitx.ModeNotRepo, SrcWorktree: dir, PackEntryID: gitx.NoEntry, IndexEntryID: gitx.NoEntry}
 	var out filesResult
-	if e := callOp(t, ep, "git-files", gitFilesArgs{Plan: plan}, &out); e != nil {
+	if e := callOp(t, ep, OpGitFiles, gitFilesArgs{Plan: plan}, &out); e != nil {
 		t.Fatal(e)
 	}
 	var gotFile bool
@@ -137,7 +137,7 @@ func TestServeGitSourceFactsOp(t *testing.T) {
 	tip := strings.TrimSpace(gitc(t, repo, "rev-parse", "HEAD"))
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
 	var facts gitx.SourceFacts
-	if e := callOp(t, ep, "git-source-facts", gitSourceFactsArgs{MainDir: repo, IndexRel: ".git/index", Tip: tip, DestTip: tip}, &facts); e != nil {
+	if e := callOp(t, ep, OpGitSourceFacts, gitSourceFactsArgs{MainDir: repo, IndexRel: ".git/index", Tip: tip, DestTip: tip}, &facts); e != nil {
 		t.Fatal(e)
 	}
 	if !facts.DestTipReachable {
@@ -157,7 +157,7 @@ func TestServeTmuxSessionsOp(t *testing.T) {
 	}}
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc", Tmux: fakeDialer(f)})
 	var out tmuxSessionsResult
-	if e := callOp(t, ep, "tmux-sessions", tmuxSessionsArgs{SocketPath: "/s"}, &out); e != nil {
+	if e := callOp(t, ep, OpTmuxSessions, tmuxSessionsArgs{SocketPath: "/s"}, &out); e != nil {
 		t.Fatal(e)
 	}
 	if len(out.Sessions) != 1 || out.Sessions[0].Name != "work" || out.Sessions[0].Group != "work" {
@@ -172,7 +172,7 @@ func TestServeTmuxKillOp(t *testing.T) {
 	f := &tmuxx.Fake{Replies: map[string][]string{`kill-window -t "@1"`: {}}}
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc", Tmux: fakeDialer(f)})
 	ref := &session.TmuxRef{SocketPath: "/s", WindowID: "@1"}
-	if e := callOp(t, ep, "tmux-kill", killWindowArgs{Ref: ref}, nil); e != nil {
+	if e := callOp(t, ep, OpKillWindow, killWindowArgs{Ref: ref}, nil); e != nil {
 		t.Fatal(e)
 	}
 }
@@ -183,7 +183,7 @@ func TestServeClaudeStatusOp(t *testing.T) {
 	p := testPaths(t)
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})})
 	var absent claudeStatusResult
-	if e := callOp(t, ep, "claude-status", claudeStatusArgs{ID: session.ID(sid)}, &absent); e != nil {
+	if e := callOp(t, ep, OpClaudeStatus, claudeStatusArgs{ID: session.ID(sid)}, &absent); e != nil {
 		t.Fatal(e)
 	}
 	if absent.OK {
@@ -191,7 +191,7 @@ func TestServeClaudeStatusOp(t *testing.T) {
 	}
 	writeRegistry(t, p, 5150, "idle", "")
 	var present claudeStatusResult
-	if e := callOp(t, ep, "claude-status", claudeStatusArgs{ID: session.ID(sid)}, &present); e != nil {
+	if e := callOp(t, ep, OpClaudeStatus, claudeStatusArgs{ID: session.ID(sid)}, &present); e != nil {
 		t.Fatal(e)
 	}
 	if !present.OK || present.Registry == nil || present.Registry.Status != "idle" {
@@ -212,7 +212,7 @@ func TestServeBuildManifestOp(t *testing.T) {
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
 	const jobID = "buildmanjob"
 	var m transfer.Manifest
-	if e := callOp(t, ep, "build-manifest", buildManifestArgs{JobID: jobID, ID: session.ID(sid), SrcHost: "laptop.example", DstHost: "big-storage.example", Files: files, PathMap: pm}, &m); e != nil {
+	if e := callOp(t, ep, OpBuildManifest, buildManifestArgs{JobID: jobID, ID: session.ID(sid), SrcHost: "laptop.example", DstHost: "big-storage.example", Files: files, PathMap: pm}, &m); e != nil {
 		t.Fatal(e)
 	}
 	if len(m.Entries) != 1 || m.Entries[0].SHA256 == "" {
@@ -231,7 +231,7 @@ func TestServeCleanupOp(t *testing.T) {
 	staging := job.StagingDir(p.DataDir, jobID)
 	os.MkdirAll(staging, 0o700)
 	os.WriteFile(filepath.Join(staging, "0"), []byte("x"), 0o600)
-	if e := callOp(t, ep, "cleanup", cleanupArgs{JobID: jobID}, nil); e != nil {
+	if e := callOp(t, ep, OpCleanup, cleanupArgs{JobID: jobID}, nil); e != nil {
 		t.Fatal(e)
 	}
 	if _, err := os.Stat(staging); !os.IsNotExist(err) {
@@ -250,7 +250,7 @@ func TestServeListSessionsOp(t *testing.T) {
 	os.WriteFile(filepath.Join(proj, sid+".jsonl"), []byte(`{"type":"user","cwd":"`+cwd+`","timestamp":"2026-01-01T00:00:00Z"}`+"\n"), 0o600)
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
 	var out sessionsResult
-	if e := callOp(t, ep, "list-sessions", struct{}{}, &out); e != nil {
+	if e := callOp(t, ep, OpListSessions, struct{}{}, &out); e != nil {
 		t.Fatal(e)
 	}
 	if len(out.Sessions) != 1 || out.Sessions[0].ID != session.ID(sid) || out.Sessions[0].Cwd != cwd {
@@ -269,4 +269,63 @@ func bytesContains(b []byte, s string) bool {
 		}
 		return false
 	}()
+}
+
+// TestPlan03OpsServeThroughAChainedClient is the I5 regression: the nine
+// Plan 03 ops are on Endpoint and dispatched like every other op, so a
+// Server can serve them from a *Client* (a chained/proxied host) — the old
+// `ep.(*Local)` branch in handle failed all nine outright there. The chain
+// is: outer Client -> Serve(inner Client) -> Serve(Local).
+func TestPlan03OpsServeThroughAChainedClient(t *testing.T) {
+	p := testPaths(t)
+	cwd := filepath.Join(p.Home, "x")
+	proj := p.ProjectDir(cwd)
+	os.MkdirAll(proj, 0o700)
+	os.WriteFile(filepath.Join(proj, sid+".jsonl"), []byte(`{"type":"user","cwd":"`+cwd+`","timestamp":"2026-01-01T00:00:00Z"}`+"\n"), 0o600)
+	f := &tmuxx.Fake{Replies: map[string][]string{
+		"list-sessions -F \"#{session_name}\t#{session_group}\"": {"work\twork"},
+		`kill-window -t "@1"`: {},
+	}}
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc", Tmux: fakeDialer(f)})
+	chained := pipeEndpointClient(t, pipeEndpointClient(t, l))
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a"), 0o644)
+	files, err := chained.GitFiles(ctx, &gitx.Plan{Mode: gitx.ModeNotRepo, SrcWorktree: dir, PackEntryID: gitx.NoEntry, IndexEntryID: gitx.NoEntry}, nil, false)
+	if err != nil || len(files) == 0 {
+		t.Errorf("GitFiles = %v %v", files, err)
+	}
+	sessions, err := chained.TmuxSessions(ctx, "/s")
+	if err != nil || len(sessions) != 1 || sessions[0].Name != "work" {
+		t.Errorf("TmuxSessions = %+v %v", sessions, err)
+	}
+	if err := chained.KillWindow(ctx, &session.TmuxRef{SocketPath: "/s", WindowID: "@1"}); err != nil {
+		t.Errorf("KillWindow = %v", err)
+	}
+	if _, ok, err := chained.ClaudeStatus(ctx, session.ID(sid)); err != nil || ok {
+		t.Errorf("ClaudeStatus = %v %v, want not ok", ok, err)
+	}
+	if err := chained.Cleanup(ctx, "nosuchjob"); err != nil {
+		t.Errorf("Cleanup = %v", err)
+	}
+	sums, err := chained.ListSessions(ctx)
+	if err != nil || len(sums) != 1 || sums[0].ID != session.ID(sid) {
+		t.Errorf("ListSessions = %+v %v", sums, err)
+	}
+	// The remaining three (git-source-facts, build-manifest, session-extras)
+	// need on-disk git/transcript fixtures and are covered against Serve
+	// above; all nine share one Op* constant between handler and Client, so
+	// the two sides cannot name different ops.
+}
+
+// TestPlan03OpsAreInTheSingleDispatchTable pins that the merge happened and
+// that no op was left behind in a second table.
+func TestPlan03OpsAreInTheSingleDispatchTable(t *testing.T) {
+	for _, op := range []string{OpGitFiles, OpGitSourceFacts, OpTmuxSessions, OpKillWindow,
+		OpClaudeStatus, OpBuildManifest, OpSessionExtras, OpCleanup, OpListSessions} {
+		if dispatch[op] == nil {
+			t.Errorf("op %q is not in dispatch", op)
+		}
+	}
 }
