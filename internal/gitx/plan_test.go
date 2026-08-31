@@ -3,6 +3,7 @@ package gitx
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/mithro/go-claude-teleport/internal/session"
@@ -24,6 +25,11 @@ func linkedInfo() *Info {
 func mainInfo() *Info {
 	return &Info{Root: "/home/alice/github/x", CommonDir: "/home/alice/github/x/.git", MainDir: "/home/alice/github/x",
 		Branch: "main", Head: tip, RootCommit: rootA}
+}
+
+func detachedInfo() *Info {
+	return &Info{Root: "/home/alice/github/x/.worktrees/feat", CommonDir: "/home/alice/github/x/.git", MainDir: "/home/alice/github/x",
+		IsLinked: true, WorktreeName: "feat", Head: tip, Detached: true, RootCommit: rootA}
 }
 
 func TestPlanTransferTable(t *testing.T) {
@@ -56,6 +62,9 @@ func TestPlanTransferTable(t *testing.T) {
 			i.DirtySubmodules = []string{"v/s"}
 			return i
 		}(), &DestState{}, "", false, false, "submodule"},
+		{"detached, dest has tip", detachedInfo(), &DestState{MainExists: true, RootCommit: rootA, RefTips: map[string]string{"refs/heads/main": tip}}, ModeExistingMain, false, false, ""},
+		{"detached, dest lacks tip", detachedInfo(), &DestState{MainExists: true, RootCommit: rootA, RefTips: map[string]string{"refs/heads/main": older}}, ModeExistingMain, false, true, ""},
+		{"W==M no working tree", mainInfo(), &DestState{MainExists: true, RootCommit: rootA}, "", false, false, "no working tree"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -106,29 +115,5 @@ func TestPlanTransferHaveTipsDeduped(t *testing.T) {
 }
 
 func containsFold(s, sub string) bool {
-	return len(sub) == 0 || len(s) >= len(sub) && (stringsIndexFold(s, sub) >= 0)
-}
-
-func stringsIndexFold(s, sub string) int {
-	ls, lsub := []rune(s), []rune(sub)
-	for i := 0; i+len(lsub) <= len(ls); i++ {
-		match := true
-		for j := range lsub {
-			a, b := ls[i+j], lsub[j]
-			if 'A' <= a && a <= 'Z' {
-				a += 'a' - 'A'
-			}
-			if 'A' <= b && b <= 'Z' {
-				b += 'a' - 'A'
-			}
-			if a != b {
-				match = false
-				break
-			}
-		}
-		if match {
-			return i
-		}
-	}
-	return -1
+	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
 }
