@@ -16,6 +16,9 @@ const confirmPoll = 250 * time.Millisecond
 
 // StartClaude types the placeholder/claude argv into the destination pane.
 func (l *Local) StartClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, jobID string, argv []string) error {
+	if ref == nil {
+		return &Error{Code: "usage", Message: "start-claude: nil pane ref"}
+	}
 	l.opts.Logf("start: typing %q into %s", strings.Join(argv, " "), ref.PaneID)
 	return l.TypeCommand(ctx, ref, argv)
 }

@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/mithro/go-claude-teleport/internal/procx"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 )
@@ -105,6 +108,92 @@ func TestExitClaudeTimesOut(t *testing.T) {
 	err := l.ExitClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", PaneID: "%7"}, 5150, "777", 300*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "5150") {
 		t.Fatalf("err = %v, want timeout naming the pid", err)
+	}
+}
+
+// startSleep spawns a real, short-lived `sleep 60` process this test owns
+// (mirrors internal/procx/freezer_test.go's startSleep) so ExitClaude's
+// ref==nil / SIGTERM branch can be exercised against a real pid+startTime
+// instead of the fake /proc trees the rest of this file uses. Only ever
+// signalled/killed by this test's own cleanup — never touches anything the
+// test did not spawn.
+//
+// A background goroutine reaps the process the instant it exits: without
+// it, a SIGTERM'd child sits as a zombie — still a live /proc/<pid> entry
+// with its startTime unchanged — until something calls Wait(), which would
+// make procx.Table.Alive see it as "alive" forever and hang ExitClaude's
+// WaitGone poll.
+func startSleep(t *testing.T) (pid int, startTime string) {
+	t.Helper()
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("spawn sleep: %v", err)
+	}
+	reaped := make(chan struct{})
+	go func() { cmd.Wait(); close(reaped) }()
+	t.Cleanup(func() {
+		cmd.Process.Kill()
+		<-reaped
+	})
+	st, err := procx.StartTime("/proc", cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("StartTime: %v", err)
+	}
+	return cmd.Process.Pid, st
+}
+
+// alive reports whether pid still exists (signal 0 probe).
+func alive(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
+}
+
+func TestExitClaudeSIGTERMTerminatesRealProcess(t *testing.T) {
+	p := testPaths(t)
+	pid, startTime := startSleep(t)
+	// ProcRoot must be the real /proc: this exercises ExitClaude's ref==nil
+	// (non-tmux) branch against a real signalled process, not the fake
+	// /proc trees the other tests in this file use.
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc", Sleep: func(time.Duration) {}})
+	if err := l.ExitClaude(context.Background(), nil, pid, startTime, 5*time.Second); err != nil {
+		t.Fatalf("ExitClaude: %v", err)
+	}
+	if alive(pid) {
+		t.Errorf("pid %d still alive after ExitClaude returned", pid)
+	}
+}
+
+func TestExitClaudeSIGTERMWrongStartTimeIsNoop(t *testing.T) {
+	p := testPaths(t)
+	pid, startTime := startSleep(t)
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc", Sleep: func(time.Duration) {}})
+	// A startTime that does not match the real process is "not our
+	// process" by procx.Table.Alive's pid-reuse protection: ExitClaude
+	// must not signal it. That same mismatch also makes WaitGone's own
+	// Alive check immediately report "not alive" against the (wrong)
+	// startTime it was given, so — per this implementation — the call
+	// no-ops and returns nil rather than erroring or timing out.
+	wrong := startTime + "1"
+	if err := l.ExitClaude(context.Background(), nil, pid, wrong, 300*time.Millisecond); err != nil {
+		t.Fatalf("ExitClaude with wrong startTime = %v, want no-op nil", err)
+	}
+	if !alive(pid) {
+		t.Fatal("pid was signalled despite a startTime mismatch")
+	}
+}
+
+func TestStartClaudeRejectsNilRef(t *testing.T) {
+	l := NewLocal(testPaths(t), "x", LocalOptions{ProcRoot: "/proc"})
+	err := l.StartClaude(context.Background(), nil, session.ID(sid), sid, []string{"claude"})
+	if e, ok := err.(*Error); !ok || e.Code != "usage" {
+		t.Fatalf("err = %v, want Error{Code: usage}", err)
+	}
+}
+
+func TestTypeCommandRejectsNilRef(t *testing.T) {
+	l := NewLocal(testPaths(t), "x", LocalOptions{ProcRoot: "/proc"})
+	err := l.TypeCommand(context.Background(), nil, []string{"claude"})
+	if e, ok := err.(*Error); !ok || e.Code != "usage" {
+		t.Fatalf("err = %v, want Error{Code: usage}", err)
 	}
 }
 

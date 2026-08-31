@@ -98,6 +98,9 @@ func (l *Local) Capture(ctx context.Context, ref *session.TmuxRef, jobID string)
 }
 
 func (l *Local) TypeCommand(ctx context.Context, ref *session.TmuxRef, argv []string) error {
+	if ref == nil {
+		return &Error{Code: "usage", Message: "tmux-keys: nil pane ref"}
+	}
 	t, err := l.dial(ctx, ref.SocketPath)
 	if err != nil {
 		return err
