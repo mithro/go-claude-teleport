@@ -411,3 +411,90 @@ func indexRelOf(info *Info) string {
 	}
 	return filepath.Join(".git", "index")
 }
+
+// TestAttachLinkedRefusesWorktreeAppearingSincePreflight: the plan said the
+// destination worktree directory was absent, but something created it
+// between preflight and attach. Attach re-checks and refuses without
+// touching what is there.
+func TestAttachLinkedRefusesWorktreeAppearingSincePreflight(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "b.txt"), "b\n")
+	gitCLI(t, w, "add", "b.txt")
+	gitCLI(t, w, "commit", "-q", "-m", "feat work")
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(w)
+	ds, err := DestStateOf(dstMain, filepath.Join(dstMain, ".worktrees", "feat"), "feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Somebody else got there first, after preflight.
+	survivor := filepath.Join(p.DstWorktree, "theirs.txt")
+	writeFile(t, survivor, "do not clobber\n")
+
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(t.TempDir(), "objects.pack")
+	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var re *RefuseError
+	err = Attach(context.Background(), p, packPath, nil)
+	if !errors.As(err, &re) || !strings.Contains(re.Reason, "already exists") {
+		t.Fatalf("err = %v, want an already-exists *RefuseError", err)
+	}
+	got, rerr := os.ReadFile(survivor)
+	if rerr != nil || string(got) != "do not clobber\n" {
+		t.Errorf("%s = %q (%v), want it untouched", survivor, got, rerr)
+	}
+	if _, err := os.Lstat(worktreeGitDir(p)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("worktree metadata created despite the refusal (%v)", err)
+	}
+}
+
+// TestAttachLinkedRefusesBranchCheckedOutElsewhere: the session branch got
+// checked out somewhere else on the destination between plan and attach.
+func TestAttachLinkedRefusesBranchCheckedOutElsewhere(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	w := addWorktree(t, srcMain, "feat")
+	writeFile(t, filepath.Join(w, "b.txt"), "b\n")
+	gitCLI(t, w, "add", "b.txt")
+	gitCLI(t, w, "commit", "-q", "-m", "feat work")
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	info, _ := Inspect(w)
+	ds, err := DestStateOf(dstMain, filepath.Join(dstMain, ".worktrees", "feat"), "feat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// After preflight the destination checks the branch out elsewhere.
+	gitCLI(t, dstMain, "branch", "feat", root)
+	gitCLI(t, dstMain, "worktree", "add", filepath.Join(dstMain, "other"), "feat")
+
+	var re *RefuseError
+	err = Attach(context.Background(), p, "", nil)
+	if !errors.As(err, &re) || !strings.Contains(re.Reason, "checked out") {
+		t.Fatalf("err = %v, want a checked-out-elsewhere *RefuseError", err)
+	}
+	if _, err := os.Lstat(p.DstWorktree); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("worktree created despite the refusal (%v)", err)
+	}
+}

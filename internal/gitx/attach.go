@@ -114,6 +114,13 @@ func attachExisting(ctx context.Context, p *Plan, packPath string, dirtyFiles ma
 	// Tip) or a genuinely clean one as dirty (index still at the old tree
 	// looks like a staged deletion against the moved ref).
 	var ffState *fastForwardState
+	if p.Linked {
+		// Preflight's DestState can be stale by now; re-check before the
+		// pack is indexed and before anything is written.
+		if err := checkLinkedDestination(p); err != nil {
+			return err
+		}
+	}
 	if !p.Linked {
 		ffState, err = snapshotFastForwardState(p)
 		if err != nil {
@@ -225,15 +232,41 @@ func ensureBranch(repo *git.Repository, p *Plan, tip plumbing.Hash) error {
 	return repo.Storer.CheckAndSetReference(plumbing.NewHashReference(name, tip), cur)
 }
 
+// linkedRerun recognises the signature attachExisting itself leaves behind
+// for a linked worktree: the metadata index plus W/.git. It is the one
+// reason a destination worktree may already exist.
+func linkedRerun(p *Plan) bool {
+	if _, err := os.Stat(filepath.Join(worktreeGitDir(p), "index")); err != nil {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(p.DstWorktree, ".git"))
+	return err == nil
+}
+
+// checkLinkedDestination re-reads the destination just before mutating it:
+// a worktree directory or a checkout of the session branch that appeared
+// since preflight is refused, exactly as PlanTransfer would have.
+func checkLinkedDestination(p *Plan) error {
+	ds, err := DestStateOf(p.DstMain, p.DstWorktree, p.Branch)
+	if err != nil {
+		return err
+	}
+	if ds.WorktreeExists && !linkedRerun(p) {
+		return &RefuseError{Reason: fmt.Sprintf("destination worktree directory %s already exists", p.DstWorktree)}
+	}
+	if ds.BranchCheckedOutElsewhere != "" {
+		return &RefuseError{Reason: fmt.Sprintf("branch %s is already checked out on the destination at %s", p.Branch, ds.BranchCheckedOutElsewhere)}
+	}
+	return nil
+}
+
 // createLinkedWorktree writes the metadata git keeps for a linked worktree
 // and populates the working tree from tip. A second call (re-run) finds the
 // index already present and leaves the tree alone.
 func createLinkedWorktree(p *Plan, tip plumbing.Hash) error {
 	gd := worktreeGitDir(p)
-	if _, err := os.Stat(filepath.Join(gd, "index")); err == nil {
-		if _, err := os.Stat(filepath.Join(p.DstWorktree, ".git")); err == nil {
-			return nil
-		}
+	if linkedRerun(p) {
+		return nil
 	}
 	if err := os.MkdirAll(gd, 0o755); err != nil {
 		return err
