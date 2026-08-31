@@ -592,3 +592,74 @@ func TestCreateLinkedWorktreeRefusesNonEmptyDir(t *testing.T) {
 		t.Errorf("%s = %q (%v), want it untouched", survivor, got, err)
 	}
 }
+
+// TestAttachSameDirDetachedFastForward: a W == M transfer where both sides
+// sit on a detached HEAD. There is no branch to match and no ref to move —
+// the detached HEAD itself advances to the tip and the tree follows.
+func TestAttachSameDirDetachedFastForward(t *testing.T) {
+	srcMain := t.TempDir()
+	repo, root := initRepo(t, srcMain)
+	writeFile(t, filepath.Join(srcMain, "b.txt"), "b\n")
+	second := commitAll(t, repo, "second")
+	gitCLI(t, srcMain, "checkout", "-q", "--detach", second)
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+	gitCLI(t, dstMain, "checkout", "-q", "--detach", root)
+
+	info, err := Inspect(srcMain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Detached {
+		t.Fatalf("fixture wants a detached source, got %+v", info)
+	}
+	ds, err := DestStateOf(dstMain, dstMain, info.Branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ds.WorktreeDetached || ds.WorktreeBranch != "" || !ds.Clean {
+		t.Fatalf("fixture wants a clean detached destination, got %+v", ds)
+	}
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Mode != ModeExistingMain || !p.Detached || p.Linked || !p.NeedPack {
+		t.Fatalf("plan = %+v", p)
+	}
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(t.TempDir(), "objects.pack")
+	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Attach(context.Background(), p, packPath, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "HEAD")); got != second {
+		t.Errorf("HEAD = %s, want %s", got, second)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "--abbrev-ref", "HEAD")); got != "HEAD" {
+		t.Errorf("destination left branch %q, want a detached HEAD", got)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "refs/heads/main")); got != root {
+		t.Errorf("refs/heads/main = %s, want it untouched at %s", got, root)
+	}
+	if got := porcelain(t, dstMain); got != nil {
+		t.Errorf("status = %v, want clean", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(dstMain, "b.txt")); err != nil || string(got) != "b\n" {
+		t.Errorf("b.txt = %q (%v)", got, err)
+	}
+	gitCLI(t, dstMain, "fsck", "--no-dangling")
+
+	// A destination that switched to a branch since preflight is refused.
+	gitCLI(t, dstMain, "checkout", "-q", "main")
+	var re *RefuseError
+	if err := Attach(context.Background(), p, packPath, nil); !errors.As(err, &re) || !strings.Contains(re.Reason, "detached") {
+		t.Fatalf("err = %v, want a detached-HEAD *RefuseError", err)
+	}
+}

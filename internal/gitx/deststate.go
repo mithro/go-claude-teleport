@@ -18,6 +18,7 @@ type DestState struct {
 	BranchTip                 string            // "" if absent
 	WorktreeExists            bool
 	WorktreeBranch            string // branch checked out at worktreeDir if it exists
+	WorktreeDetached          bool   // worktreeDir is a checkout with a detached HEAD
 	Clean                     bool   // for W==M case
 	BranchCheckedOutElsewhere string // path, if the branch is checked out in another worktree
 	// BranchTipReachable is NOT computed by DestStateOf: the orchestrator
@@ -87,6 +88,7 @@ func DestStateOf(mainDir, worktreeDir, branch string) (*DestState, error) {
 			}
 		} else if wi.Root == filepath.Clean(worktreeDir) {
 			st.WorktreeBranch = wi.Branch
+			st.WorktreeDetached = wi.Detached
 			if wi.Root == wi.MainDir {
 				st.Clean = len(wi.Dirty.Staged)+len(wi.Dirty.Modified)+len(wi.Dirty.Untracked)+len(wi.Dirty.Deleted) == 0
 			}

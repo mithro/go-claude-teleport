@@ -123,10 +123,16 @@ func PlanTransfer(src *Info, dst *DestState, pm session.PathMap) (*Plan, error) 
 	if !dst.WorktreeExists {
 		return nil, refuse("destination main checkout %s has no working tree", p.DstMain)
 	}
-	if dst.WorktreeBranch == "" {
+	switch {
+	case src.Detached && dst.WorktreeDetached:
+		// Neither side is on a branch, so there is nothing to match: the
+		// plan carries no branch, Attach skips ensureBranch and moves the
+		// detached HEAD to Tip.
+	case src.Detached:
+		return nil, refuse("destination checkout %s has branch %q checked out, the session is on a detached HEAD (%s)", p.DstMain, dst.WorktreeBranch, short(src.Head))
+	case dst.WorktreeBranch == "":
 		return nil, refuse("destination checkout %s has no branch checked out (detached HEAD, or not a checkout of this repository), session branch is %q", p.DstMain, src.Branch)
-	}
-	if dst.WorktreeBranch != src.Branch {
+	case dst.WorktreeBranch != src.Branch:
 		return nil, refuse("destination checkout %s has branch %q checked out, session branch is %q", p.DstMain, dst.WorktreeBranch, src.Branch)
 	}
 	if !dst.Clean {

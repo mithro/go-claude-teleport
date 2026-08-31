@@ -27,6 +27,11 @@ func mainInfo() *Info {
 		Branch: "main", Head: tip, RootCommit: rootA}
 }
 
+func detachedMainInfo() *Info {
+	return &Info{Root: "/home/alice/github/x", CommonDir: "/home/alice/github/x/.git", MainDir: "/home/alice/github/x",
+		Head: tip, Detached: true, RootCommit: rootA}
+}
+
 func detachedInfo() *Info {
 	return &Info{Root: "/home/alice/github/x/.worktrees/feat", CommonDir: "/home/alice/github/x/.git", MainDir: "/home/alice/github/x",
 		IsLinked: true, WorktreeName: "feat", Head: tip, Detached: true, RootCommit: rootA}
@@ -67,6 +72,10 @@ func TestPlanTransferTable(t *testing.T) {
 		{"W==M no working tree", mainInfo(), &DestState{MainExists: true, RootCommit: rootA}, "", false, false, "no working tree"},
 		{"existing main, empty dest repository", linkedInfo(), &DestState{MainExists: true, RootCommit: ""}, "", false, false, "empty repository"},
 		{"W==M dest has no branch checked out", mainInfo(), &DestState{MainExists: true, RootCommit: rootA, WorktreeExists: true, WorktreeBranch: "", Clean: true, BranchTip: tip}, "", false, false, "no branch checked out"},
+		{"W==M detached both sides", detachedMainInfo(), &DestState{MainExists: true, RootCommit: rootA, WorktreeExists: true, WorktreeDetached: true, Clean: true}, ModeExistingMain, false, true, ""},
+		{"W==M detached both sides, dest already at tip", detachedMainInfo(), &DestState{MainExists: true, RootCommit: rootA, WorktreeExists: true, WorktreeDetached: true, Clean: true, RefTips: map[string]string{"refs/heads/main": tip}}, ModeExistingMain, false, false, ""},
+		{"W==M detached src, dest on a branch", detachedMainInfo(), &DestState{MainExists: true, RootCommit: rootA, WorktreeExists: true, WorktreeBranch: "main", Clean: true, RefTips: map[string]string{"refs/heads/main": older}}, "", false, false, "detached HEAD"},
+		{"W==M detached src, dest not clean", detachedMainInfo(), &DestState{MainExists: true, RootCommit: rootA, WorktreeExists: true, WorktreeDetached: true, Clean: false}, "", false, false, "not clean"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

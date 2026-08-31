@@ -169,7 +169,7 @@ func attachExisting(ctx context.Context, p *Plan, packPath string, dirtyFiles ma
 		}
 	} else {
 		gitdir = filepath.Join(p.DstMain, ".git")
-		if err := fastForwardMainCheckout(p, tip, ffState); err != nil {
+		if err := fastForwardMainCheckout(ctx, p, tip, ffState); err != nil {
 			return err
 		}
 	}
@@ -342,6 +342,7 @@ type fastForwardState struct {
 	alreadyAtTip bool
 	clean        bool
 	branch       string
+	detached     bool   // the checkout was on a detached HEAD
 	head         string // the commit the checkout sat on before the attach
 }
 
@@ -354,17 +355,21 @@ func snapshotFastForwardState(p *Plan) (*fastForwardState, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &fastForwardState{alreadyAtTip: cur.Head == p.Tip, clean: ds.Clean, branch: ds.WorktreeBranch, head: cur.Head}, nil
+	return &fastForwardState{alreadyAtTip: cur.Head == p.Tip, clean: ds.Clean, branch: ds.WorktreeBranch, detached: cur.Detached, head: cur.Head}, nil
 }
 
 // checkFastForwardState is the W == M gate: the destination checkout must
-// still be clean and on the session branch. It is evaluated before
-// attachExisting mutates anything.
+// still be clean and on the session branch — or, for a detached session,
+// still detached. It is evaluated before attachExisting mutates anything.
 func checkFastForwardState(p *Plan, st *fastForwardState) error {
-	if st.branch != p.Branch {
-		if st.branch == "" {
-			return &RefuseError{Reason: fmt.Sprintf("destination checkout %s has no branch checked out, session branch is %q", p.DstMain, p.Branch)}
-		}
+	switch {
+	case p.Detached && st.detached:
+		// Nothing to match; the detached HEAD is moved to Tip below.
+	case p.Detached:
+		return &RefuseError{Reason: fmt.Sprintf("destination checkout %s is on %q, the session is on a detached HEAD (%s)", p.DstMain, st.branch, short(p.Tip))}
+	case st.branch == "":
+		return &RefuseError{Reason: fmt.Sprintf("destination checkout %s has no branch checked out, session branch is %q", p.DstMain, p.Branch)}
+	case st.branch != p.Branch:
 		return &RefuseError{Reason: fmt.Sprintf("destination checkout %s is on %q, not %q", p.DstMain, st.branch, p.Branch)}
 	}
 	if !st.clean {
@@ -375,9 +380,12 @@ func checkFastForwardState(p *Plan, st *fastForwardState) error {
 
 // fastForwardMainCheckout handles W == M: HEAD moves to tip. The gate
 // above has already run.
-func fastForwardMainCheckout(p *Plan, tip plumbing.Hash, st *fastForwardState) error {
+func fastForwardMainCheckout(ctx context.Context, p *Plan, tip plumbing.Hash, st *fastForwardState) error {
 	if st.alreadyAtTip {
-		return nil // already there (re-run after the dirty state was applied)
+		// HEAD is at Tip already: an idempotent re-run of a transfer that
+		// landed. (The gate above has already established the checkout is
+		// still clean, so there is nothing to move and nothing to lose.)
+		return nil
 	}
 	repo, err := git.PlainOpenWithOptions(p.DstMain, &git.PlainOpenOptions{EnableDotGitCommonDir: true})
 	if err != nil {
@@ -395,7 +403,7 @@ func fastForwardMainCheckout(p *Plan, tip plumbing.Hash, st *fastForwardState) e
 		return fmt.Errorf("fast-forward %s to %s: %w", p.DstMain, short(p.Tip), err)
 	}
 	// The working tree is then updated only where the two trees differ.
-	if err := applyTreeDiff(repo, p.DstMain, plumbing.NewHash(st.head), tip); err != nil {
+	if err := applyTreeDiff(ctx, repo, p.DstMain, plumbing.NewHash(st.head), tip); err != nil {
 		return fmt.Errorf("fast-forward %s to %s: %w", p.DstMain, short(p.Tip), err)
 	}
 	return nil
@@ -403,7 +411,7 @@ func fastForwardMainCheckout(p *Plan, tip plumbing.Hash, st *fastForwardState) e
 
 // applyTreeDiff checks out into dir exactly the paths in which the trees of
 // from and to differ, leaving everything else on disk untouched.
-func applyTreeDiff(repo *git.Repository, dir string, from, to plumbing.Hash) error {
+func applyTreeDiff(ctx context.Context, repo *git.Repository, dir string, from, to plumbing.Hash) error {
 	fromTree, err := treeOfCommit(repo, from)
 	if err != nil {
 		return err
@@ -412,7 +420,12 @@ func applyTreeDiff(repo *git.Repository, dir string, from, to plumbing.Hash) err
 	if err != nil {
 		return err
 	}
-	changes, err := object.DiffTree(fromTree, toTree)
+	// Rename detection is pinned OFF: with it on, a delete/insert pair
+	// collapses into one Modify whose From and To names differ, and the
+	// delete arm below would never run (leaving the old path on disk).
+	// object.DiffTree defaults to off today but go-git v6 flips that, so
+	// the options are passed explicitly rather than relied upon.
+	changes, err := object.DiffTreeWithOptions(ctx, fromTree, toTree, &object.DiffTreeOptions{})
 	if err != nil {
 		return err
 	}
