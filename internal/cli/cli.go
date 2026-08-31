@@ -91,5 +91,6 @@ func (a *app) rootCmd() *cobra.Command {
 		},
 	}
 	root.AddCommand(a.versionCmd())
+	root.AddCommand(a.internalFreezerCmd())
 	return root
 }
