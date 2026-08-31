@@ -129,21 +129,21 @@ func TestAttachExistingMainCreatesWorktreeAndAppliesDirty(t *testing.T) {
 	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	dirty := map[string]string{}
+	dirty := map[string]DirtyFile{}
 	for i, rel := range []string{"README.md", "new.txt", "staged.txt"} {
 		staged := filepath.Join(staging, string(rune('a'+i)))
 		b, _ := os.ReadFile(filepath.Join(w, rel))
-		if err := os.WriteFile(staged, b, 0o644); err != nil {
+		if err := os.WriteFile(staged, b, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		dirty[filepath.Join(p.DstWorktree, rel)] = staged
+		dirty[filepath.Join(p.DstWorktree, rel)] = DirtyFile{Src: staged, Mode: 0o644}
 	}
 	idxStaged := filepath.Join(staging, "index")
 	b, _ := os.ReadFile(filepath.Join(srcMain, p.IndexRel))
 	if err := os.WriteFile(idxStaged, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	dirty[filepath.Join(p.DstMain, p.IndexRel)] = idxStaged
+	dirty[filepath.Join(p.DstMain, p.IndexRel)] = DirtyFile{Src: idxStaged}
 
 	if err := Attach(context.Background(), p, packPath, dirty); err != nil {
 		t.Fatal(err)
@@ -160,6 +160,16 @@ func TestAttachExistingMainCreatesWorktreeAndAppliesDirty(t *testing.T) {
 	}
 	if got := gitCLI(t, dstW, "diff", "--cached", "--name-only"); strings.TrimSpace(got) != "staged.txt" {
 		t.Errorf("staged diff = %q", got)
+	}
+	// The recorded DirtyFile.Mode wins over the staged copy's own mode.
+	for _, rel := range []string{"README.md", "new.txt", "staged.txt"} {
+		st, err := os.Stat(filepath.Join(dstW, rel))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Mode().Perm() != 0o644 {
+			t.Errorf("%s mode = %o, want 644 (DirtyFile.Mode)", rel, st.Mode().Perm())
+		}
 	}
 	gitCLI(t, dstMain, "fsck", "--no-dangling")
 	// Re-running attach after success is a no-op that does not clobber the dirty state.
@@ -203,7 +213,10 @@ func TestAttachSameDirFastForward(t *testing.T) {
 	idxStaged := filepath.Join(staging, "index")
 	b, _ := os.ReadFile(filepath.Join(srcMain, ".git", "index"))
 	os.WriteFile(idxStaged, b, 0o644)
-	dirty := map[string]string{filepath.Join(dstMain, "new.txt"): newStaged, filepath.Join(dstMain, ".git", "index"): idxStaged}
+	dirty := map[string]DirtyFile{
+		filepath.Join(dstMain, "new.txt"):       {Src: newStaged},
+		filepath.Join(dstMain, ".git", "index"): {Src: idxStaged},
+	}
 	if err := Attach(context.Background(), p, packPath, dirty); err != nil {
 		t.Fatal(err)
 	}

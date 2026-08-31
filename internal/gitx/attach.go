@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -14,8 +15,17 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 )
 
-// Attach performs the destination side of spec §8.
-func Attach(ctx context.Context, p *Plan, packPath string, dirtyFiles map[string]string) error {
+// DirtyFile is one dirty worktree file (or the index) staged on the
+// destination host: Src is the staged copy, Mode the mode it must land
+// with. A zero Mode means "keep the staged file's own mode".
+type DirtyFile struct {
+	Src  string
+	Mode fs.FileMode
+}
+
+// Attach performs the destination side of spec §8. dirtyFiles maps the
+// absolute destination path to the staged copy to install there.
+func Attach(ctx context.Context, p *Plan, packPath string, dirtyFiles map[string]DirtyFile) error {
 	switch p.Mode {
 	case ModeNotRepo:
 		return nil
@@ -32,6 +42,12 @@ func Attach(ctx context.Context, p *Plan, packPath string, dirtyFiles map[string
 
 func worktreeGitDir(p *Plan) string {
 	return filepath.Join(p.DstMain, ".git", "worktrees", p.WorktreeName)
+}
+
+// indexDestPath is where the transferred index file lands on the
+// destination (M/.git/index, or M/.git/worktrees/<n>/index when linked).
+func indexDestPath(p *Plan) string {
+	return filepath.Join(p.DstMain, filepath.FromSlash(p.IndexRel))
 }
 
 // writeIfDifferent writes content to path unless it already holds it.
@@ -58,7 +74,7 @@ func repairLinkedMetadata(p *Plan) error {
 	return nil
 }
 
-func attachExisting(ctx context.Context, p *Plan, packPath string, dirtyFiles map[string]string) error {
+func attachExisting(ctx context.Context, p *Plan, packPath string, dirtyFiles map[string]DirtyFile) error {
 	repo, err := git.PlainOpenWithOptions(p.DstMain, &git.PlainOpenOptions{EnableDotGitCommonDir: true})
 	if err != nil {
 		return fmt.Errorf("open %s: %w", p.DstMain, err)
@@ -106,17 +122,17 @@ func attachExisting(ctx context.Context, p *Plan, packPath string, dirtyFiles ma
 			return err
 		}
 	}
-	indexDst := filepath.Join(p.DstMain, p.IndexRel)
-	if staged, ok := dirtyFiles[indexDst]; ok {
-		if err := copyFile(staged, filepath.Join(gitdir, "index")); err != nil {
+	indexDst := indexDestPath(p)
+	if df, ok := dirtyFiles[indexDst]; ok {
+		if err := copyFile(df, filepath.Join(gitdir, "index")); err != nil {
 			return fmt.Errorf("apply index: %w", err)
 		}
 	}
-	for dst, staged := range dirtyFiles {
+	for dst, df := range dirtyFiles {
 		if dst == indexDst {
 			continue
 		}
-		if err := copyFile(staged, dst); err != nil {
+		if err := copyFile(df, dst); err != nil {
 			return fmt.Errorf("apply dirty file %s: %w", dst, err)
 		}
 	}
@@ -255,10 +271,17 @@ func fastForwardMainCheckout(p *Plan, tip plumbing.Hash, st *fastForwardState) e
 	return nil
 }
 
-func copyFile(src, dst string) error {
+// copyFile installs df.Src at dst with df.Mode (the staged file's own mode
+// when df.Mode is zero).
+func copyFile(df DirtyFile, dst string) error {
+	src := df.Src
 	st, err := os.Stat(src)
 	if err != nil {
 		return err
+	}
+	mode := df.Mode.Perm()
+	if df.Mode == 0 {
+		mode = st.Mode().Perm()
 	}
 	in, err := os.Open(src)
 	if err != nil {
@@ -269,7 +292,7 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	tmp := dst + ".claude-teleport.tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, st.Mode().Perm())
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
 	if err != nil {
 		return err
 	}
@@ -279,6 +302,10 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, mode); err != nil {
 		os.Remove(tmp)
 		return err
 	}

@@ -153,7 +153,7 @@ func TestAttachSameDirSecondRunIsNoOp(t *testing.T) {
 	if err := os.WriteFile(idxStaged, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	dirty := map[string]string{filepath.Join(p.DstMain, p.IndexRel): idxStaged}
+	dirty := map[string]DirtyFile{filepath.Join(p.DstMain, p.IndexRel): {Src: idxStaged}}
 
 	if err := Attach(context.Background(), p, packPath, dirty); err != nil {
 		t.Fatal(err)
