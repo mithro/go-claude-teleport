@@ -131,6 +131,29 @@ func TestBuildRawHashWithoutRewrite(t *testing.T) {
 	}
 }
 
+// TestBuildStatFallbackForZeroModeModTime covers a Task 10 gap (controller
+// ruling 2): a FileEntry built without a stat (Mode==0, zero ModTime — as
+// Plan 03's capture entry does) still ends up with the real file's Mode and
+// ModTime in the manifest, via Build's os.Stat fallback.
+func TestBuildStatFallbackForZeroModeModTime(t *testing.T) {
+	cfg, _, files := sourceTree(t)
+	f := files[1] // the transcript, a real regular file
+	f.Mode = 0
+	f.ModTime = time.Time{}
+	m, err := Build(context.Background(), sid, session.ID(sid), "a", "b", []session.FileEntry{f}, session.NewPathMap())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.Stat(filepath.Join(cfg, "projects/-home-alice-work", sid+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := m.Entries[0]
+	if got.Mode != uint32(want.Mode()) || !got.ModTime.Equal(want.ModTime()) {
+		t.Errorf("stat fallback: Mode=%v (want %v) ModTime=%v (want %v)", got.Mode, uint32(want.Mode()), got.ModTime, want.ModTime())
+	}
+}
+
 func TestBuildRefusesForbiddenPaths(t *testing.T) {
 	cfg, _, _ := sourceTree(t)
 	forbidden := []string{".credentials.json", "sessions/12345.json", "sessions/12345.abcd.key", "settings.json", "plugins/installed_plugins.json", ".claude.json"}

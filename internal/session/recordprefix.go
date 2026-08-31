@@ -36,11 +36,7 @@ func IsRecordPrefix(existing, incoming string) (bool, error) {
 			prefix = false
 			return errStopScan
 		}
-		eq, err := recordsEqual(eLine, iLine)
-		if err != nil {
-			return fmt.Errorf("is-record-prefix: %w", err)
-		}
-		if !eq {
+		if !recordsEqual(eLine, iLine) {
 			prefix = false
 			return errStopScan
 		}
@@ -74,14 +70,14 @@ func nextNonBlankLine(sc *bufio.Scanner) ([]byte, bool, error) {
 // recordsEqual compares two JSONL lines by JSON semantic equality (UseNumber
 // decode, then deep-equal); if either side fails to parse, it falls back to
 // an exact byte comparison of the two lines.
-func recordsEqual(a, b []byte) (bool, error) {
+func recordsEqual(a, b []byte) bool {
 	av, aErr := decodeOne(a)
 	if aErr != nil {
-		return bytes.Equal(a, b), nil
+		return bytes.Equal(a, b)
 	}
 	bv, bErr := decodeOne(b)
 	if bErr != nil {
-		return bytes.Equal(a, b), nil
+		return bytes.Equal(a, b)
 	}
-	return reflect.DeepEqual(av, bv), nil
+	return reflect.DeepEqual(av, bv)
 }
