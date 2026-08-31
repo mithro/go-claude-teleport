@@ -1,6 +1,8 @@
 package claudecfg
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -71,6 +73,34 @@ func hashShort(h string) string {
 		return h[:12]
 	}
 	return h
+}
+
+// configHash is the hex sha256 of a canonical config string; "" (rendered
+// "(absent)" by hashShort) when the config itself is absent. Never render
+// an MCP server's raw config: it may carry tokens or auth headers.
+func configHash(canonicalConfig string) string {
+	if canonicalConfig == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(canonicalConfig))
+	return hex.EncodeToString(h[:])
+}
+
+// envSummary describes a settings.env map without ever rendering a value
+// (env commonly carries secrets like ANTHROPIC_AUTH_TOKEN): sorted key
+// names plus a short hash of the full key=value content, so drift in
+// values still shows up as a differing hash.
+func envSummary(env map[string]string) string {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	h := sha256.New()
+	for _, k := range keys {
+		fmt.Fprintf(h, "%s=%s\n", k, env[k])
+	}
+	return fmt.Sprintf("keys%v %s", keys, hashShort(hex.EncodeToString(h.Sum(nil))))
 }
 
 func sortedKeys[V any](maps ...map[string]V) []string {
@@ -180,15 +210,15 @@ func Compare(src, dst *Inventory, usage *session.Usage) Report {
 		used := usedOr(usage2map(usage), name)
 		switch {
 		case !ok:
-			add(classIf(used), "mcp."+name, short(sc), "(absent)", "MCP server absent on destination")
+			add(classIf(used), "mcp."+name, hashShort(configHash(sc)), "(absent)", "MCP server absent on destination")
 		case sc != dc:
-			add(classIf(used), "mcp."+name, short(sc), short(dc), "MCP server configured differently")
+			add(classIf(used), "mcp."+name, hashShort(configHash(sc)), hashShort(configHash(dc)), "MCP server configured differently")
 		}
 	}
 	for _, name := range sortedKeys(dst.MCPServers, dst.ProjectMCP) {
 		if _, ok := mcpConfig(src, name); !ok {
 			dc, _ := mcpConfig(dst, name)
-			add(Warn, "mcp."+name, "(absent)", short(dc), "MCP server only on destination")
+			add(Warn, "mcp."+name, "(absent)", hashShort(configHash(dc)), "MCP server only on destination")
 		}
 	}
 	if src.ProjectPresent && dst.ProjectPresent {
@@ -247,7 +277,7 @@ func Compare(src, dst *Inventory, usage *session.Usage) Report {
 		add(Warn, "effortLevel", short(src.Effort), short(dst.Effort), "effortLevel differs")
 	}
 	if !sameMap(src.Env, dst.Env) {
-		add(Warn, "env", short(fmt.Sprint(src.Env)), short(fmt.Sprint(dst.Env)), "settings env differs")
+		add(Warn, "env", envSummary(src.Env), envSummary(dst.Env), "settings env differs")
 	}
 	if src.ProjectPresent && dst.ProjectPresent && !sameSet(src.AllowedTools, dst.AllowedTools) {
 		add(Warn, "allowedTools", short(strings.Join(src.AllowedTools, ",")), short(strings.Join(dst.AllowedTools, ",")), "project allowedTools differ")
