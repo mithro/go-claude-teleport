@@ -14,7 +14,14 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 )
 
-type Dirty struct{ Staged, Modified, Untracked, Deleted []string }
+// Dirty is nested in Info and Plan, so it crosses the protocol too; tags
+// pin Go-name marshaling exactly (no wire change), as on Info and Plan.
+type Dirty struct {
+	Staged    []string `json:"Staged"`
+	Modified  []string `json:"Modified"`
+	Untracked []string `json:"Untracked"`
+	Deleted   []string `json:"Deleted"`
+}
 
 // Info crosses the protocol (inventory-git). The json tags reproduce
 // Go-name marshaling EXACTLY (field F -> "F"), so they changed no wire
