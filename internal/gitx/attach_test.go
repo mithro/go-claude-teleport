@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -496,5 +497,98 @@ func TestAttachLinkedRefusesBranchCheckedOutElsewhere(t *testing.T) {
 	}
 	if _, err := os.Lstat(p.DstWorktree); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("worktree created despite the refusal (%v)", err)
+	}
+}
+
+// TestAttachSameDirFastForwardKeepsIgnoredFiles: go-git's HardReset walks
+// the worktree with excludeIgnoredChanges = false, so a blanket reset
+// deletes ignored-but-present destination files (build output, node_modules
+// …). A fast-forward must move only the paths the two trees differ in.
+func TestAttachSameDirFastForwardKeepsIgnoredFiles(t *testing.T) {
+	srcMain := t.TempDir()
+	repo, _ := initRepo(t, srcMain)
+	writeFile(t, filepath.Join(srcMain, ".gitignore"), "build/\n")
+	base := commitAll(t, repo, "ignore")
+	writeFile(t, filepath.Join(srcMain, "b.txt"), "b\n")
+	writeFile(t, filepath.Join(srcMain, "README.md"), "hello again\n")
+	tip := commitAll(t, repo, "second")
+
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, base)
+	// Ignored build output the destination already has on disk.
+	ignored := filepath.Join(dstMain, "build", "out.bin")
+	writeFile(t, ignored, "expensive artifact\n")
+	if got := porcelain(t, dstMain); got != nil {
+		t.Fatalf("fixture destination must look clean, got %v", got)
+	}
+
+	info, _ := Inspect(srcMain)
+	ds, _ := DestStateOf(dstMain, dstMain, "main")
+	ds.BranchTipReachable, _ = IsAncestor(srcMain, ds.BranchTip, info.Head)
+	p, err := PlanTransfer(info, ds, pathMap(srcMain, dstMain))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.FastForward || p.Tip != tip {
+		t.Fatalf("fixture wants a fast-forward plan, got %+v", p)
+	}
+	var pack bytes.Buffer
+	if err := WritePack(context.Background(), srcMain, []string{p.Tip}, p.HaveTips, &pack); err != nil {
+		t.Fatal(err)
+	}
+	packPath := filepath.Join(t.TempDir(), "objects.pack")
+	if err := os.WriteFile(packPath, pack.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Attach(context.Background(), p, packPath, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := os.ReadFile(ignored); err != nil || string(got) != "expensive artifact\n" {
+		t.Errorf("%s = %q (%v), want it to survive the fast-forward", ignored, got, err)
+	}
+	if got := porcelain(t, dstMain); got != nil {
+		t.Errorf("destination status after fast-forward = %v, want clean", got)
+	}
+	if got := strings.TrimSpace(gitCLI(t, dstMain, "rev-parse", "HEAD")); got != tip {
+		t.Errorf("HEAD = %s, want %s", got, tip)
+	}
+	// The tracked change actually landed.
+	for rel, want := range map[string]string{"b.txt": "b\n", "README.md": "hello again\n"} {
+		if got, err := os.ReadFile(filepath.Join(dstMain, rel)); err != nil || string(got) != want {
+			t.Errorf("%s = %q (%v), want %q", rel, got, err, want)
+		}
+	}
+	gitCLI(t, dstMain, "fsck", "--no-dangling")
+}
+
+// TestCreateLinkedWorktreeRefusesNonEmptyDir guards the populate step
+// itself: go-git's hard reset is only safe on the empty directory attach
+// just made, so createLinkedWorktree refuses anything else outright rather
+// than deleting files it does not own.
+func TestCreateLinkedWorktreeRefusesNonEmptyDir(t *testing.T) {
+	srcMain := t.TempDir()
+	_, root := initRepo(t, srcMain)
+	dstMain := filepath.Join(t.TempDir(), "x")
+	initRepoAt(t, dstMain, srcMain, root)
+
+	p := &Plan{
+		Mode: ModeExistingMain, Linked: true, WorktreeName: "feat", Branch: "main",
+		DstMain: dstMain, DstWorktree: filepath.Join(dstMain, ".worktrees", "feat"),
+		Tip: root, IndexRel: ".git/worktrees/feat/index",
+	}
+	survivor := filepath.Join(p.DstWorktree, "theirs.txt")
+	writeFile(t, survivor, "do not clobber\n")
+
+	var re *RefuseError
+	err := createLinkedWorktree(p, plumbing.NewHash(root))
+	if !errors.As(err, &re) || !strings.Contains(re.Reason, "not empty") {
+		t.Fatalf("err = %v, want a not-empty *RefuseError", err)
+	}
+	if !strings.Contains(re.Reason, "theirs.txt") {
+		t.Errorf("Reason = %q, want it to name the offending entry", re.Reason)
+	}
+	if got, err := os.ReadFile(survivor); err != nil || string(got) != "do not clobber\n" {
+		t.Errorf("%s = %q (%v), want it untouched", survivor, got, err)
 	}
 }

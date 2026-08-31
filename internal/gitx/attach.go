@@ -14,7 +14,10 @@ import (
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/utils/merkletrie"
 )
 
 // DirtyFile is one dirty worktree file (or the index) staged on the
@@ -284,6 +287,17 @@ func createLinkedWorktree(p *Plan, tip plumbing.Hash) error {
 	if err := os.MkdirAll(p.DstWorktree, 0o755); err != nil {
 		return err
 	}
+	// The reset below populates the tree from tip, and go-git's hard reset
+	// deletes every on-disk path the tip tree does not carry (ignored files
+	// included). That is only safe on the empty directory just created:
+	// anything already here belongs to somebody else.
+	names, err := someEntryNames(p.DstWorktree, 5)
+	if err != nil {
+		return err
+	}
+	if len(names) > 0 {
+		return &RefuseError{Reason: fmt.Sprintf("destination worktree directory %s is not empty (%s)", p.DstWorktree, strings.Join(names, ", "))}
+	}
 	if err := repairLinkedMetadata(p); err != nil {
 		return err
 	}
@@ -301,12 +315,31 @@ func createLinkedWorktree(p *Plan, tip plumbing.Hash) error {
 	return nil
 }
 
+// someEntryNames lists up to max names in dir (sorted, as os.ReadDir
+// returns them) so a refusal can point at what is in the way.
+func someEntryNames(dir string, max int) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if len(names) == max {
+			names = append(names, "…")
+			break
+		}
+		names = append(names, e.Name())
+	}
+	return names, nil
+}
+
 // fastForwardState is the W == M checkout state as it stood before
 // attachExisting mutated anything (see the snapshot comment above its call).
 type fastForwardState struct {
 	alreadyAtTip bool
 	clean        bool
 	branch       string
+	head         string // the commit the checkout sat on before the attach
 }
 
 func snapshotFastForwardState(p *Plan) (*fastForwardState, error) {
@@ -318,7 +351,7 @@ func snapshotFastForwardState(p *Plan) (*fastForwardState, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &fastForwardState{alreadyAtTip: cur.Head == p.Tip, clean: ds.Clean, branch: ds.WorktreeBranch}, nil
+	return &fastForwardState{alreadyAtTip: cur.Head == p.Tip, clean: ds.Clean, branch: ds.WorktreeBranch, head: cur.Head}, nil
 }
 
 // checkFastForwardState is the W == M gate: the destination checkout must
@@ -351,10 +384,110 @@ func fastForwardMainCheckout(p *Plan, tip plumbing.Hash, st *fastForwardState) e
 	if err != nil {
 		return err
 	}
-	if err := wt.Reset(&git.ResetOptions{Mode: git.HardReset, Commit: tip}); err != nil {
+	// MixedReset, not HardReset: it moves HEAD and rewrites the index but
+	// leaves the working tree alone. go-git's hard reset walks the worktree
+	// with excludeIgnoredChanges = false, so it deletes every on-disk path
+	// the tip tree does not carry — ignored build output included.
+	if err := wt.Reset(&git.ResetOptions{Mode: git.MixedReset, Commit: tip}); err != nil {
+		return fmt.Errorf("fast-forward %s to %s: %w", p.DstMain, short(p.Tip), err)
+	}
+	// The working tree is then updated only where the two trees differ.
+	if err := applyTreeDiff(repo, p.DstMain, plumbing.NewHash(st.head), tip); err != nil {
 		return fmt.Errorf("fast-forward %s to %s: %w", p.DstMain, short(p.Tip), err)
 	}
 	return nil
+}
+
+// applyTreeDiff checks out into dir exactly the paths in which the trees of
+// from and to differ, leaving everything else on disk untouched.
+func applyTreeDiff(repo *git.Repository, dir string, from, to plumbing.Hash) error {
+	fromTree, err := treeOfCommit(repo, from)
+	if err != nil {
+		return err
+	}
+	toTree, err := treeOfCommit(repo, to)
+	if err != nil {
+		return err
+	}
+	changes, err := object.DiffTree(fromTree, toTree)
+	if err != nil {
+		return err
+	}
+	for _, ch := range changes {
+		action, err := ch.Action()
+		if err != nil {
+			return err
+		}
+		switch action {
+		case merkletrie.Delete:
+			if err := removeTracked(dir, ch.From.Name); err != nil {
+				return err
+			}
+		case merkletrie.Insert, merkletrie.Modify:
+			if err := checkoutEntry(repo, dir, ch.To.Name, ch.To.TreeEntry); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func treeOfCommit(repo *git.Repository, h plumbing.Hash) (*object.Tree, error) {
+	c, err := repo.CommitObject(h)
+	if err != nil {
+		return nil, fmt.Errorf("commit %s: %w", short(h.String()), err)
+	}
+	return c.Tree()
+}
+
+// removeTracked deletes one tracked path and any parent directories it
+// leaves empty (as git does), stopping at dir.
+func removeTracked(dir, name string) error {
+	abs := filepath.Join(dir, filepath.FromSlash(name))
+	if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for parent := filepath.Dir(abs); parent != dir && len(parent) > len(dir); parent = filepath.Dir(parent) {
+		if err := os.Remove(parent); err != nil {
+			return nil // not empty (or gone): stop pruning
+		}
+	}
+	return nil
+}
+
+// checkoutEntry writes one tree entry to disk, replacing whatever is there.
+func checkoutEntry(repo *git.Repository, dir, name string, e object.TreeEntry) error {
+	if e.Mode == filemode.Submodule {
+		return nil // submodules are not populated by the attach
+	}
+	blob, err := repo.BlobObject(e.Hash)
+	if err != nil {
+		return fmt.Errorf("blob %s for %s: %w", short(e.Hash.String()), name, err)
+	}
+	r, err := blob.Reader()
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	content, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	abs := filepath.Join(dir, filepath.FromSlash(name))
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		return err
+	}
+	if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if e.Mode == filemode.Symlink {
+		return os.Symlink(string(content), abs)
+	}
+	mode, err := e.Mode.ToOSFileMode()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(abs, content, mode.Perm())
 }
 
 // copyFile installs df.Src at dst with df.Mode (the staged file's own mode
