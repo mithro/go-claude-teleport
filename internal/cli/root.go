@@ -97,6 +97,9 @@ func (a *app) rootCmd() *cobra.Command {
 		},
 	}
 	root.SetHelpTemplate("{{.Long}}\n")
+	root.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
+		return Exit(ExitUsage, "%v", err)
+	})
 	f := root.Flags()
 	f.SetNormalizeFunc(flagAliases)
 	f.StringVar(&tf.To, "teleport-to", "", "destination host (alias --to)")

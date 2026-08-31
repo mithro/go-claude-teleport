@@ -2,9 +2,16 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
+
+// errWriter always fails to write, so a command that writes its result
+// straight to a.stdout (e.g. version) returns a plain, non-*ExitError error.
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, errors.New("write boom") }
 
 func run(t *testing.T, env []string, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
@@ -30,6 +37,17 @@ func TestUnknownFlagIsUsageError(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "claude-teleport:") {
 		t.Fatalf("stderr = %q", stderr)
+	}
+}
+
+func TestPlainErrorExitsFailed(t *testing.T) {
+	var errb bytes.Buffer
+	code := Main([]string{"version"}, strings.NewReader(""), errWriter{}, &errb, nil)
+	if code != ExitFailed {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
+	}
+	if !strings.Contains(errb.String(), "claude-teleport:") {
+		t.Fatalf("stderr = %q", errb.String())
 	}
 }
 

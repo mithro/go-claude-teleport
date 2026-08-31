@@ -77,7 +77,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer, env []string
 		return ee.Code
 	}
 	fmt.Fprintln(stderr, "claude-teleport:", err)
-	return ExitUsage
+	return ExitFailed
 }
 
 // resolvePaths computes the local session.Paths from HOME, CLAUDE_CONFIG_DIR
