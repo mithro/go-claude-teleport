@@ -22,7 +22,6 @@ type walkOptions struct {
 	skipDirs map[string]bool   // absolute dirs never entered
 	excludes []string          // path.Match patterns on the slash-relative path
 	matcher  gitignore.Matcher // nil = no ignore handling
-	worktree string            // when set, entries under it get CatWorktree
 }
 
 // Files lists what to move for the plan (spec §8).
@@ -46,13 +45,10 @@ func filesFreshMain(p *Plan, excludes []string, includeIgnored bool) ([]session.
 	skip := map[string]bool{}
 	for _, o := range info.OtherWorktrees {
 		skip[o] = true
-	}
-	others, err := linkedWorktrees(info.CommonDir)
-	if err != nil {
-		return nil, err
-	}
-	for name := range others {
-		if name != info.WorktreeName {
+		// Also skip the .git/worktrees/<name> metadata directory by extracting name from gitdir.
+		dotGitFile := filepath.Join(o, ".git")
+		if gd, err := readGitdirFile(dotGitFile); err == nil {
+			name := filepath.Base(gd)
 			skip[filepath.Join(info.CommonDir, "worktrees", name)] = true
 		}
 	}
@@ -184,11 +180,6 @@ func walk(o walkOptions) ([]session.FileEntry, error) {
 		}
 		rel = filepath.ToSlash(rel)
 		if rel != "" {
-			// Skip .gitignore files (in-repo; part of repo state, not separate transfer)
-			// and .git/info/exclude (local git config)
-			if rel == ".gitignore" || rel == ".git/info/exclude" {
-				return nil
-			}
 			if excluded(rel, o.excludes) {
 				if d.IsDir() {
 					return filepath.SkipDir

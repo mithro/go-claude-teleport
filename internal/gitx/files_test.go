@@ -67,8 +67,8 @@ func TestFilesFreshMainLinked(t *testing.T) {
 			t.Errorf("missing repo entry %q; have %v", want, rels(files, session.CatRepo))
 		}
 	}
-	// Our worktree travels as "worktree", including its .git file.
-	if diff := cmp.Diff([]string{"", ".git", "README.md", "src.go"}, rels(files, session.CatWorktree)); diff != "" {
+	// Our worktree travels as "worktree", including its .git file and .gitignore.
+	if diff := cmp.Diff([]string{"", ".git", ".gitignore", "README.md", "src.go"}, rels(files, session.CatWorktree)); diff != "" {
 		t.Errorf("worktree entries (-want +got):\n%s", diff)
 	}
 	// Excluded: other worktree dir + metadata, ignored files, glob.
@@ -76,6 +76,10 @@ func TestFilesFreshMainLinked(t *testing.T) {
 		if has(files, no) {
 			t.Errorf("entry %q must not be transferred", no)
 		}
+	}
+	// .gitignore must be present in repo entries (transferred with repository content).
+	if !has(files, ".gitignore") {
+		t.Errorf("missing .gitignore in repo entries")
 	}
 	// includeIgnored brings the ignored files back but never other worktrees.
 	files, err = Files(p, nil, true)
