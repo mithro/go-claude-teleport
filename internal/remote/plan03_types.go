@@ -6,6 +6,13 @@ package remote
 //   type TmuxDialer = tmuxx.Dialer
 // Until then the Endpoint round-trips these values as opaque JSON so the
 // protocol, Client and Server are complete and testable without git/tmux.
+//
+// Replacing these json.RawMessage aliases with real structs changes the
+// wire format (git/tmux payloads stop being opaque blobs and gain a
+// concrete shape a mismatched peer can no longer just pass through). Plan
+// 03 MUST bump version.Protocol (internal/version/version.go) to 2 when it
+// makes this replacement, so an old and a new binary refuse to talk to each
+// other instead of silently misinterpreting these fields.
 
 import "encoding/json"
 
