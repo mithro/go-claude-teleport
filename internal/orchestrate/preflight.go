@@ -68,6 +68,23 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 	}
 	p.PathMap = session.NewPathMap(maps...)
 	p.DestCwd = p.PathMap.ApplyPath(sess.LaunchCwd)
+
+	// Spec §7.2 ruling R-P3-18a: the mappings above only rewrite a leading
+	// path PREFIX, so they cannot reach inside a Munge()'d project-directory
+	// path component (Munge flattens a whole cwd into one non-decomposable
+	// path segment). Add a dedicated source-project-dir -> dest-project-dir
+	// mapping, recomputed from the (already path-mapped) destination cwd via
+	// the same session.Paths.ProjectDir helper both hosts use, so it is more
+	// specific (longer) than the Home mapping and NewPathMap's longest-
+	// prefix-first ordering makes it win for entries whose Root sits under
+	// projects/<munged> (CatSession/memory manifest entries, and the
+	// rewritten sessions-index fullPath in SessionExtras).
+	srcProjectDir := src.Paths().ProjectDir(sess.LaunchCwd)
+	dstProjectDir := dst.Paths().ProjectDir(p.DestCwd)
+	if srcProjectDir != dstProjectDir {
+		maps = append(maps, session.Mapping{From: srcProjectDir, To: dstProjectDir})
+		p.PathMap = session.NewPathMap(maps...)
+	}
 	p.DestCapture = filepath.Join(job.Dir(p.DestInfo.DataDir, jobID), "capture.txt")
 
 	// Drift (spec §10).

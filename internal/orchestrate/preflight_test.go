@@ -50,6 +50,10 @@ func TestPreflightIdleSessionFreshMainWithHomeRewrite(t *testing.T) {
 	makeRepo(t, cwd)
 	os.WriteFile(filepath.Join(cwd, "scratch.txt"), []byte("untracked"), 0o644)
 	seedSession(t, src, cwd)
+	srcProj := src.paths.ProjectDir(cwd)
+	if err := session.MergeIndexEntry(srcProj, session.IndexEntry{SessionID: sid, FullPath: filepath.Join(srcProj, sid+".jsonl"), ProjectPath: cwd}); err != nil {
+		t.Fatal(err)
+	}
 
 	o := baseOptions()
 	o.State = "idle"
@@ -77,6 +81,37 @@ func TestPreflightIdleSessionFreshMainWithHomeRewrite(t *testing.T) {
 	}
 	if !p.PathMap.Empty() && p.PathMap.ApplyPath(src.paths.Home+"/a") != dst.paths.Home+"/a" {
 		t.Errorf("path map = %+v", p.PathMap)
+	}
+
+	// spec §7.2 ruling R-P3-18a: a plain Home-prefix mapping cannot rewrite
+	// the Munge()'d project-directory path component (Munge flattens the
+	// whole cwd into one path segment); Preflight must add a dedicated
+	// source-project-dir -> dest-project-dir mapping so the manifest's
+	// CatSession entries, and the rewritten sessions-index fullPath, land
+	// under the DESTINATION's own munged project directory rather than
+	// carrying over the source's.
+	dstProj := dst.paths.ProjectDir(filepath.Join(dst.paths.Home, "github", "x"))
+	m, err := transfer.Load(p.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, e := range m.Entries {
+		if e.Category == session.CatSession && strings.HasSuffix(e.Dst, "/"+sid+".jsonl") {
+			found = true
+			if filepath.Dir(e.Dst) != dstProj {
+				t.Errorf("transcript Dst = %q, want under dest munged project dir %q", e.Dst, dstProj)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("manifest has no session entry for %s.jsonl", sid)
+	}
+	if p.Extras.IndexEntry == nil {
+		t.Fatalf("Extras.IndexEntry missing (sessions-index entry was seeded)")
+	}
+	if want := filepath.Join(dstProj, sid+".jsonl"); p.Extras.IndexEntry.FullPath != want {
+		t.Errorf("IndexEntry.FullPath = %q, want %q", p.Extras.IndexEntry.FullPath, want)
 	}
 }
 

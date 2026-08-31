@@ -72,12 +72,21 @@ func Build(ctx context.Context, jobID string, id session.ID, srcHost, dstHost st
 			ID:       i,
 			Category: f.Category,
 			Src:      f.Path(),
-			Dst:      filepath.Join(pm.ApplyPath(f.Root), filepath.FromSlash(f.Rel)),
-			Size:     f.Size,
-			Mode:     uint32(f.Mode),
-			ModTime:  f.ModTime,
-			Symlink:  f.Symlink,
-			Rewrite:  f.Rewrite,
+			// pm is applied to the FULL joined path, not just Root, so a
+			// mapping more specific than a plain Home prefix (e.g. source
+			// project dir -> destination project dir, spec §7.2 ruling
+			// R-P3-18a) can match and rewrite a path component nested
+			// inside Root's own tail (Munge() flattens a cwd into one
+			// non-decomposable path segment, so a Root-only prefix rewrite
+			// can never reach inside it). For a pure-prefix mapping whose
+			// From ends at or before Root, this is output-identical to
+			// applying pm to Root and joining Rel afterwards.
+			Dst:     pm.ApplyPath(filepath.Join(f.Root, filepath.FromSlash(f.Rel))),
+			Size:    f.Size,
+			Mode:    uint32(f.Mode),
+			ModTime: f.ModTime,
+			Symlink: f.Symlink,
+			Rewrite: f.Rewrite,
 		}
 		e.FFAllowed = f.Category == session.CatSession && ffAllowed(f.Rel, id)
 		if e.IsRegular() {
