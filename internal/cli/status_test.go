@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/job"
+	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
 func TestStatusRendersJournal(t *testing.T) {
@@ -51,6 +53,44 @@ func TestStatusRendersJournal(t *testing.T) {
 		t.Errorf("json doc = %+v", doc)
 	}
 	_ = time.Now
+}
+
+func TestStatusRendersManifestSummary(t *testing.T) {
+	env, home := testEnv(t)
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	j, _ := job.New(dataDir, tsid)
+	j.Direction, j.SourceHost, j.DestHost = "to", "laptop.example", "big-storage.example"
+	j.Save()
+	m := &transfer.Manifest{Version: 1, JobID: tsid, SessionID: tsid, Entries: []transfer.Entry{
+		{ID: 0, Category: session.CatSession, Dst: "/home/alice/.claude/todos/" + tsid + ".json", Size: 100},
+		{ID: 1, Category: session.CatSession, Dst: "/home/alice/.claude/projects/-home-alice-work/" + tsid + ".jsonl", Size: 250},
+	}, Skipped: []session.Skipped{{Path: "/home/alice/.claude/ide/locks/1234.lock", Reason: "forbidden"}}}
+	if err := m.Save(j.ManifestPath()); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Main([]string{"status", tsid}, strings.NewReader(""), &out, &errOut, env)
+	if code != ExitOK {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "manifest: 2 entries, 350 bytes, 1 skipped") {
+		t.Errorf("status output lacks manifest summary line:\n%s", out.String())
+	}
+
+	out.Reset()
+	code = Main([]string{"status", tsid, "--json"}, strings.NewReader(""), &out, &errOut, env)
+	if code != ExitOK {
+		t.Fatalf("exit %d: %s", code, errOut.String())
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(out.Bytes(), &doc); err != nil {
+		t.Fatalf("json: %v\n%s", err, out.String())
+	}
+	manifest, ok := doc["manifest"]
+	if !ok || string(manifest) == "null" {
+		t.Errorf("json doc's \"manifest\" key must be present and non-null, got %q", manifest)
+	}
 }
 
 func TestStatusMissingAndBadID(t *testing.T) {
