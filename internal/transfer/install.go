@@ -125,9 +125,62 @@ func placeEntry(stagingDir string, e Entry) error {
 	return placeFile(stagingDir, e)
 }
 
+// underDir reports whether the already-Clean cleanPath is dir itself, or
+// lexically nested under it. dir must be a non-empty absolute path; a
+// relative or empty dir fails closed (never "under").
+func underDir(cleanPath, dir string) bool {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return false
+	}
+	dir = filepath.Clean(dir)
+	return cleanPath == dir || strings.HasPrefix(cleanPath, dir+string(filepath.Separator))
+}
+
+// validateDst is a defense-in-depth re-check performed on the DESTINATION,
+// independent of whatever the source already refused to include in the
+// manifest: every entry's Dst must lexically resolve (Clean only — no
+// EvalSymlinks, so a symlink swap on disk cannot fool this) under p.Home,
+// and a session-category entry's Dst must additionally resolve under
+// p.ConfigDir and not be a config-dir-relative forbidden path (spec §7.1:
+// credentials, the registry, messaging keys, the global json, settings,
+// plugins). This guards against a compromised or buggy source relaying a
+// manifest (or an InstallExtras.Memory entry) whose Dst tries to smuggle a
+// write outside the sandbox — e.g. <ConfigDir>/.credentials.json, or a path
+// outside $HOME entirely.
+func validateDst(e Entry, p session.Paths) error {
+	dst := filepath.Clean(e.Dst)
+	if !underDir(dst, p.Home) {
+		return fmt.Errorf("refusing entry: %s is not under home %s", e.Dst, p.Home)
+	}
+	if e.Category == session.CatSession {
+		if !underDir(dst, p.ConfigDir) {
+			return fmt.Errorf("refusing session entry: %s is not under config dir %s", e.Dst, p.ConfigDir)
+		}
+		rel, err := filepath.Rel(p.ConfigDir, dst)
+		if err != nil {
+			return fmt.Errorf("refusing session entry: %s: %w", e.Dst, err)
+		}
+		if session.Forbidden(rel) {
+			return fmt.Errorf("refusing session entry: %s is a forbidden path (%s)", e.Dst, rel)
+		}
+	}
+	return nil
+}
+
 // Install moves staged entries into place per spec §7.5 and performs the merges.
 func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir string, p session.Paths, extra InstallExtras) (*InstallReport, error) {
 	rep := &InstallReport{}
+	// Defense-in-depth destination re-check, before anything is touched.
+	for _, e := range m.Entries {
+		if err := validateDst(e, p); err != nil {
+			return rep, err
+		}
+	}
+	for _, e := range extra.Memory {
+		if err := validateDst(e, p); err != nil {
+			return rep, err
+		}
+	}
 	memory := map[int]bool{}
 	for _, e := range extra.Memory {
 		// Enforce the InstallExtras.Memory invariant: every entry must be a
@@ -231,10 +284,16 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 
 // Uninstall removes manifest-listed installed files whose current content
 // still matches the manifest (for `abandon --delete-destination-files`), then
-// removes directories the install emptied. p is accepted so a future caller
-// can restrict removal to paths under p.ConfigDir/p.DataDir; Plan 02 does not
-// need that check since every Dst already comes from this manifest.
+// removes directories the install emptied. Every entry is re-checked against
+// p with the same defense-in-depth validateDst as Install, before anything
+// is deleted, so a manifest cannot be used to smuggle a deletion outside the
+// session's own paths.
 func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
+	for _, e := range m.Entries {
+		if err := validateDst(e, p); err != nil {
+			return nil, err
+		}
+	}
 	var removed []string
 	var errs []error
 	for _, e := range m.Entries {

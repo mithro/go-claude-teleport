@@ -219,6 +219,131 @@ func TestInstallRefusesMemoryEntryWithMismatchedID(t *testing.T) {
 	}
 }
 
+// TestInstallRefusesSmuggledCredentialsDst covers the defense-in-depth
+// destination re-check (controller item 5): even though a well-behaved
+// Build never emits a manifest entry inside session.Forbidden, Install must
+// independently refuse one anyway — e.g. a manifest that smuggles a session
+// entry's Dst into <ConfigDir>/.credentials.json — before touching disk.
+func TestInstallRefusesSmuggledCredentialsDst(t *testing.T) {
+	m, staging, p := staged(t)
+	victim := 1 // the transcript entry: a plain session-category file
+	if m.Entries[victim].Category != session.CatSession || m.Entries[victim].IsDir() {
+		t.Fatalf("fixture entry %d is not a plain session file: %+v", victim, m.Entries[victim])
+	}
+	credPath := filepath.Join(p.ConfigDir, ".credentials.json")
+	m.Entries[victim].Dst = credPath
+	st, _ := Diff(context.Background(), m, staging)
+	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
+	if err == nil || !strings.Contains(err.Error(), "forbidden") || !strings.Contains(err.Error(), credPath) {
+		t.Fatalf("err = %v, want a forbidden-path refusal naming %s", err, credPath)
+	}
+	if _, statErr := os.Stat(credPath); !os.IsNotExist(statErr) {
+		t.Errorf(".credentials.json must not have been written")
+	}
+	for i, e := range m.Entries {
+		if i == victim || e.IsDir() {
+			continue
+		}
+		if _, err := os.Lstat(e.Dst); err == nil {
+			t.Errorf("entry %d (%s) must not have been installed before the smuggled entry was rejected", i, e.Dst)
+		}
+	}
+}
+
+// TestInstallRefusesDstOutsideHome covers the second half of the same
+// defense-in-depth check: a Dst that lexically escapes p.Home altogether
+// (any category, not just session) is refused before touching disk.
+func TestInstallRefusesDstOutsideHome(t *testing.T) {
+	m, staging, p := staged(t)
+	victim := 3 // the todos/<sid>.json entry
+	if m.Entries[victim].IsDir() {
+		t.Fatalf("fixture entry %d is a dir, want a plain file", victim)
+	}
+	outside := filepath.Join(filepath.Dir(p.Home), "evil-outside", "payload.txt")
+	m.Entries[victim].Dst = outside
+	st, _ := Diff(context.Background(), m, staging)
+	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
+	if err == nil || !strings.Contains(err.Error(), "not under home") || !strings.Contains(err.Error(), outside) {
+		t.Fatalf("err = %v, want a not-under-home refusal naming %s", err, outside)
+	}
+	if _, statErr := os.Stat(outside); !os.IsNotExist(statErr) {
+		t.Errorf("payload must not have been written outside home")
+	}
+}
+
+// TestUninstallRefusesSmuggledCredentialsDst mirrors the Install case for
+// Uninstall: a manifest entry whose Dst has been retargeted at
+// <ConfigDir>/.credentials.json (with a matching hash, so nothing else
+// would stop the removal) must be refused before anything is deleted —
+// including the OTHER, legitimate entries the same manifest lists.
+func TestUninstallRefusesSmuggledCredentialsDst(t *testing.T) {
+	m, staging, p := staged(t)
+	st, _ := Diff(context.Background(), m, staging)
+	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
+		t.Fatal(err)
+	}
+	credPath := filepath.Join(p.ConfigDir, ".credentials.json")
+	os.WriteFile(credPath, []byte("super-secret"), 0o600)
+	sum, _, err := HashFile(credPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim := 1
+	m.Entries[victim].Dst = credPath
+	m.Entries[victim].SHA256 = sum
+
+	removed, err := Uninstall(m, p)
+	if err == nil || !strings.Contains(err.Error(), "forbidden") || !strings.Contains(err.Error(), credPath) {
+		t.Fatalf("err = %v removed = %v, want a forbidden-path refusal naming %s", err, removed, credPath)
+	}
+	if removed != nil {
+		t.Errorf("nothing should have been removed: %v", removed)
+	}
+	if got, err := os.ReadFile(credPath); err != nil || string(got) != "super-secret" {
+		t.Errorf(".credentials.json must survive untouched: %q err=%v", got, err)
+	}
+	for i, e := range m.Entries {
+		if i == victim || e.IsDir() {
+			continue
+		}
+		if _, err := os.Lstat(e.Dst); err != nil {
+			t.Errorf("entry %d (%s) must not have been removed either: %v", i, e.Dst, err)
+		}
+	}
+}
+
+// TestUninstallRefusesDstOutsideHome mirrors the Install case: a manifest
+// entry whose Dst lexically escapes p.Home is refused before any deletion.
+func TestUninstallRefusesDstOutsideHome(t *testing.T) {
+	m, staging, p := staged(t)
+	st, _ := Diff(context.Background(), m, staging)
+	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "payload.txt")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, _, err := HashFile(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim := 3
+	m.Entries[victim].Dst = outside
+	m.Entries[victim].SHA256 = sum
+
+	removed, err := Uninstall(m, p)
+	if err == nil || !strings.Contains(err.Error(), "not under home") || !strings.Contains(err.Error(), outside) {
+		t.Fatalf("err = %v removed = %v, want a not-under-home refusal naming %s", err, removed, outside)
+	}
+	if removed != nil {
+		t.Errorf("nothing should have been removed: %v", removed)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Errorf("payload outside home must survive untouched: %v", err)
+	}
+}
+
 func TestUninstallRemovesOnlyMatching(t *testing.T) {
 	m, staging, p := staged(t)
 	st, _ := Diff(context.Background(), m, staging)
