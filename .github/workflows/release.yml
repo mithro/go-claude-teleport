@@ -15,10 +15,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-  pull_request:
+  # Deliberately NOT pull_request: the version job pushes a tag and the
+  # release job cuts a GitHub Release, so running this on a PR publishes
+  # a release from unmerged code.
 
-# A reusable workflow cannot escalate beyond the permissions its caller holds,
-# so the Pages permissions the apt job needs are granted here.
 # Least privilege by default: only the publish job below raises this, and only
 # for itself. The build jobs run Docker and clone third-party sources, so they
 # should never hold a token that can write to Pages.
