@@ -19,10 +19,11 @@ on:
 
 # A reusable workflow cannot escalate beyond the permissions its caller holds,
 # so the Pages permissions the apt job needs are granted here.
+# Least privilege by default: only the publish job below raises this, and only
+# for itself. The build jobs run Docker and clone third-party sources, so they
+# should never hold a token that can write to Pages.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 # Serialise releases so two quick pushes never compute the same next tag.
 concurrency:
@@ -181,6 +182,13 @@ jobs:
           fi
 
   apt:
+    # Scoped to this job alone. A job calling a reusable workflow sets the
+    # maximum permissions available to it, so the elevated Pages scopes stay
+    # here rather than applying to the whole workflow.
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     # Build on PRs to validate, but never publish from one.
     if: github.event_name != 'pull_request'
     needs: build
