@@ -115,16 +115,29 @@ func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, 
 		if err != nil {
 			return nil, err
 		}
-		st, err := os.Lstat(e.Dst)
-		if errors.Is(err, os.ErrNotExist) {
+		stagedStatus := func() Status {
 			switch {
 			case staged:
-				out[e.ID] = StagedSame
+				return StagedSame
 			case mismatch:
-				out[e.ID] = StagedMismatch
+				return StagedMismatch
 			default:
-				out[e.ID] = Absent
+				return Absent
 			}
+		}
+		if e.Deferred {
+			// A deferred entry is never compared against Dst: Dst is
+			// whatever the destination's own current checkout already
+			// holds there (an existing-main teleport's whole premise), not
+			// a prior install of THIS entry, so a "difference" there is
+			// meaningless — only "is the source's copy correctly staged
+			// for the later step to read" matters.
+			out[e.ID] = stagedStatus()
+			continue
+		}
+		st, err := os.Lstat(e.Dst)
+		if errors.Is(err, os.ErrNotExist) {
+			out[e.ID] = stagedStatus()
 			continue
 		}
 		if err != nil {
@@ -206,6 +219,27 @@ func Need(m *Manifest, st map[int]Status) []int {
 			if e.FFAllowed {
 				ids = append(ids, e.ID)
 			}
+		}
+	}
+	return ids
+}
+
+// Pending lists entry ids with no verified staged (or better) copy yet:
+// Absent and StagedMismatch only. Unlike Need — deliberately over-inclusive
+// so a re-send of an already-staged ff-candidate is never skipped by
+// mistake — Pending is the completeness check: an ff-candidate, a
+// present-same/staged-same, or a present-different FFAllowed entry (which,
+// by Diff's construction, is reachable only once a verified staged copy
+// already failed its ff-prefix check) all already have everything the
+// later install/git-attach step needs staged; go/claude-teleport's own
+// transfer step is done at that point even though Need would still list
+// some of them.
+func Pending(m *Manifest, st map[int]Status) []int {
+	var ids []int
+	for _, e := range m.Entries {
+		switch st[e.ID] {
+		case Absent, StagedMismatch:
+			ids = append(ids, e.ID)
 		}
 	}
 	return ids

@@ -30,6 +30,20 @@ type Entry struct {
 	Symlink   string           `json:"symlink,omitempty"`
 	Rewrite   bool             `json:"rewrite"`
 	FFAllowed bool             `json:"ff_allowed"` // transcript/sidecar of THIS session
+
+	// Deferred means Diff must classify this entry purely by staging
+	// state, never by comparing against whatever the destination's own
+	// current file at Dst already holds — that comparison is meaningless
+	// for two different kinds of entry: git-attach's existing-main dirty
+	// index/worktree files (Dst is the destination's own pre-existing
+	// checkout; installManifest also excludes these, since git-attach
+	// places them itself with git's own semantics) and a job's pane
+	// capture (Dst can hold an unrelated prior attempt's snapshot at the
+	// very same path; capture.txt IS still installed by the plain
+	// file-install path, just judged only against staging). Either way, a
+	// difference at Dst is expected and never a reason to refuse or to
+	// skip staging the source's copy.
+	Deferred bool `json:"deferred,omitempty"`
 }
 
 func (e Entry) IsDir() bool     { return os.FileMode(e.Mode)&os.ModeDir != 0 }

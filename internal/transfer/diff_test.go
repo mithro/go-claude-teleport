@@ -80,6 +80,47 @@ func TestDiffStatuses(t *testing.T) {
 	}
 }
 
+// TestPendingExcludesFFCandidate pins the bug an orchestrator e2e test
+// (a re-teleport back to a host that already holds an older copy of this
+// session's own transcript) found: verifyTransfer/runTransfer used Need as
+// a "the transfer step is done" oracle, but Need deliberately keeps
+// listing an already-staged ff-candidate (its own doc comment: "so a
+// resend after a crash is never skipped") — so a fast-forward transfer
+// could never converge, forever reporting the just-received file "still
+// missing". Pending is the correct completeness check: it excludes
+// ff-candidate (and present-different-FFAllowed, and present/staged-same),
+// since all of those already have a correctly staged copy for the later
+// install step to use.
+func TestPendingExcludesFFCandidate(t *testing.T) {
+	dest := t.TempDir()
+	staging := filepath.Join(t.TempDir(), "staging")
+	m := destManifest(dest)
+	writeFile(t, m.Entries[1].Dst, "line1\n")              // older copy of the FFAllowed transcript
+	writeFile(t, StagedPath(staging, 1), "line1\nline2\n") // the just-received, longer copy
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[1] != FFCandidate {
+		t.Fatalf("entry 1 = %s, want ff-candidate", st[1])
+	}
+	if got := Need(m, st); len(got) == 0 || got[0] != 1 {
+		t.Fatalf("Need = %v, want it to still list the ff-candidate (over-inclusive by design)", got)
+	}
+	pending := Pending(m, st)
+	for _, id := range pending {
+		if id == 1 {
+			t.Fatalf("Pending = %v, must not list an already-staged ff-candidate", pending)
+		}
+	}
+	// entry 0 (the project dir) exists as a side effect of writeFile
+	// MkdirAll-ing entry 1's parent -> present-same, not pending. Entries 2
+	// (other.json) and 3 (symlink) are genuinely absent -> still pending.
+	if diff := cmp.Diff([]int{2, 3}, pending); diff != "" {
+		t.Errorf("Pending (-want +got):\n%s", diff)
+	}
+}
+
 func TestDiffFastForwardAndCollision(t *testing.T) {
 	dest := t.TempDir()
 	staging := filepath.Join(t.TempDir(), "staging")
