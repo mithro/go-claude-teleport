@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,54 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 )
+
+// tmuxx.FindServer's liveness probe (spec §9 discovery, used whenever
+// Preflight has to find a destination tmux server it has no existing pane
+// ref for) dials through the package-level tmuxx.Dial var, not through a
+// Local's own injected opts.Tmux dialer — the two are deliberately separate
+// (FindServer works purely from a socket directory + name, before any Local
+// exists to inject into). A fake host's socket (below) is a bare marker
+// file, not a real listening unix socket, so tmuxx.Dial's default
+// (tmuxx.DialControl) would always report it dead. installFakeTmuxDial
+// patches tmuxx.Dial once per test binary to answer for every host's own
+// fake registered here and fall through to the real dialer otherwise, so
+// FindServer's discovery exercises the fake exactly as it would a real
+// server. Every other test (e.g. the tmuxlive ones, which never call
+// newHost with a fake) is unaffected: nothing they use is ever registered,
+// so every dial they make still falls through to the real DialControl.
+var (
+	fakeTmuxDialOnce sync.Once
+	fakeTmuxMu       sync.Mutex
+	fakeTmuxByPath   = map[string]*fakeTmux{}
+)
+
+func installFakeTmuxDial() {
+	fakeTmuxDialOnce.Do(func() {
+		real := tmuxx.Dial
+		tmuxx.Dial = func(ctx context.Context, path string) (tmuxx.Transport, error) {
+			fakeTmuxMu.Lock()
+			tm, ok := fakeTmuxByPath[path]
+			fakeTmuxMu.Unlock()
+			if ok {
+				return tm, nil
+			}
+			return real(ctx, path)
+		}
+	})
+}
+
+func registerFakeTmux(t *testing.T, path string, tm *fakeTmux) {
+	t.Helper()
+	installFakeTmuxDial()
+	fakeTmuxMu.Lock()
+	fakeTmuxByPath[path] = tm
+	fakeTmuxMu.Unlock()
+	t.Cleanup(func() {
+		fakeTmuxMu.Lock()
+		delete(fakeTmuxByPath, path)
+		fakeTmuxMu.Unlock()
+	})
+}
 
 // host is one side of an in-process teleport: its own home, config dir,
 // data dir and a Local endpoint. Tmux is either nil (no tmux) or a fake.
@@ -43,6 +92,7 @@ func newHost(t *testing.T, name, user string, tm *fakeTmux) *host {
 		os.MkdirAll(opts.TmuxSocketDir, 0o700)
 		tm.socket = filepath.Join(opts.TmuxSocketDir, "default")
 		os.WriteFile(tm.socket, nil, 0o600) // FindServer lists it; Dial is the fake above
+		registerFakeTmux(t, tm.socket, tm)
 		t.Cleanup(tm.killAll)
 	}
 	h := &host{name: name, paths: p, opts: opts, tmux: tm}
@@ -116,6 +166,44 @@ func startClaudeInPane(t *testing.T, h *host, group, cwd string) *session.TmuxRe
 	waitRegistry(t, h, "idle")
 	h.refreshProbe(t)
 	return ref
+}
+
+// waitPlaceholderForeground polls PaneState on h until ref's foreground
+// command is the placeholder (procx.IsPlaceholderArgv), returning its Argv.
+// Fork+exec of a typed placeholder command races against the caller:
+// job.Run (internal/job/run.go) marks a step Done the instant its Run
+// function returns, with no re-verify in between, so a step that just
+// TypeCommand'd the placeholder (steps.go's runThawExit and runShape) can
+// report the whole job "success" before the pane's shell has actually
+// exec'd it — a single PaneState read right after can still see the shell
+// itself (argv [sh +m -s]), not the placeholder. Two consecutive sightings
+// a moment apart are required, not just one: a single procx.Scan can
+// transiently catch the placeholder process between fork and exec (still
+// reported under the shell's own comm), which this test has observed as a
+// false positive that a later, independent scan then correctly saw through.
+func waitPlaceholderForeground(t *testing.T, h *host, ref *session.TmuxRef) []string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	seenOnce := false
+	for {
+		h.refreshProbe(t)
+		st, err := h.ep.PaneState(context.Background(), ref)
+		if err == nil {
+			if _, ok := procx.IsPlaceholderArgv(st.Argv); ok {
+				if seenOnce {
+					return st.Argv
+				}
+				seenOnce = true
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+		}
+		seenOnce = false
+		if time.Now().After(deadline) {
+			t.Fatalf("placeholder never became %s's stable foreground command (last err %v)", h.name, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func waitRegistry(t *testing.T, h *host, status string) *session.Registry {

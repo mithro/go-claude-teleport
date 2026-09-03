@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/creack/pty"
 )
 
 // fakeTmux implements tmuxx.Transport by interpreting the exact command
@@ -235,19 +237,34 @@ func (f *fakeTmux) newWindow(sess, name, cwd string) ([]string, error) {
 	f.nextW++
 	p := &fakePane{id: fmt.Sprintf("%%%d", f.nextP), windowID: w.id, cwd: cwd, out: &lockedBuffer{}}
 	f.nextP++
-	cmd := exec.Command("sh", "-s")
+	// +m: with a real pty (below), sh auto-detects itself as interactive
+	// (stdin+stderr are both ttys) and turns job control ON, which then
+	// STOPs the foreground job on SIGSTOP and reclaims the pty as ITS OWN
+	// foreground process — a later raw SIGCONT (procx.Freeze/Thaw, not a
+	// shell `fg`) resumes the child's execution but never gives it back
+	// the pty, so anything typed afterwards (e.g. "/exit") goes to the
+	// shell instead ("sh: /exit: not found"), not the child. +m forces job
+	// control off regardless of the tty check, so the shell never takes
+	// the pty back out from under a stopped/continued foreground child.
+	cmd := exec.Command("sh", "+m", "-s")
 	cmd.Dir = cwd
 	cmd.Env = f.env(p.id, sess, w.id)
-	cmd.Stdout, cmd.Stderr = p.out, p.out
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	stdin, err := cmd.StdinPipe()
+	// A real pty, not a plain pipe: production code (internal/placeholder)
+	// deliberately behaves differently when stdin isn't a terminal ("When
+	// stdin is not a terminal the resume happens immediately" — placeholder
+	// --resume's own doc comment) precisely to be safe over a script/pipe.
+	// A plain os/exec pipe here would make every placeholder auto-resume
+	// the instant it's typed, which is indistinguishable from the pane
+	// never having shown one at all — a real tmux pane is always a pty, so
+	// only a pty here lets these tests actually discriminate "source pane
+	// suspended, showing the placeholder, waiting" from "source pane
+	// already resumed again".
+	master, err := pty.Start(cmd)
 	if err != nil {
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	p.cmd, p.stdin = cmd, stdin
+	go io.Copy(p.out, master) // pty echo + the pane's own stdout/stderr, all on one fd
+	p.cmd, p.stdin = cmd, master
 	f.windows[w.id] = w
 	f.panes[p.id] = p
 	return []string{p.id + "\t" + w.id + "\t" + sess}, nil
@@ -256,11 +273,23 @@ func (f *fakeTmux) newWindow(sess, name, cwd string) ([]string, error) {
 // describe renders the Describe format for one pane (only that format
 // is supported: session, group, window id, index, name, pane id, cwd,
 // command, pid, history size, title).
+// describe renders "list-panes -a -F ..." for one pane. Two distinct real
+// formats reach here: tmuxx.describeFormat (Describe, 11 fields, session
+// group second) and tmuxx.listPanesFormat (session.PaneProbe.ListPanes,
+// used by session.Load's suspended-pane discovery — 3 fields, window id
+// second) — a version of this that only checked the "#{session_name}"
+// prefix answered every format with the 11-field shape, silently feeding
+// ListPanes 3-field-truncated garbage (its own session_group and window_id
+// values swapped in), so a placeholder pane could never be discovered as
+// suspended through it.
 func (f *fakeTmux) describe(w *fakeWindow, p *fakePane, format string) string {
-	if !strings.HasPrefix(format, "#{session_name}") {
-		return ""
+	switch {
+	case strings.HasPrefix(format, "#{session_name}\t#{session_group}"):
+		return strings.Join([]string{w.session, f.sessions[w.session], w.id, strconv.Itoa(w.index), w.name, p.id, p.cwd, "sh", strconv.Itoa(p.cmd.Process.Pid), strconv.Itoa(len(p.out.lines())), "title"}, "\t")
+	case strings.HasPrefix(format, "#{session_name}\t#{window_id}"):
+		return strings.Join([]string{w.session, w.id, p.id}, "\t")
 	}
-	return strings.Join([]string{w.session, f.sessions[w.session], w.id, strconv.Itoa(w.index), w.name, p.id, p.cwd, "sh", strconv.Itoa(p.cmd.Process.Pid), strconv.Itoa(len(p.out.lines())), "title"}, "\t")
+	return ""
 }
 
 // killAll ends every pane process (test cleanup).
