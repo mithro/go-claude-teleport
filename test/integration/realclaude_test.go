@@ -217,9 +217,9 @@ func TestRealClaudeTmuxResumeWritesRegistry(t *testing.T) {
 // (ledgered carry M5, internal/remote/local_claude.go's ConfirmClaude):
 // nothing in the codebase had verified what a real `claude -p` writes to
 // ~/.claude/sessions/<pid>.json while it is running. This test backgrounds
-// a real `claude -p` run and polls the registry as fast as the shell
-// allows, recording every distinct snapshot it observes plus the state
-// immediately after the process exits.
+// a real `claude -p` run and captures the registry snapshot as fast as the
+// shell allows, recording the first snapshot seen and the last one on disk
+// before the process exits, plus the state immediately after.
 //
 // The first run of this probe (task-26-report.md) established that "kind"
 // is "interactive" for a print run AND an interactive one — real Claude
@@ -228,6 +228,19 @@ func TestRealClaudeTmuxResumeWritesRegistry(t *testing.T) {
 // "entrypoint" for that reason (T26-1), so this probe now asserts the fact
 // the tool actually depends on: any snapshot seen with status "busy" must
 // carry entrypoint "sdk-cli", and none of them may claim kind "print".
+//
+// RC-1: on a fast CI runner the registry entry could appear and vanish
+// entirely between two 50ms polls that only started once `claude -p` was
+// already backgrounded, so "captured no registry snapshot" fired on an
+// otherwise-healthy run (main run 33797461842). Three independent
+// mitigations, none sufficient alone, fixed it: the watcher now starts
+// BEFORE `claude -p` is launched (removing the startup-ordering gap) and
+// polls every 10ms with a tight cp-based capture instead of 50ms
+// grep+cat; the probe prompt asks for a 40-item list so the busy window is
+// as wide as this fakeapi harness allows; and the whole probe retries up
+// to 3 times if a given attempt still captures zero snapshots, since a
+// capture miss is a timing flake in the harness, not a fact about real
+// Claude Code, and must not be conflated with one.
 func TestRealClaudePrintRegistryKind(t *testing.T) {
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -235,47 +248,106 @@ func TestRealClaudePrintRegistryKind(t *testing.T) {
 		}
 	})
 	reset(t)
-	sid := newSID(t)
+
+	const maxAttempts = 3
+	var snapshots int
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		sid := newSID(t)
+		out := runPrintRegistryProbe(t, sid)
+		t.Logf("entrypoint probe attempt %d/%d for sid %s:\n%s", attempt, maxAttempts, sid, out)
+
+		// The backgrounded run must have succeeded: a claude -p that failed
+		// (or never started, or hit the poll cap) would otherwise leave
+		// this test asserting over an empty snapshot list and passing for
+		// the wrong reason. Checked before the snapshots so a broken
+		// claude reports itself rather than surfacing as "captured no
+		// snapshot".
+		if !strings.Contains(out, "=== claude -p exit 0 ===") {
+			t.Fatalf("the backgrounded claude -p did not exit 0 (attempt %d/%d):\n%s", attempt, maxAttempts, out)
+		}
+
+		n, busy := checkPrintRegistrySnapshots(t, out)
+		if n == 0 {
+			t.Logf("attempt %d/%d captured no registry snapshot; retrying", attempt, maxAttempts)
+			continue
+		}
+		snapshots = n
+		t.Logf("entrypoint probe: %d registry snapshot(s), %d with status=busy; kind/entrypoint pinned on every one (attempt %d/%d)", n, busy, attempt, maxAttempts)
+		break
+	}
+	if snapshots == 0 {
+		t.Fatalf("captured no registry snapshot in %d attempts for a live `claude -p` — the probe asserts nothing unless it sees one (real Claude Code writes ~/.claude/sessions/<pid>.json for the life of the process)", maxAttempts)
+	}
+}
+
+// runPrintRegistryProbe runs one attempt of the backgrounded `claude -p`
+// registry probe for sid on source/alice and returns its combined log.
+//
+// The watcher subshell is started (backgrounded) BEFORE `claude -p` itself
+// is launched, so its first 10ms poll is already in flight (or at worst a
+// few shell-fork microseconds behind) when the registry file can first
+// appear, rather than starting only after `claude -p &` has already been
+// scheduled. It copies (cp, not cat) the registry file the moment it sees
+// one matching sid: the first successful copy is kept forever as
+// snap_first.json, and every later sighting overwrites snap_last.json — cp
+// racing a file that vanishes mid-copy just fails that one iteration
+// (tolerated, `|| true`) rather than losing the snapshot already on disk
+// from a prior iteration. A long-ish prompt (40 items) widens the window
+// during which claude is "busy" for this fakeapi harness to catch. A
+// watchdog kills claude (and, separately, the watcher) after 30s so a hung
+// run is reported via the exit-status check above instead of spinning a
+// container CPU until go test's own -timeout fires.
+func runPrintRegistryProbe(t testing.TB, sid string) string {
+	t.Helper()
 	script := `sid='` + sid + `'
 cd ~ && mkdir -p proj && cd proj
-claude -p --session-id "$sid" 'kind probe: remember the word pineapple' &
+rm -f snap_first.json snap_last.json snap_first.json.tmp snap_last.json.tmp
+
+(
+  polls=0
+  while [ "$polls" -le 3000 ]; do
+    polls=$((polls+1))
+    for f in ~/.claude/sessions/*.json; do
+      [ -e "$f" ] || continue
+      grep -q "\"sessionId\":\"$sid\"" "$f" 2>&1 || continue
+      if [ ! -e snap_first.json ]; then
+        { cp "$f" snap_first.json.tmp && mv snap_first.json.tmp snap_first.json; } 2>&1 || true
+      fi
+      { cp "$f" snap_last.json.tmp && mv snap_last.json.tmp snap_last.json; } 2>&1 || true
+    done
+    sleep 0.01
+  done
+) &
+watcher_pid=$!
+
+claude -p --session-id "$sid" 'kind probe: give me a numbered list of 40 short one-word items, one per line' &
 pid=$!
-last=""
-snap=0
-polls=0
-# Bounded (600 x 0.05s = 30s of sampling): a real -p turn against this
-# fakeapi's canned reply finishes in about two seconds, so the cap is only
-# ever reached by a claude that hung — in which case it is killed here and
-# the exit-status assertion below reports it, rather than the suite
-# spinning a container CPU until go test's own -timeout fires.
-while kill -0 "$pid"; do
-  polls=$((polls+1))
-  if [ "$polls" -gt 600 ]; then
-    echo "=== poll cap reached after $polls samples; killing $pid ==="
-    kill "$pid"
-    break
-  fi
-  f=$(grep -ls "\"sessionId\":\"$sid\"" ~/.claude/sessions/*.json | head -1)
-  if [ -n "$f" ]; then
-    cur=$(cat "$f" 2>&1) || cur=""
-    if [ -n "$cur" ] && [ "$cur" != "$last" ]; then
-      snap=$((snap+1))
-      echo "=== snapshot $snap (pid alive) ==="
-      echo "$cur"
-      last="$cur"
-    fi
-  fi
-  sleep 0.05
-done
+
+( sleep 30; kill "$pid" 2>&1 || true ) &
+watchdog_pid=$!
+
 # The exit status is recorded rather than discarded with "|| true": a
-# claude -p that failed (or was killed at the cap above) must fail this
-# test, not leave it quietly asserting over zero snapshots. Captured into
-# rc instead of letting the shell's own -e abort here, so the
+# claude -p that failed (or was killed by the watchdog above) must fail
+# this test, not leave it quietly asserting over zero snapshots. Captured
+# into rc instead of letting the shell's own -e abort here, so the
 # after-exit registry state below still makes it into the log for a
 # failure to be read from.
 rc=0
 wait "$pid" || rc=$?
+kill "$watchdog_pid" 2>&1 || true
+wait "$watchdog_pid" 2>&1 || true
+kill "$watcher_pid" 2>&1 || true
+wait "$watcher_pid" 2>&1 || true
+
 echo "=== claude -p exit $rc ==="
+if [ -s snap_first.json ]; then
+  echo "=== snapshot first ==="
+  cat snap_first.json 2>&1
+fi
+if [ -s snap_last.json ]; then
+  echo "=== snapshot last ==="
+  cat snap_last.json 2>&1
+fi
 echo "=== after exit ==="
 f=$(grep -ls "\"sessionId\":\"$sid\"" ~/.claude/sessions/*.json | head -1)
 if [ -n "$f" ]; then
@@ -284,23 +356,21 @@ else
   echo "(no registry entry for $sid after exit)"
 fi
 `
-	out := sh(t, "source", "alice", script)
-	t.Logf("entrypoint probe for sid %s:\n%s", sid, out)
+	return sh(t, "source", "alice", script)
+}
 
-	// The backgrounded run must have succeeded: a claude -p that failed (or
-	// never started, or hit the poll cap) would otherwise leave this test
-	// asserting over an empty snapshot list and passing for the wrong
-	// reason. Checked before the snapshots so a broken claude reports
-	// itself rather than surfacing as "captured no snapshot".
-	if !strings.Contains(out, "=== claude -p exit 0 ===") {
-		t.Fatalf("the backgrounded claude -p did not exit 0:\n%s", out)
-	}
-
-	// Parse each snapshot section on its own (the JSON between the section
-	// header and the next "=== " marker) rather than scanning the whole
-	// transcript for one { ... } span, which would run a final snapshot
-	// together with the after-exit dump and silently fail to parse.
-	var snapshots, busySnapshots int
+// checkPrintRegistrySnapshots parses each "snapshot <label>" section
+// runPrintRegistryProbe's log produced (the JSON between the section
+// header and the next "=== " marker, rather than scanning the whole
+// transcript for one { ... } span, which would run a final snapshot
+// together with the after-exit dump and silently fail to parse) and
+// asserts the pinned real-claude facts against every one it can parse. It
+// returns the number of parsed snapshots and how many reported
+// status=busy; callers decide what a zero count means (this test retries
+// the whole probe on zero, since that is a capture-timing flake, not a
+// fact about real Claude Code).
+func checkPrintRegistrySnapshots(t testing.TB, out string) (snapshots, busySnapshots int) {
+	t.Helper()
 	for _, sec := range strings.Split(out, "=== ") {
 		if !strings.HasPrefix(sec, "snapshot ") {
 			continue
@@ -350,8 +420,5 @@ fi
 			t.Errorf(`pinned fact broken: a real claude -p registry entry had entrypoint=%q, want "sdk-cli" (internal/remote/local_claude.go's ConfirmClaude accepts a "busy" print-mode turn only on entrypoint=="sdk-cli", via internal/session.Registry.Entrypoint — that gate can no longer match)`, reg.Entrypoint)
 		}
 	}
-	if snapshots == 0 {
-		t.Fatalf("captured no registry snapshot at all for a live `claude -p` — the probe asserts nothing unless it sees one (real Claude Code writes ~/.claude/sessions/<pid>.json for the life of the process):\n%s", out)
-	}
-	t.Logf("entrypoint probe: %d registry snapshot(s), %d with status=busy; kind/entrypoint pinned on every one", snapshots, busySnapshots)
+	return snapshots, busySnapshots
 }
