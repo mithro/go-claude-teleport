@@ -321,7 +321,11 @@ stopped by a crash, the stop is owned by a **freezer**: a tiny process the
 runner spawns with a pipe; the freezer sends `SIGSTOP`, then blocks on the
 pipe; when the runner writes `thaw` *or dies* (pipe EOF), it sends `SIGCONT`
 and exits. `procStart` from `/proc/<pid>/stat` is checked before every signal
-so a reused pid can never be signalled.
+so a reused pid can never be signalled. On the death path the freezer also
+restores the pane's foreground — it is given the source pane at freeze time
+and, after the `SIGCONT`, types `fg` into that pane and no other — because a
+bare `SIGCONT` leaves the pane's shell holding the pty and the resumed
+Claude re-stopping on `SIGTTIN`, and no thawing caller is left to fix it.
 
 The freeze moves Claude's whole **process group**, not just its pid: an
 interactive shell puts Claude in its own process group and gives that group

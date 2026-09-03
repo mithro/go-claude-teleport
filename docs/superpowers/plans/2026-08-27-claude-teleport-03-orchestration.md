@@ -11067,6 +11067,8 @@ Everything below is new relative to `2026-08-27-claude-teleport-00-interfaces.md
 - `RefString(ref *session.TmuxRef) string` — the one spelling of `<session>:<window>.<pane>`; every caller that formats a pane ref (steps, `list`, the registry comparison in `verifyStart`) uses it
 - `IsShell(comm string) bool` — the shared "is this pane running a shell" predicate (`orchestrate` had a private copy; C4/B6)
 - `PanePID(ctx, t, paneID) (int, error)` — the pid tmux itself started in the pane; the group the pty's foreground reverts to after a stopped job is thawed
+- `RestoreForeground(ctx, t Transport, paneID string, pid int, opts ForegroundOptions) error`, `ForegroundOptions{ProcRoot, Logf, Sleep, Timeout, Poll}`, `ForegroundPoll`, `ForegroundTimeout`, `ErrNotRestored` — the ONE implementation of "ask the pane's shell to `fg` the thawed job back into the pty" (ruling R-P3-F1). `remote.Local.restoreForeground` delegates to it; nothing else re-implements the check-then-type dance
+- `FreezerRestore(socketPath, paneID string) procx.RestoreFunc` — that same restore, packaged as the hook the freezer helper runs after the SIGCONT of its owner-died path (it dials the pane's own server; `procx` cannot import `tmuxx`, so `internal/cli` hands it in)
 - `StartTestServer(t) (socketPath, socketDir string)` under build tag `tmuxlive`
 - **Knowing deviation from the "no package reads the environment" rule:** `utf8Env` (client.go) reads `LC_ALL`/`LC_CTYPE`/`LANG` out of the environment it is given and forces a UTF-8 locale for the `tmux -C` child. It is not a directory or a default a caller could pass instead — it is the locale of the very process being spawned, and a non-UTF-8 one makes tmux mangle non-ASCII pane names and content. Documented here rather than plumbed through every call site.
 
@@ -11079,9 +11081,11 @@ Everything below is new relative to `2026-08-27-claude-teleport-00-interfaces.md
 
 **internal/procx**
 - `(*Freezer).Warnings() string` — whatever the freezer helper wrote to stderr (its degrade-to-bare-pid notes), so the caller can put them in `log.txt` on the success path too
+- `PaneRef{SocketPath, PaneID string}` with `Empty() bool`, and `RestoreFunc func(pid int) error`; `Freeze(selfExe string, pid int, startTime string, ref PaneRef)` and `RunFreezerHelper(pid int, startTime string, control *os.File, restore RestoreFunc)` take them (ruling R-P3-F1). The ref reaches the helper through its argv (`internal-freezer <pid> <start> [socket pane]`, hence `internal/cli`'s `cobra.RangeArgs(2, 4)`); the hook runs only on the owner-died path, since the ordinary thaw's owner does the restore itself
 
 **internal/remote**
 - `Endpoint` gains: `GitFiles`, `GitSourceFacts`, `BuildManifest`, `SessionExtras`, `TmuxSessions`, `KillWindow`, `ClaudeStatus`, `ListSessions`, `Cleanup`, `DeleteInstalled`, `RemoveJob` (signatures in Tasks 13, 16, 23; `RemoveJob` removes `jobs/<id>/` entirely — the wire dispatch handler refuses any id not prefixed `inspect-`, ruling R-P3-23i)
+- `Endpoint.Freeze(ctx, pid int, startTime string, ref *session.TmuxRef) error` — the pane joins the freeze so the freezer helper can restore its foreground unaided if this process dies (ruling R-P3-F1); `FreezeArgs.Ref *session.TmuxRef` carries it over the wire
 - `SessionSummary` struct
 - `LocalOptions.TmuxSocketDir string`, `LocalOptions.Sleep func(time.Duration)`
 - `FailureMarkers`, `HasFailureMarker`
@@ -11103,6 +11107,10 @@ Everything below is new relative to `2026-08-27-claude-teleport-00-interfaces.md
 - `Plan.RecordedSrc`/`Plan.RecordedDst bool` (`json:"recorded_src"`/`"recorded_dst"`) — each host's history row is appended once per job, so a re-run of the record step cannot duplicate it (finding A8)
 - `ExitOK = 0`, `ExitFailed = 1`, `ExitNotResumed = 5` — the spec §5 codes a journal can decide, defined once here next to `ExitCode` and re-exported by `internal/cli` (finding A13)
 - `Steps(p, j, src, dst, logf)` and `RunJob(ctx, dataDir, jobID, factory, logf)` take no `selfExe`: no step re-execs the binary (finding A9)
+
+**internal/session** (Plan 01 types, extended here)
+- `NewPaths(home, configDir, xdgDataHome string, configDirFromEnv bool) Paths` — the fourth argument, and the `Paths.ConfigDirFromEnv bool` field it sets, record that `CLAUDE_CONFIG_DIR` was actually SET rather than `ConfigDir` merely defaulting to `~/.claude`. Claude Code picks `$HOME/.claude.json` vs `<ConfigDir>/.claude.json` by the variable's presence, not its value, and `remote.claudeEnv` decides from it whether a claude this host starts sees the variable at all. `internal/cli` is the only reader of the environment and so the only caller that can pass `true`
+- `Registry.Entrypoint string` (`json:"entrypoint"`) — how the session was launched: `"cli"` for a terminal session, `"sdk-cli"` for a `claude -p` run. Verified against real Claude Code 2.1.247 and 2.1.259: `kind` is `"interactive"` for both, so this is the only field that tells a print run apart
 
 **test/fakeclaude**
 - (no additions) `FAKECLAUDE_TMUX`, `FAKECLAUDE_FAIL=not-logged-in` and `FAKECLAUDE_RUN_CHILD` are Plan 01 Task 19's env contract, used as defined there

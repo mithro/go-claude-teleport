@@ -269,7 +269,10 @@ detached runner; the foreground command streams its log. Steps:
 1. **preflight** — resolve, compare versions and configuration, plan git
    and tmux, check every destination path for collisions, print the plan
 2. **freeze** — a running source Claude is `SIGSTOP`ped by a tiny freezer
-   process that `SIGCONT`s it if the runner dies for any reason
+   process that, if the runner dies for any reason, `SIGCONT`s it and hands
+   its terminal back (it types `fg` into the source pane it was given at
+   freeze time, and nowhere else), so a dead runner leaves a live,
+   usable session behind
 3. **capture** — the source pane's scrollback
 4. **transfer** — one gzip'd tar stream over a dedicated ssh channel, each
    file verified by size and SHA-256 into a staging directory
