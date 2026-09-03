@@ -10,7 +10,12 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -ldflags "-X github.com/mithro/
 CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o dist/fakeclaude ./test/fakeclaude
 rm -f test/integration/keys/id_ed25519 test/integration/keys/id_ed25519.pub
 ssh-keygen -q -t ed25519 -N '' -C claude-teleport-it -f test/integration/keys/id_ed25519
-chmod 644 test/integration/keys/id_ed25519   # the container copies it into alice's ~/.ssh with 600
+# 600, not 644 (C13): this throwaway per-run key is bind-mounted read-only
+# into every container, and entrypoint.sh copies it into each user's ~/.ssh
+# (chmod 600, chown) before anything uses it — so nothing needs to read it
+# as another uid, and a private key on the host has no business being
+# world-readable even for a few minutes.
+chmod 600 test/integration/keys/id_ed25519
 export CLAUDE_VERSION="${1:-}"
 if [ -n "$CLAUDE_VERSION" ]; then
   # Layer 2 (real Claude) also runs the fakeapi service, and `api` is

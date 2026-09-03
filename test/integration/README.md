@@ -11,6 +11,12 @@ Three containers — `source`, `jump`, `dest` — with sshd, tmux and git.
 
 Everything under `keys/` and `api-log/` is generated per run and git-ignored.
 
+Two layer-1 scenarios (the killed-runner and network-drop resumes) each
+create a **1 GiB** random file on `source` and transfer it, to make the
+"transfer running" window wide enough to intervene in from outside: budget
+~2 GiB of free disk (source's copy plus dest's) and most of the suite's
+~4 minutes for those two tests. The other scenarios are seconds each.
+
 `build.sh` with a CLAUDE_VERSION argument also builds the profile-gated
 `api` (fakeapi) image; without one it builds only the layer-1 services,
 since layer 1 never starts `api`. Pass `-count=1` when re-running a suite

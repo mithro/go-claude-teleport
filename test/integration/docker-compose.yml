@@ -64,6 +64,15 @@ services:
       - ./api-log:/log
 
 networks:
-  public: {}
+  # Both networks are internal (C12): nothing in this harness needs runtime
+  # internet — the images are prebuilt by build.sh, and real Claude Code
+  # (layer 2) is pointed at the in-harness fakeapi by ANTHROPIC_BASE_URL.
+  # Cutting the route makes that a property of the environment rather than
+  # a promise: an accidental call to a real endpoint fails here instead of
+  # succeeding quietly. "public" and "private" still differ in the way the
+  # suite depends on — dest is only on "private", so source must go --via
+  # jump to reach it.
+  public:
+    internal: true
   private:
     internal: true

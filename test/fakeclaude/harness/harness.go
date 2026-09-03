@@ -19,21 +19,45 @@ var (
 
 // Build compiles the fake claude once per test process and returns a
 // directory containing the `claude` binary.
+//
+// The build directory is a FIXED path under the repository's gitignored
+// tmp/, not a fresh os.MkdirTemp: the binary is cached for the whole test
+// process and shared by later tests, so no single test's t.Cleanup may
+// remove it, and every package that uses this harness would otherwise
+// leave one more copy behind in the system temp directory on every run
+// (finding A19). Reusing one path bounds that at a single directory, and
+// the build goes to a unique file that is then RENAMED into place, so two
+// package test binaries building concurrently cannot see a half-written
+// `claude` (rename is atomic, and it does not disturb a copy another
+// process is already executing).
 func Build(t testing.TB) string {
 	t.Helper()
 	once.Do(func() {
 		_, self, _, _ := runtime.Caller(0)
-		pkgDir := filepath.Dir(filepath.Dir(self)) // test/fakeclaude
-		dir, err := os.MkdirTemp("", "fakeclaude-")
+		pkgDir := filepath.Dir(filepath.Dir(self))     // test/fakeclaude
+		repoRoot := filepath.Dir(filepath.Dir(pkgDir)) // <repo>
+		dir := filepath.Join(repoRoot, "tmp", "fakeclaude-bin")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			bErr = err
+			return
+		}
+		tmp, err := os.CreateTemp(dir, "claude-")
 		if err != nil {
 			bErr = err
 			return
 		}
-		cmd := exec.Command("go", "build", "-o", filepath.Join(dir, "claude"), ".")
+		tmp.Close()
+		cmd := exec.Command("go", "build", "-o", tmp.Name(), ".")
 		cmd.Dir = pkgDir
 		if out, err := cmd.CombinedOutput(); err != nil {
+			os.Remove(tmp.Name())
 			bErr = err
 			t.Logf("go build fakeclaude: %s", out)
+			return
+		}
+		if err := os.Rename(tmp.Name(), filepath.Join(dir, "claude")); err != nil {
+			os.Remove(tmp.Name())
+			bErr = err
 			return
 		}
 		binDir = dir
