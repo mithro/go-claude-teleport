@@ -39,9 +39,19 @@ jobs:
           go-version-file: go.mod
       - run: test/integration/build.sh
       - run: go test -tags integration ./test/integration/ -v -timeout 40m
+      # The suite's TestMain tears down its containers on every path, so
+      # this only ever finds anything when teardown itself failed (e.g. the
+      # process was killed by the job timeout). Each run uses a dynamic
+      # compose project name (ct25-<pid>-<nanos>, harness_test.go), so
+      # `docker compose logs` can't address it by a fixed project/file —
+      # enumerate whatever is left by container name prefix instead.
       - name: container logs on failure
         if: failure()
-        run: docker compose -f test/integration/docker-compose.yml logs --no-color | tail -n 500
+        run: |
+          for c in $(docker ps -a --filter 'name=ct25-' -q); do
+            echo "== $c"
+            docker logs "$c" 2>&1 | tail -n 200
+          done
 
   real-claude:
     if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
@@ -59,6 +69,14 @@ jobs:
           go-version-file: go.mod
       - run: test/integration/build.sh ${{ matrix.claude }}
       - run: CLAUDE_VERSION=${{ matrix.claude }} go test -tags 'integration realclaude' ./test/integration/ -run TestReal -v -timeout 40m
+      # See the integration job's equivalent step: this only fires when the
+      # suite's TestMain teardown itself failed, and enumerates by
+      # container name prefix since the run's compose project name is
+      # dynamic (ct25-<pid>-<nanos>).
       - name: container logs on failure
         if: failure()
-        run: docker compose -f test/integration/docker-compose.yml -f test/integration/docker-compose.realclaude.yml --profile realclaude logs --no-color | tail -n 500
+        run: |
+          for c in $(docker ps -a --filter 'name=ct25-' -q); do
+            echo "== $c"
+            docker logs "$c" 2>&1 | tail -n 200
+          done
