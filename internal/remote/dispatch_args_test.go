@@ -2,6 +2,7 @@ package remote
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/mithro/go-claude-teleport/internal/job"
@@ -70,10 +71,15 @@ func TestEveryDispatchedOpDeclaresItsArgsType(t *testing.T) {
 // handler's args pass through) validates any args value implementing
 // jobIDCarrier, so an args type with a job-id field that does NOT
 // implement it would slip an unvalidated id through to a handler.
-// Only top-level fields are checked here: the wire's path-forming job id
-// is always a top-level job_id arg, while a job id nested inside a
-// payload (transfer.Manifest.JobID) is metadata that names no directory
-// — and Local validates for itself anyway before touching the disk.
+// Only top-level fields are checked here, and deliberately so. The wire's
+// path-forming job id is always a top-level job_id arg; a job id nested
+// inside a payload (transfer.Manifest.JobID, job.Journal.ID reached
+// through a pointer) names no directory by itself, so the defence for
+// those is Local's own checkJobID before it touches the disk — see
+// TestLocalRejectsHostileJobIDs — not this reflection walk. JournalPutArgs
+// is the exception that proves it: its id IS path-forming, reflection
+// cannot see it through the pointer, and it therefore gets an explicit
+// test of its own below.
 func TestEveryArgsTypeWithAJobIDIsValidatedAtDispatch(t *testing.T) {
 	for op, proto := range argsPrototypes {
 		if proto == nil {
@@ -82,7 +88,11 @@ func TestEveryArgsTypeWithAJobIDIsValidatedAtDispatch(t *testing.T) {
 		rt := reflect.TypeOf(proto)
 		for i := 0; i < rt.NumField(); i++ {
 			f := rt.Field(i)
-			if f.Type.Kind() != reflect.String || (f.Name != "JobID" && f.Tag.Get("json") != "job_id") {
+			// The json tag may carry options ("job_id,omitempty"): compare
+			// the NAME only, or a future omitempty would quietly take a
+			// field out of this check.
+			tag, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			if f.Type.Kind() != reflect.String || (f.Name != "JobID" && tag != "job_id") {
 				continue
 			}
 			c, ok := proto.(jobIDCarrier)

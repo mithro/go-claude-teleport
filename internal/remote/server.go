@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"runtime/debug"
 	"sync"
 
@@ -29,6 +30,16 @@ func decode[T any](args json.RawMessage) (T, error) {
 		if err := json.Unmarshal(args, &v); err != nil {
 			return v, &Error{Code: "usage", Message: "bad args: " + err.Error()}
 		}
+	}
+	// Every args type in ops.go/ops_plan03.go is a STRUCT, so v is a
+	// usable value even when the wire sent no args at all. A pointer
+	// instantiation would not be: decode[*T] with empty args leaves v nil,
+	// and a wireJobIDs with a pointer receiver would then panic inside the
+	// dispatch (recovered and shipped to the peer as an "internal" error)
+	// instead of failing as a usage error. Guarded rather than merely
+	// assumed, since the instantiation is chosen at each call site.
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.IsNil() {
+		return v, nil
 	}
 	if c, ok := any(v).(jobIDCarrier); ok {
 		for _, id := range c.wireJobIDs() {

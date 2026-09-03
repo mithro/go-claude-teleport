@@ -155,10 +155,14 @@ func TestServeRejectsHostileJobIDs(t *testing.T) {
 	}
 	h := newHostileIDs(t, p)
 	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
-	before := snapshotTree(t, h.root)
 	for _, o := range jobIDOps() {
 		for _, id := range h.all {
 			t.Run(o.op+"/"+strings.NewReplacer("/", "_", "\x00", "NUL", `\`, "bs").Replace(id), func(t *testing.T) {
+				// Snapshotted per CALL, not once around the whole table: a
+				// single before/after pair would let one op's stray write
+				// be cancelled out by another op's stray delete, and would
+				// not say which op did it.
+				before := snapshotTree(t, h.root)
 				e := callOp(t, ep, o.op, o.args(id), nil)
 				if e == nil {
 					t.Fatalf("%s accepted job id %q", o.op, id)
@@ -169,12 +173,12 @@ func TestServeRejectsHostileJobIDs(t *testing.T) {
 				if !strings.Contains(e.Message, "job id") {
 					t.Errorf("%s job id %q: message %q does not mention the job id", o.op, id, e.Message)
 				}
+				assertTreeUnchanged(t, h.root, before)
+				if _, err := os.Stat(h.canary); err != nil {
+					t.Fatalf("the canary outside the data dir must survive %s: %v", o.op, err)
+				}
 			})
 		}
-	}
-	assertTreeUnchanged(t, h.root, before)
-	if _, err := os.Stat(h.canary); err != nil {
-		t.Fatalf("the canary outside the data dir must survive every refused op: %v", err)
 	}
 }
 
@@ -227,9 +231,10 @@ func TestLocalRejectsHostileJobIDs(t *testing.T) {
 			return ServeStream(ctx, StreamTar, id, "send:0", strings.NewReader(""), io.Discard, l)
 		},
 	}
-	before := snapshotTree(t, h.root)
 	for name, call := range calls {
 		for _, id := range h.all {
+			// Per call, for the same reason as the wire test above.
+			before := snapshotTree(t, h.root)
 			err := call(id)
 			if err == nil {
 				t.Errorf("Local.%s accepted job id %q", name, id)
@@ -239,7 +244,7 @@ func TestLocalRejectsHostileJobIDs(t *testing.T) {
 			if !errors.As(err, &pe) || pe.Code != "usage" || !strings.Contains(pe.Message, "job id") {
 				t.Errorf("Local.%s job id %q: err = %v, want a usage error naming the job id", name, id, err)
 			}
+			assertTreeUnchanged(t, h.root, before)
 		}
 	}
-	assertTreeUnchanged(t, h.root, before)
 }
