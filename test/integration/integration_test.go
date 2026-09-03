@@ -43,8 +43,17 @@ func TestRunningSessionTeleportsToRunningOnDest(t *testing.T) {
 	if registry(t, "source", "alice", sid) != "" {
 		t.Error("source claude still registered: it must exit only after dest is confirmed")
 	}
-	if pane := sh(t, "source", "alice", "tmux capture-pane -p -t main:claude"); !strings.Contains(pane, "placeholder --resume "+sid) || !strings.Contains(pane, "--teleported-to") {
-		t.Errorf("source pane should show the placeholder command:\n%s", pane)
+	// The placeholder is TYPED AND ENTERED (tmuxx.TypeCommand sends Enter),
+	// so the pane is left RUNNING it, waiting at its "Enter = resume"
+	// prompt — by then the screen shows its banner, not the command line
+	// that started it. Assert both halves of that: the pane's foreground
+	// process is the placeholder, and the placeholder says where the
+	// session went (spec §6.3).
+	if pane := sh(t, "source", "alice", "tmux capture-pane -p -t main:claude"); !strings.Contains(pane, "teleported to dest") || !strings.Contains(pane, sid[:8]) {
+		t.Errorf("source pane should show the placeholder banner for %s:\n%s", sid, pane)
+	}
+	if cmd := sh(t, "source", "alice", "tmux list-panes -t main:claude -F '#{pane_current_command}'"); !strings.Contains(cmd, "claude-teleport") {
+		t.Errorf("source pane should be running the placeholder, got %q", cmd)
 	}
 	if hist := sh(t, "source", "alice", "cat ~/.local/share/claude-teleport/jobs/"+sid+"/history.jsonl"); !strings.Contains(hist, `"outcome":"success"`) {
 		t.Errorf("history: %s", hist)
@@ -60,10 +69,19 @@ func TestBangModeStopsParentDuringTransfer(t *testing.T) {
 	ensureTmuxServer(t, "dest", "alice")
 	sid := newSID(t)
 	seed(t, "source", "alice", "/home/alice/proj", sid)
-	sh(t, "source", "alice", "head -c 268435456 /dev/urandom > /home/alice/proj/big.bin")
-	startInTmux(t, "source", "alice", "/home/alice/proj", sid, "main",
-		"FAKECLAUDE_RUN_CHILD='claude-teleport --to dest "+teleportOpts+"'")
-	pid := strings.TrimSpace(sh(t, "source", "alice", "grep -l "+sid+" ~/.claude/sessions/*.json | head -1 | xargs cat | sed -n 's/.*\"pid\":\\([0-9]*\\).*/\\1/p'"))
+	// 1 GiB, for the same reason as scenario 3: 256 MB crosses this
+	// harness's docker bridge in about a second, which an external poll
+	// loop whose own docker-exec round trip is ~200-300ms cannot reliably
+	// catch.
+	sh(t, "source", "alice", "head -c 1073741824 /dev/urandom > /home/alice/proj/big.bin")
+	// NOT startInTmux: fakeclaude runs FAKECLAUDE_RUN_CHILD (its `!`-mode
+	// stand-in) before it ever reports "idle" — exactly as Claude Code is
+	// mid-turn while a `! claude-teleport` runs — so waiting for idle here
+	// would wait for the whole teleport to finish and leave no
+	// mid-transfer to observe. "busy" is written before the child starts.
+	sh(t, "source", "alice", "tmux -f /dev/null new-session -d -s main -n claude -c /home/alice/proj")
+	sh(t, "source", "alice", "tmux send-keys -t main:claude \"FAKECLAUDE_RUN_CHILD='claude-teleport --to dest "+teleportOpts+"' claude --resume "+sid+"\" Enter")
+	pid := pidFromRegistry(waitRegistry(t, "source", "alice", sid, "busy"))
 
 	sawStopped := false
 	deadline := time.Now().Add(90 * time.Second)
@@ -168,13 +186,26 @@ func TestNetworkDropThenContinueCompletes(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	// The link must stay down long enough to BE a drop: the tool
+	// deliberately survives a brief hiccup (TCP retransmits), and only
+	// gives up when its ssh keepalives go unanswered for
+	// ServerAliveInterval x ServerAliveCountMax (15s x 3 by default, so
+	// ~45-60s — internal/sshx). A 3-second pause proves nothing either
+	// way; jump therefore stays paused until the runner has actually
+	// died, and is only unpaused for the `continue` below. `source` is
+	// never paused, so the runner can still be observed throughout.
 	compose(t, "pause", "jump")
-	time.Sleep(3 * time.Second)
-	compose(t, "unpause", "jump")
-
+	unpaused := false
+	unpause := func() {
+		if !unpaused {
+			unpaused = true
+			compose(t, "unpause", "jump")
+		}
+	}
+	t.Cleanup(unpause)
 	deadline = time.Now().Add(3 * time.Minute)
 	for {
-		if _, code := shCode(t, "source", "alice", "pgrep -f 'claude-teleport internal-runner'"); code != 0 {
+		if _, code := shCode(t, "source", "alice", "pgrep -f '[c]laude-teleport internal-runner'"); code != 0 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -182,6 +213,7 @@ func TestNetworkDropThenContinueCompletes(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+	unpause()
 	journal := sh(t, "source", "alice", "cat ~/.local/share/claude-teleport/jobs/"+sid+"/job.json")
 	if !strings.Contains(journal, `"outcome": "failed"`) {
 		t.Errorf("job should have failed loudly with a continuable journal:\n%s", journal)
@@ -205,8 +237,9 @@ func TestNotLoggedInDestFailsSourceResumable(t *testing.T) {
 	startInTmux(t, "source", "alice", "/home/alice/proj", sid, "main", "")
 	// claude-teleport reaches dest over a fresh, non-interactive ssh exec
 	// (never a login shell), so ~/.bashrc is never sourced there; only
-	// sshd_config's AcceptEnv list or ~/.ssh/environment (already used for
-	// LC_ALL — see entrypoint.sh) reach that process's environment.
+	// sshd_config's AcceptEnv list or ~/.ssh/environment (created empty by
+	// entrypoint.sh, with PermitUserEnvironment on) reach that process's
+	// environment.
 	sh(t, "dest", "alice", "echo FAKECLAUDE_FAIL=not-logged-in >> ~/.ssh/environment")
 	t.Cleanup(func() { shCode(t, "dest", "alice", "sed -i '/FAKECLAUDE_FAIL/d' ~/.ssh/environment") })
 
