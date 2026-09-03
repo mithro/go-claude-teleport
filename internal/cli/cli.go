@@ -125,6 +125,15 @@ func nextHint(w io.Writer, id string) {
 	fmt.Fprintf(w, "next: claude-teleport status %s | claude-teleport continue %s | claude-teleport abandon %s\n", id, id, id)
 }
 
+// helpPointer is nextHint's counterpart for someone who hasn't told us
+// anything yet: the bare `claude-teleport` invocation (root.go's
+// teleportFlags.validate, bare==true) gets the usual "exactly one of --to/
+// --from is required" message, but that alone doesn't point anywhere —
+// unlike every other usage mistake, which at least named a flag the user
+// can go look up. This is the one case that's genuinely lost, so it's the
+// one that gets a pointer to --help appended.
+func helpPointer() string { return " (see 'claude-teleport --help')" }
+
 // resolvePaths computes the local session.Paths from HOME, CLAUDE_CONFIG_DIR
 // (overridden by --config-dir) and XDG_DATA_HOME.
 func (a *app) resolvePaths() (session.Paths, error) {

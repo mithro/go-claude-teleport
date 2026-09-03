@@ -89,6 +89,24 @@ func TestTeleportFlagValidation(t *testing.T) {
 	}
 }
 
+// TestBareInvocationPointsToHelp: the literal zero-argument invocation
+// (`claude-teleport`, nothing else) is the one usage mistake that doesn't
+// itself name a flag to go look up — every other case in
+// TestTeleportFlagValidation at least mentions --state, --map, etc. — so
+// it alone gets a pointer to --help appended (root.go's bare-detection,
+// cli.go's helpPointer). A real usage mistake like passing both --to and
+// --from is not "lost" the same way, so it must not carry the same hint.
+func TestBareInvocationPointsToHelp(t *testing.T) {
+	code, _, stderr := run(t, []string{"HOME=/home/alice"})
+	if code != ExitUsage || !strings.Contains(stderr, "exactly one of") || !strings.Contains(stderr, "--help") {
+		t.Fatalf("bare invocation: exit %d stderr %q", code, stderr)
+	}
+	code2, _, stderr2 := run(t, []string{"HOME=/home/alice"}, "--to", "a", "--from", "b")
+	if code2 != ExitUsage || strings.Contains(stderr2, "--help") {
+		t.Fatalf("--to and --from together: exit %d stderr %q (must not carry the bare-invocation hint)", code2, stderr2)
+	}
+}
+
 func TestHelpDocumentsEverything(t *testing.T) {
 	code, out, _ := run(t, nil, "--help")
 	if code != ExitOK {

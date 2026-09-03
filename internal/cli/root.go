@@ -37,10 +37,16 @@ type teleportFlags struct {
 
 var validStates = map[string]bool{"auto": true, "running": true, "suspended": true, "idle": true}
 
-// validate applies the cross-flag rules; it returns usage errors.
-func (f *teleportFlags) validate(args []string) error {
+// validate applies the cross-flag rules; it returns usage errors. bare is
+// true only for the literal zero-argument invocation (`claude-teleport`,
+// nothing else) — see helpPointer's doc comment.
+func (f *teleportFlags) validate(args []string, bare bool) error {
 	if (f.To == "") == (f.From == "") {
-		return Exit(ExitUsage, "exactly one of --teleport-to/--to or --teleport-from/--from is required")
+		msg := "exactly one of --teleport-to/--to or --teleport-from/--from is required"
+		if bare {
+			msg += helpPointer()
+		}
+		return Exit(ExitUsage, "%s", msg)
 	}
 	if !validStates[f.State] {
 		return Exit(ExitUsage, "--state must be auto, running, suspended or idle (got %q)", f.State)
@@ -81,7 +87,8 @@ func (a *app) rootCmd() *cobra.Command {
 		SilenceErrors: true,
 		Args:          cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := tf.validate(args); err != nil {
+			bare := len(args) == 0 && cmd.Flags().NFlag() == 0
+			if err := tf.validate(args, bare); err != nil {
 				return err
 			}
 			return exitErr(a.runTeleport(cmd.Context(), tf, args))
