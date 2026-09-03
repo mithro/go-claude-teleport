@@ -231,11 +231,20 @@ func (l *Local) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {
 	f, ok := l.freezers[pid]
 	delete(l.freezers, pid)
 	l.mu.Unlock()
-	if !ok {
-		return nil // not frozen by us: no-op (spec §6 step 9)
-	}
-	if err := f.Thaw(); err != nil {
-		return err
+	// A Local that never froze this pid is the NORMAL case for a re-dial:
+	// the freezer belongs to the process that ran step 4, and a dropped
+	// link, a killed runner or a plain `continue` all thaw from a fresh
+	// Local whose freezers map is empty. Releasing the SIGSTOP is then
+	// somebody else's job (the freezer helper exits with its owner and
+	// SIGCONTs on pipe EOF), but handing the terminal back is still ours:
+	// skipping restoreForeground here left the pane shell holding the pty,
+	// so the resumed Claude re-stopped on SIGTTIN and spec §6.3's "/exit"
+	// was typed into the shell instead (B2). restoreForeground's own
+	// guards no-op when there is genuinely nothing to restore.
+	if ok {
+		if err := f.Thaw(); err != nil {
+			return err
+		}
 	}
 	return l.restoreForeground(ctx, pid, ref)
 }
