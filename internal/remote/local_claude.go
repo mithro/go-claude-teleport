@@ -1,8 +1,10 @@
 package remote
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -39,8 +41,10 @@ func (l *Local) ClaudeStatus(ctx context.Context, id session.ID) (*session.Regis
 	return reg, true, nil
 }
 
-// ConfirmClaude implements spec §6.2: registry entry alive in our pane,
-// no failure marker in the pane, status idle — all within timeout.
+// ConfirmClaude implements spec §6.2: registry entry alive in our pane, no
+// failure marker in NEW pane output, and status idle — or, for a `-p` run
+// that never reaches idle, busy after it has produced a turn (case 3) —
+// all within timeout.
 func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration) (*session.Registry, error) {
 	// Both sides of this comparison are tmux's STORED session-name spelling
 	// (R-PRB-2): Claude Code writes registry.tmux from #{session_name}, and
@@ -48,7 +52,7 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 	// either side, or an escaped name could never match.
 	wantTmux := ""
 	if ref != nil {
-		wantTmux = fmt.Sprintf("%s:%s.%s", ref.Session, ref.WindowID, ref.PaneID)
+		wantTmux = tmuxx.RefString(ref)
 	}
 	// M3: one control connection for the whole poll, not one per 250ms
 	// iteration — the old shape spawned a `tmux -C attach-session` process
@@ -65,6 +69,57 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 	}
 	deadline := time.Now().Add(timeout)
 	last := "no registry entry for the session yet"
+
+	// M4: capture-pane -S - returns the WHOLE scrollback every time, which
+	// can still hold a failure marker (a stale login prompt, ...) left by
+	// an earlier, unrelated confirm attempt — this call always runs in a
+	// freshly re-spawned runner process (job continue/retry) with no
+	// memory of that attempt, so it cannot tell "stale" from "current" any
+	// other way. The first capture of THIS call is therefore treated as
+	// the pre-existing baseline and is never itself scanned; only output
+	// beyond it (this attempt's own new output, appended after the start
+	// keystroke that preceded this call) is checked. capture-pane's
+	// history is append-only in the ordinary case, so later captures keep
+	// the baseline as a byte-prefix; if that ever breaks (e.g. tmux's
+	// history-limit trimmed old lines), fall back to scanning the whole
+	// capture rather than silently miss real output.
+	//
+	// Disclosed trade-off: a failure that manifests in the fraction of a
+	// second between the start keystroke and this call's first capture
+	// would be folded into the baseline and missed here; confirmation
+	// still fails (via timeout) rather than succeeding wrongly, just with
+	// a less specific error. See task-21-report.md.
+	var markerBaseline []byte
+	haveMarkerBaseline := false
+
+	// M5 (spec §6.2 case 3): a `-p` (print) run's registry never reports
+	// "idle" — fakeclaude/real Claude Code do one exchange and remove the
+	// registry entry on exit rather than looping back to a prompt — so
+	// success for one is declared once its transcript has grown past this
+	// call's own baseline size (evidence a turn actually completed) while
+	// status is "busy". T26-1 closed task-21-report.md's disclosed
+	// detectability gap by capturing real registry entries (Claude Code
+	// 2.1.247 and 2.1.259): "kind" is "interactive" for a print run and an
+	// interactive one alike, and the field that actually differs is
+	// "entrypoint" ("sdk-cli" for -p, "cli" for a terminal session), so
+	// that is what the acceptance below gates on.
+	// Baselined once, up front, rather than at the first busy+print
+	// sighting: the growth that matters is growth since this call began.
+	transcriptBaseline := int64(-1)
+	if n, terr := l.transcriptSize(id); terr == nil {
+		transcriptBaseline = n
+	}
+	// B11: a print run removes its registry entry the moment it finishes,
+	// so the poll can miss the busy-with-a-completed-turn window entirely —
+	// one iteration sees it, the next sees nothing, and the confirm then
+	// burns the whole --start-timeout on a run that in fact succeeded.
+	// Remembering the print entry we DID see lets the same evidence (its
+	// transcript grew past the baseline) be accepted one poll late. Only a
+	// run whose entrypoint said "sdk-cli" qualifies: an interactive Claude
+	// whose entry disappears has not resumed, however much it wrote on the
+	// way down.
+	var lastPrintReg *session.Registry
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -74,8 +129,16 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 			if err != nil {
 				return nil, &Error{Code: "internal", Message: err.Error()}
 			}
-			if m, hit := HasFailureMarker(string(text)); hit {
-				return nil, &Error{Code: "conflict", Message: fmt.Sprintf("destination Claude did not resume: pane shows %q", m)}
+			if !haveMarkerBaseline {
+				markerBaseline, haveMarkerBaseline = text, true
+			} else {
+				fresh := text
+				if len(text) >= len(markerBaseline) && bytes.HasPrefix(text, markerBaseline) {
+					fresh = text[len(markerBaseline):]
+				}
+				if m, hit := HasFailureMarker(string(fresh)); hit {
+					return nil, &Error{Code: "conflict", Message: fmt.Sprintf("destination Claude did not resume: pane shows %q", m)}
+				}
 			}
 		}
 		reg, ok, err := l.ClaudeStatus(ctx, id)
@@ -84,19 +147,52 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 		}
 		switch {
 		case !ok:
+			if lastPrintReg != nil && transcriptBaseline >= 0 {
+				if n, terr := l.transcriptSize(id); terr == nil && n > transcriptBaseline {
+					l.opts.Logf("confirm: the print-mode run for %s exited between polls; its transcript grew %d -> %d bytes, so its turn completed", id, transcriptBaseline, n)
+					return lastPrintReg, nil
+				}
+			}
 			last = "no live registry entry for the session"
 		case wantTmux != "" && reg.Tmux != wantTmux:
 			last = fmt.Sprintf("registry pane %q is not our pane %q", reg.Tmux, wantTmux)
-		case reg.Status != "idle":
-			last = fmt.Sprintf("registry status is %q, waiting for idle", reg.Status)
-		default:
+		case reg.Status == "idle":
 			return reg, nil
+		// Real `claude -p` (2.1.247/2.1.259) never carries a status field
+		// while alive, so this arm cannot fire for it; print-mode acceptance
+		// for real Claude Code rests on the !ok arm above (lastPrintReg + transcript growth), not here.
+		case reg.Status == "busy" && strings.EqualFold(reg.Entrypoint, "sdk-cli"):
+			lastPrintReg = reg
+			if n, terr := l.transcriptSize(id); terr == nil {
+				if transcriptBaseline < 0 {
+					transcriptBaseline = n
+				} else if n > transcriptBaseline {
+					return reg, nil
+				}
+			}
+			last = "print-mode run is busy; waiting for its turn to finish"
+		default:
+			last = fmt.Sprintf("registry status is %q, waiting for idle", reg.Status)
 		}
 		if time.Now().After(deadline) {
 			return nil, &Error{Code: "conflict", Message: fmt.Sprintf("destination Claude not confirmed within %s: %s", timeout, last)}
 		}
 		l.opts.Sleep(confirmPoll)
 	}
+}
+
+// transcriptSize returns id's transcript size, used only as growth
+// evidence for the print-mode (`-p`) acceptance case above.
+func (l *Local) transcriptSize(id session.ID) (int64, error) {
+	path, err := session.FindTranscript(l.paths.ProjectsDir(), id)
+	if err != nil {
+		return 0, err
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
 }
 
 // ExitClaude implements spec §6.3: in tmux, /exit + Enter then wait for

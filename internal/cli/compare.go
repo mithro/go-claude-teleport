@@ -231,7 +231,9 @@ func (a *app) compareConfigRemote(cmd *cobra.Command, host string, via, opts []s
 	if destCwd != "" {
 		dstCwd = destCwd
 	}
-	local := remote.NewLocal(p, selfExe(), remote.LocalOptions{ProcRoot: "/proc", TmuxSocketDir: tmuxSocketDir(a.envSlice()), Logf: stderrLogf(a.stderr)})
+	localOpts, closeProbe := serverLocalOptions(ctx, a.envSlice(), stderrLogf(a.stderr))
+	defer closeProbe()
+	local := remote.NewLocal(p, selfExe(), localOpts)
 	localInfo, _ := local.Hello(ctx)
 	src, err := local.InventoryHost(ctx, cwd, localInfo.ClaudeVersion)
 	if err != nil {
@@ -242,6 +244,15 @@ func (a *app) compareConfigRemote(cmd *cobra.Command, host string, via, opts []s
 		return err
 	}
 	defer closeRemote()
+	// The same gate preflight applies (orchestrate/preflight.go, ruling
+	// R-P3-28c): two claude-teleport releases do not agree on the
+	// inventory's wire shape, so a comparison across them reports drift
+	// that is really a protocol difference. Refuse before any of it is
+	// collected or rendered — exit 4, spec §5, exactly as a teleport
+	// against the same peer would.
+	if ri := rc.Info(); ri.Version != localInfo.Version {
+		return fail(ExitUnreachable, "claude-teleport version mismatch: here %s, %s %s — install the same version on both hosts", localInfo.Version, host, ri.Version)
+	}
 	dst, err := rc.InventoryHost(ctx, dstCwd, rc.Info().ClaudeVersion)
 	if err != nil {
 		return Exit(ExitFailed, "%s inventory: %v", host, err)

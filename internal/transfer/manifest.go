@@ -30,6 +30,20 @@ type Entry struct {
 	Symlink   string           `json:"symlink,omitempty"`
 	Rewrite   bool             `json:"rewrite"`
 	FFAllowed bool             `json:"ff_allowed"` // transcript/sidecar of THIS session
+
+	// Deferred means Diff must classify this entry purely by staging
+	// state, never by comparing against whatever the destination's own
+	// current file at Dst already holds — that comparison is meaningless
+	// for two different kinds of entry: git-attach's existing-main dirty
+	// index/worktree files (Dst is the destination's own pre-existing
+	// checkout; installManifest also excludes these, since git-attach
+	// places them itself with git's own semantics) and a job's pane
+	// capture (Dst can hold an unrelated prior attempt's snapshot at the
+	// very same path; capture.txt IS still installed by the plain
+	// file-install path, just judged only against staging). Either way, a
+	// difference at Dst is expected and never a reason to refuse or to
+	// skip staging the source's copy.
+	Deferred bool `json:"deferred,omitempty"`
 }
 
 func (e Entry) IsDir() bool     { return os.FileMode(e.Mode)&os.ModeDir != 0 }
@@ -45,7 +59,20 @@ type Manifest struct {
 	PathMap    session.PathMap   `json:"path_map"`
 	Entries    []Entry           `json:"entries"`
 	Skipped    []session.Skipped `json:"skipped"`
-	TmpDir     string            `json:"-"` // where Send writes rewritten temp files ("" = os.TempDir())
+	// Roots is ruling R-P3-B1d (reshaped by R-P3-B1e): the destination
+	// repository root(s) a CatRepo/CatWorktree entry's Dst must lie under
+	// — gitx.Plan's own DstMain and DstWorktree (not-a-repo: DstWorktree
+	// alone, the destination cwd, flagged MayPreExist; see
+	// transfer.GitRoots, populated by internal/orchestrate's
+	// annotateManifest). Never trusted at face value: Diff/Install
+	// re-validate every declared Root on its REAL path (EvalSymlinks:
+	// under Home, not Home itself, outside ConfigDir/DataDir, no
+	// dot-prefixed first component) and, for entries carrying content,
+	// require the Root to have been created by this very job
+	// (jobs/<id>/roots.json) unless it is not-a-repo mode's
+	// user-chosen destination directory.
+	Roots  []Root `json:"roots,omitempty"`
+	TmpDir string `json:"-"` // where Send writes rewritten temp files ("" = os.TempDir())
 }
 
 // ErrForbidden is returned by Build when an entry is a never-transferred path.
@@ -72,12 +99,21 @@ func Build(ctx context.Context, jobID string, id session.ID, srcHost, dstHost st
 			ID:       i,
 			Category: f.Category,
 			Src:      f.Path(),
-			Dst:      filepath.Join(pm.ApplyPath(f.Root), filepath.FromSlash(f.Rel)),
-			Size:     f.Size,
-			Mode:     uint32(f.Mode),
-			ModTime:  f.ModTime,
-			Symlink:  f.Symlink,
-			Rewrite:  f.Rewrite,
+			// pm is applied to the FULL joined path, not just Root, so a
+			// mapping more specific than a plain Home prefix (e.g. source
+			// project dir -> destination project dir, spec §7.2 ruling
+			// R-P3-18a) can match and rewrite a path component nested
+			// inside Root's own tail (Munge() flattens a cwd into one
+			// non-decomposable path segment, so a Root-only prefix rewrite
+			// can never reach inside it). For a pure-prefix mapping whose
+			// From ends at or before Root, this is output-identical to
+			// applying pm to Root and joining Rel afterwards.
+			Dst:     pm.ApplyPath(filepath.Join(f.Root, filepath.FromSlash(f.Rel))),
+			Size:    f.Size,
+			Mode:    uint32(f.Mode),
+			ModTime: f.ModTime,
+			Symlink: f.Symlink,
+			Rewrite: f.Rewrite,
 		}
 		e.FFAllowed = f.Category == session.CatSession && ffAllowed(f.Rel, id)
 		if e.IsRegular() {

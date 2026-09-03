@@ -109,22 +109,41 @@ func TypeCommand(ctx context.Context, t Transport, paneID string, argv []string)
 
 var shells = map[string]bool{"bash": true, "zsh": true, "sh": true, "fish": true, "dash": true}
 
+// IsShell reports whether comm (a /proc comm) is one of the interactive
+// shells a pane may run.
+func IsShell(comm string) bool { return shells[comm] }
+
+// PanePID is the pid of the process tmux itself started in the pane — the
+// shell, in an ordinary pane. It leads its own process group, so it is
+// also the group the pty's foreground reverts to when a job-control shell
+// takes the terminal back from a stopped job.
+func PanePID(ctx context.Context, t Transport, paneID string) (int, error) {
+	if err := checkTargetID("pane pid", paneSigil, paneID); err != nil {
+		return 0, err
+	}
+	lines, err := t.Run(ctx, fmt.Sprintf(`list-panes -t %s -F "#{pane_pid}"`, Quote(paneID)))
+	if err != nil {
+		return 0, fmt.Errorf("list-panes %s: %w", paneID, err)
+	}
+	if len(lines) == 0 {
+		return 0, fmt.Errorf("pane %s: no such pane", paneID)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(lines[0]))
+	if err != nil {
+		return 0, fmt.Errorf("pane %s: pane_pid %q: %w", paneID, lines[0], err)
+	}
+	return pid, nil
+}
+
 // State reports the pane's foreground process (first non-shell process in
 // the pane's subtree, else the shell) and its last 50 lines.
 func State(ctx context.Context, t Transport, paneID string, procs *procx.Table) (*PaneState, error) {
 	if err := checkTargetID("pane state", paneSigil, paneID); err != nil {
 		return nil, err
 	}
-	lines, err := t.Run(ctx, fmt.Sprintf(`list-panes -t %s -F "#{pane_pid}"`, Quote(paneID)))
+	panePID, err := PanePID(ctx, t, paneID)
 	if err != nil {
-		return nil, fmt.Errorf("list-panes %s: %w", paneID, err)
-	}
-	if len(lines) == 0 {
-		return nil, fmt.Errorf("pane %s: no such pane", paneID)
-	}
-	panePID, err := strconv.Atoi(strings.TrimSpace(lines[0]))
-	if err != nil {
-		return nil, fmt.Errorf("pane %s: pane_pid %q: %w", paneID, lines[0], err)
+		return nil, err
 	}
 	st := &PaneState{PaneID: paneID}
 	shell, ok := procs.Get(panePID)

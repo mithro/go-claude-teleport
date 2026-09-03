@@ -41,7 +41,7 @@ func (f *fakeProbe) ListPanes() ([]PaneInfo, error) {
 func (f *fakeProbe) SocketPath() string { return f.socket }
 
 func fixturePaths() Paths {
-	p := NewPaths("/home/alice", "testdata/config", "/tmp/xdg")
+	p := NewPaths("/home/alice", "testdata/config", "/tmp/xdg", true)
 	p.ProcRoot = "testdata/proc"
 	return p
 }
@@ -161,7 +161,7 @@ func TestResolveAmbiguousPrefix(t *testing.T) {
 	// registry name path: not ambiguous either. Ambiguity is exercised by a
 	// temp project dir with two sessions sharing a prefix.
 	dir := t.TempDir()
-	p := NewPaths("/home/alice", dir, dir)
+	p := NewPaths("/home/alice", dir, dir, true)
 	proj := p.ProjectDir("/home/alice/x")
 	mustMkdir(t, proj)
 	for _, id := range []string{"deadbeef-0000-4000-8000-000000000001", "deadbeef-0000-4000-8000-000000000002"} {

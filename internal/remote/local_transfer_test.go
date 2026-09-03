@@ -2,6 +2,8 @@ package remote
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,7 +13,77 @@ import (
 
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
+
+// TestLocalDeleteInstalledOnlyNamedIDs covers abandon's destination-side
+// deletion (Task 23, ruling E): DeleteInstalled must remove only the
+// manifest entries named by ids, never an entry that happens to match the
+// manifest hash but was not named — the id list is how abandon restricts
+// deletion to files THIS job actually installed (preflight status Absent).
+func TestLocalDeleteInstalledOnlyNamedIDs(t *testing.T) {
+	p := testPaths(t)
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
+	dir := filepath.Join(p.ConfigDir, "projects", "-home-alice-proj")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(dir, "keep.jsonl")
+	gone := filepath.Join(dir, "gone.jsonl")
+	if err := os.WriteFile(keep, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gone, []byte("gone\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha := func(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
+	m := &transfer.Manifest{Version: 1, JobID: sid, SessionID: sid, Entries: []transfer.Entry{
+		{ID: 0, Category: session.CatSession, Dst: dir, Mode: uint32(os.ModeDir | 0o700)},
+		{ID: 1, Category: session.CatSession, Dst: keep, Size: 5, Mode: 0o600, SHA256: sha("keep\n")},
+		{ID: 2, Category: session.CatSession, Dst: gone, Size: 5, Mode: 0o600, SHA256: sha("gone\n")},
+	}}
+	// Both files must have been installed BY THIS JOB for deletion to be
+	// possible at all (ruling R-P3-B1f N3), so the fixture installs them
+	// for real — writing the destination's own jobs/<id>/installed.json —
+	// instead of just dropping matching bytes on disk.
+	staging := job.StagingDir(p.DataDir, sid)
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for id, content := range map[int]string{1: "keep\n", 2: "gone\n"} {
+		if err := os.WriteFile(transfer.StagedPath(staging, id), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(keep); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Install(context.Background(), m, sid); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := l.DeleteInstalled(context.Background(), m, []int{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(gone); !os.IsNotExist(err) {
+		t.Errorf("named entry must be removed")
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("unnamed entry must survive: %v", err)
+	}
+	var found bool
+	for _, d := range deleted {
+		if d == gone {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("deleted = %v, want it to include %s", deleted, gone)
+	}
+}
 
 func TestLocalCleanupRemovesStaging(t *testing.T) {
 	p := testPaths(t)
@@ -75,7 +147,27 @@ func TestLocalListSessionsScansRegistryAndProjects(t *testing.T) {
 
 	// idA (sid) has a live registry entry: pid 5150 is alive in this
 	// ProcRoot, matching writeRegistry's hardcoded procStart "777".
-	l := NewLocal(p, "x", LocalOptions{ProcRoot: fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})})
+	//
+	// Both idA and idC also have a placeholder pane. idA's must be
+	// ignored — a live registry entry means the session is running, and
+	// the pane it runs in can legitimately still show a placeholder argv
+	// mid-handover — while idC's is the only evidence it exists at all,
+	// so idC is the suspended one (same precedence session.Load applies).
+	probe := &paneProbe{
+		socket: "/run/tmux/default",
+		panes: map[string][]string{
+			"%1": {"claude-teleport", "placeholder", "--resume", sid},
+			"%3": {"claude-teleport", "placeholder", "--resume", string(idC)},
+		},
+		infos: []session.PaneInfo{
+			{Session: "work", WindowID: "@1", PaneID: "%1"},
+			{Session: "work", WindowID: "@3", PaneID: "%3"},
+		},
+	}
+	l := NewLocal(p, "x", LocalOptions{
+		ProcRoot: fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}}),
+		Probe:    probe,
+	})
 	writeRegistry(t, p, 5150, "busy", "work:@1.%1")
 
 	// idB also has a registry entry, but its pid (6161) is not in the proc
@@ -113,7 +205,7 @@ func TestLocalListSessionsScansRegistryAndProjects(t *testing.T) {
 		t.Errorf("idB (registry row for a dead pid must not count as running) summary = %+v", b)
 	}
 	c := out[0]
-	if c.State != "idle" || c.Cwd != "/home/alice/proj-c" || c.Tmux != "" {
-		t.Errorf("idC (no registry entry at all) summary = %+v", c)
+	if c.State != "suspended" || c.Cwd != "/home/alice/proj-c" || c.Tmux != "work:@3.%3" {
+		t.Errorf("idC (no registry entry, held by a placeholder pane) summary = %+v", c)
 	}
 }

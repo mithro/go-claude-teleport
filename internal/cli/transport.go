@@ -14,15 +14,12 @@ import (
 	"github.com/kevinburke/ssh_config"
 	"github.com/spf13/cobra"
 
-	"github.com/mithro/go-claude-teleport/internal/job"
+	"github.com/mithro/go-claude-teleport/internal/procx"
 	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/sshx"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 )
-
-// RunnerSteps is registered by Plan 03's orchestrator; nil means the
-// detached runner cannot run any job yet.
-var RunnerSteps func(j *job.Journal, logf func(string, ...any)) ([]job.Step, error)
 
 // fail is shorthand for Plan 01's cli.Exit: it returns a *cli.ExitError
 // carrying a spec §5 exit code out of a cobra RunE (Plan 01's Main maps it).
@@ -41,7 +38,11 @@ func envPaths(env []string) (session.Paths, error) {
 	if home == "" {
 		return session.Paths{}, errors.New("HOME is not set")
 	}
-	return session.NewPaths(home, envValue(env, "CLAUDE_CONFIG_DIR"), envValue(env, "XDG_DATA_HOME")), nil
+	// The fourth argument is CLAUDE_CONFIG_DIR's PRESENCE (T26-2): an env
+	// slice cannot carry "set to empty" meaningfully — Claude Code treats
+	// an empty value as unset — so a non-empty value is exactly presence.
+	cfg := envValue(env, "CLAUDE_CONFIG_DIR")
+	return session.NewPaths(home, cfg, envValue(env, "XDG_DATA_HOME"), cfg != ""), nil
 }
 
 // cmdEnv is how Plan 01's Main hands the env slice and stdio to commands:
@@ -73,6 +74,60 @@ func selfExe() string {
 		return "claude-teleport"
 	}
 	return exe
+}
+
+// serverLocalOptions builds the remote.LocalOptions used by every
+// server-side / non-app construction of a remote.Local (remote serve,
+// remote stream, compare's local half) — and, through a.localEndpoint,
+// this host's own endpoint too, so the two can never drift apart.
+//
+// Tmux MUST be wired here: remote.Local refuses every tmux op outright
+// when opts.Tmux is nil (local_tmux.go's "unavailable" guard), so a
+// `remote serve` built without it reports "no usable tmux server" for
+// every destination — even one with a live server — and preflight then
+// refuses any end state but idle. That was the single biggest failure in
+// the Docker integration suite (task-25-report.md, Bug 1).
+//
+// The pane Probe must be wired here too (finding A4): remote.NewLocal
+// derives none of its own, so without it every SUSPENDED session on this
+// host reads as idle over the wire — selector rule 4 (<tmux-session>
+// <window>) cannot resolve there, a placeholder pane is invisible to a
+// remote ResolveSession/InspectSession, and `--from host` silently
+// downgrades the end state. The socket is $TMUX first, then spec §9
+// discovery, exactly as an interactive invocation resolves it; the
+// returned closeFn releases the control connection the probe holds (a
+// no-op when there is no reachable server).
+func serverLocalOptions(ctx context.Context, env []string, logf func(string, ...any)) (remote.LocalOptions, func()) {
+	opts := remote.LocalOptions{
+		ProcRoot: "/proc",
+		// tmuxx.Dial, not tmuxx.DialControl directly: it is the package's
+		// one swappable dialer (tmuxx.FindServer's own liveness probe
+		// already goes through it) and defaults to DialControl.
+		Tmux:          func(ctx context.Context, sock string) (tmuxx.Transport, error) { return tmuxx.Dial(ctx, sock) },
+		TmuxSocketDir: tmuxSocketDir(env),
+		Logf:          logf,
+	}
+	noop := func() {}
+	sock := ""
+	if t := envValue(env, "TMUX"); t != "" {
+		sock = strings.SplitN(t, ",", 2)[0]
+	} else if s, err := tmuxx.FindServer(opts.TmuxSocketDir, "", ""); err == nil {
+		sock = s
+	}
+	if sock == "" {
+		return opts, noop
+	}
+	tr, err := tmuxx.Dial(ctx, sock)
+	if err != nil {
+		return opts, noop
+	}
+	procs, err := procx.Scan(opts.ProcRoot)
+	if err != nil {
+		tr.Close()
+		return opts, noop
+	}
+	opts.Probe = tmuxx.Prober(ctx, tr, procs, sock)
+	return opts, func() { tr.Close() }
 }
 
 // tmuxSocketDir resolves $TMUX_TMPDIR, defaulting to /tmp/tmux-<uid> when
@@ -157,7 +212,6 @@ func dialTarget(ctx context.Context, target string, via []string, opts []string,
 // AddTransportCommands registers remote serve|stream and internal-runner.
 func AddTransportCommands(root *cobra.Command) {
 	root.AddCommand(statusCmd())
-	root.AddCommand(abandonCmd())
 
 	remoteCmd := &cobra.Command{Use: "remote", Short: "internal: remote helper", Hidden: true}
 	remoteCmd.AddCommand(&cobra.Command{
@@ -169,7 +223,9 @@ func AddTransportCommands(root *cobra.Command) {
 			if err != nil {
 				return fail(ExitUsage, "%v", err)
 			}
-			local := remote.NewLocal(p, selfExe(), remote.LocalOptions{ProcRoot: "/proc", TmuxSocketDir: tmuxSocketDir(e.env), Logf: stderrLogf(e.stderr)})
+			opts, closeProbe := serverLocalOptions(cmd.Context(), e.env, stderrLogf(e.stderr))
+			defer closeProbe()
+			local := remote.NewLocal(p, selfExe(), opts)
 			if err := remote.Serve(cmd.Context(), e.stdin, e.stdout, local); err != nil {
 				return fail(ExitFailed, "remote serve: %v", err)
 			}
@@ -185,7 +241,9 @@ func AddTransportCommands(root *cobra.Command) {
 			if err != nil {
 				return fail(ExitUsage, "%v", err)
 			}
-			local := remote.NewLocal(p, selfExe(), remote.LocalOptions{ProcRoot: "/proc", TmuxSocketDir: tmuxSocketDir(e.env), Logf: stderrLogf(e.stderr)})
+			opts, closeProbe := serverLocalOptions(cmd.Context(), e.env, stderrLogf(e.stderr))
+			defer closeProbe()
+			local := remote.NewLocal(p, selfExe(), opts)
 			if err := remote.ServeStream(cmd.Context(), remote.StreamKind(args[0]), args[1], args[2], e.stdin, e.stdout, local); err != nil {
 				return fail(ExitFailed, "%v", err)
 			}
@@ -193,39 +251,7 @@ func AddTransportCommands(root *cobra.Command) {
 		},
 	})
 	root.AddCommand(remoteCmd)
-
-	root.AddCommand(&cobra.Command{
-		Use:    "internal-runner <job-dir>",
-		Hidden: true,
-		Args:   cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			e := envOf(cmd)
-			jobDir := filepath.Clean(args[0])
-			id := filepath.Base(jobDir)
-			dataDir := filepath.Dir(filepath.Dir(jobDir))
-			j, found, err := job.Open(dataDir, id)
-			if err != nil {
-				return fail(ExitFailed, "%v", err)
-			}
-			if !found {
-				return fail(ExitFailed, "no journal at %s", jobDir)
-			}
-			logf := stderrLogf(e.stderr)
-			if RunnerSteps == nil {
-				return fail(ExitFailed, "internal-runner: no steps registered for job %s (orchestrator arrives in Plan 03)", id)
-			}
-			steps, err := RunnerSteps(j, logf)
-			if err != nil {
-				return fail(ExitFailed, "%v", err)
-			}
-			j.RunnerPID = os.Getpid()
-			if err := j.Save(); err != nil {
-				return fail(ExitFailed, "%v", err)
-			}
-			if err := job.Run(cmd.Context(), j, steps, logf); err != nil {
-				return fail(ExitFailed, "%v", err)
-			}
-			return nil
-		},
-	})
+	// internal-runner is registered by root.go (newInternalRunnerCmd, Task
+	// 21) — the real orchestrator now exists; there is no provisional stub
+	// to fall back to.
 }

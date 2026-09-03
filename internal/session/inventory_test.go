@@ -88,7 +88,7 @@ func TestInventoryFiles(t *testing.T) {
 // recorded as symlinks (never followed), fifos are skipped and reported.
 func TestInventoryNeverReturnsForbidden(t *testing.T) {
 	dir := t.TempDir()
-	p := NewPaths("/home/alice", dir, dir)
+	p := NewPaths("/home/alice", dir, dir, true)
 	const sid = "deadbeef-0000-4000-8000-000000000001"
 	proj := p.ProjectDir("/home/alice/x")
 	mustWrite(t, proj+"/"+sid+".jsonl", `{"type":"user","cwd":"/home/alice/x","sessionId":"`+sid+`","message":{"content":"hi"}}`+"\n")

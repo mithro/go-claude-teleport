@@ -41,10 +41,25 @@ type Endpoint interface {
 	Install(ctx context.Context, m *transfer.Manifest, jobID string) (*transfer.InstallReport, error)
 	GitAttach(ctx context.Context, plan *gitx.Plan, jobID string) error
 	Cleanup(ctx context.Context, jobID string) error
+	// DeleteInstalled removes the manifest entries named by ids from this
+	// host when their current content still matches the manifest hash
+	// (spec §7.4/abandon --delete-destination-files); see
+	// transfer.UninstallIDs for the containment and hash-check semantics.
+	DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids []int) ([]string, error)
+	// RemoveJob removes jobs/<jobID>/ (manifest.json, extras.json, ...)
+	// entirely — unlike Cleanup, which only removes staging. Ruling
+	// R-P3-23i: this exists so inspect --host's throwaway job dir does
+	// not linger on the destination forever; the wire dispatch handler
+	// (not Local) refuses any jobID not prefixed "inspect-", so a real
+	// job's directory can never be removed this way.
+	RemoveJob(ctx context.Context, jobID string) error
 
 	// processes and panes
-	Freeze(ctx context.Context, pid int, startTime string) error
-	Thaw(ctx context.Context, pid int) error
+	// Freeze SIGSTOPs pid; ref is the pane it runs in (nil when not in
+	// tmux), which the freezer needs to hand the terminal back itself if
+	// the caller dies (R-P3-F1).
+	Freeze(ctx context.Context, pid int, startTime string, ref *session.TmuxRef) error
+	Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error
 	Capture(ctx context.Context, ref *session.TmuxRef, jobID string) error
 	OpenWindow(ctx context.Context, p *tmuxx.Plan) (*session.TmuxRef, error)
 	KillWindow(ctx context.Context, ref *session.TmuxRef) error

@@ -77,6 +77,10 @@ func (l *Local) OpenWindow(ctx context.Context, p *tmuxx.Plan) (*session.TmuxRef
 
 // Capture writes jobs/<jobID>/capture.txt on this host.
 func (l *Local) Capture(ctx context.Context, ref *session.TmuxRef, jobID string) error {
+	// Before the pane is even dialled: the capture lands in jobs/<jobID>/.
+	if err := checkJobID(jobID); err != nil {
+		return err
+	}
 	if ref == nil {
 		return &Error{Code: "usage", Message: "capture: nil pane ref"}
 	}

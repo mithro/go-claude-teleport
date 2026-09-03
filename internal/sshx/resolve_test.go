@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/kevinburke/ssh_config"
@@ -114,5 +115,43 @@ func TestResolveNilConfig(t *testing.T) {
 	}
 	if r.HostName != "x.example" || r.User != "bob" || r.Port != 22 {
 		t.Errorf("nil config defaults: %+v", r)
+	}
+}
+
+// TestResolveKeepaliveFromConfig covers the second half of the keepalive
+// fix-wave item: OpenSSH reads ServerAliveInterval/ServerAliveCountMax from
+// ~/.ssh/config, so a host configured there must get the same treatment as
+// one given them with -o. An explicit -o still wins.
+func TestResolveKeepaliveFromConfig(t *testing.T) {
+	cfg, err := ssh_config.Decode(strings.NewReader(`
+Host slow
+  ServerAliveInterval 60
+  ServerAliveCountMax 2
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := Resolve(Target{Host: "slow"}, cfg, nil, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	i, c, err := keepaliveSettings(Options{}, r.Options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i != 60*time.Second || c != 2 {
+		t.Errorf("config keepalives = %s/%d, want 1m0s/2", i, c)
+	}
+
+	r, err = Resolve(Target{Host: "slow"}, cfg, map[string]string{"ServerAliveInterval": "5"}, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	i, c, err = keepaliveSettings(Options{}, r.Options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i != 5*time.Second || c != 2 {
+		t.Errorf("-o over config = %s/%d, want 5s/2", i, c)
 	}
 }

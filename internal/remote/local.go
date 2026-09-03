@@ -148,6 +148,10 @@ func (l *Local) InventoryHost(ctx context.Context, cwd, claudeVersion string) (*
 // ConfirmClaude, ExitClaude and ClaudeStatus are implemented in
 // local_claude.go. RunPtyResume is implemented in local_pty.go.
 
+// jobDir/stagingDir/extrasPath join a job id straight into the data dir,
+// so every exported method that reaches them checks the id first with
+// checkJobID (R-P3-23n) — the wire dispatch validates too, but Local is
+// reachable without it.
 func (l *Local) jobDir(jobID string) string     { return job.Dir(l.paths.DataDir, jobID) }
 func (l *Local) stagingDir(jobID string) string { return job.StagingDir(l.paths.DataDir, jobID) }
 func (l *Local) extrasPath(jobID string) string { return filepath.Join(l.jobDir(jobID), "extras.json") }
@@ -155,8 +159,14 @@ func (l *Local) extrasPath(jobID string) string { return filepath.Join(l.jobDir(
 // ManifestDiff persists the manifest under jobs/<id>/ (the tar stream
 // receiver needs it) and classifies every entry.
 func (l *Local) ManifestDiff(ctx context.Context, m *transfer.Manifest, jobID string) (map[int]transfer.Status, error) {
+	if err := checkJobID(jobID); err != nil {
+		return nil, err
+	}
 	if m == nil {
 		return nil, &Error{Code: "usage", Message: "manifest-diff: nil manifest"}
+	}
+	if m.JobID != jobID {
+		return nil, &Error{Code: "usage", Message: fmt.Sprintf("manifest-diff: manifest JobID %q does not match job %q", m.JobID, jobID)}
 	}
 	if err := os.MkdirAll(l.jobDir(jobID), 0o700); err != nil {
 		return nil, err
@@ -164,11 +174,30 @@ func (l *Local) ManifestDiff(ctx context.Context, m *transfer.Manifest, jobID st
 	if err := m.Save(filepath.Join(l.jobDir(jobID), "manifest.json")); err != nil {
 		return nil, err
 	}
-	return transfer.Diff(ctx, m, l.stagingDir(jobID))
+	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID), l.paths)
+	if err != nil {
+		return nil, refusalError(err)
+	}
+	return st, nil
+}
+
+// refusalError turns transfer's "the destination may never write this
+// entry" verdict into a wire error the driver can tell apart from an I/O
+// failure (ruling R-P3-B1e item 5: preflight reports it as a refusal
+// naming the entry and the reason, never as a content collision). Anything
+// else passes through untouched.
+func refusalError(err error) error {
+	if transfer.IsRefusal(err) {
+		return &Error{Code: "refused", Message: err.Error()}
+	}
+	return err
 }
 
 // PutInstallExtras stores the merge inputs for Install under jobs/<id>/extras.json.
 func (l *Local) PutInstallExtras(ctx context.Context, jobID string, extra transfer.InstallExtras) error {
+	if err := checkJobID(jobID); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(extra)
 	if err != nil {
 		return err
@@ -183,9 +212,18 @@ func (l *Local) PutInstallExtras(ctx context.Context, jobID string, extra transf
 // keyed by the direction streamID carries).
 
 func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string) (*transfer.InstallReport, error) {
-	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID))
-	if err != nil {
+	if err := checkJobID(jobID); err != nil {
 		return nil, err
+	}
+	if m == nil {
+		return nil, &Error{Code: "usage", Message: "install: nil manifest"}
+	}
+	if m.JobID != jobID {
+		return nil, &Error{Code: "usage", Message: fmt.Sprintf("install: manifest JobID %q does not match job %q", m.JobID, jobID)}
+	}
+	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID), l.paths)
+	if err != nil {
+		return nil, refusalError(err)
 	}
 	var extra transfer.InstallExtras
 	raw, err := os.ReadFile(l.extrasPath(jobID))
@@ -196,16 +234,31 @@ func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	return transfer.Install(ctx, m, st, l.stagingDir(jobID), l.paths, extra)
+	rep, err := transfer.Install(ctx, m, st, l.stagingDir(jobID), l.paths, extra)
+	if err != nil {
+		return rep, refusalError(err)
+	}
+	return rep, nil
 }
 
-func (l *Local) Freeze(ctx context.Context, pid int, startTime string) error {
+// Freeze SIGSTOPs pid through a freezer helper that outlives this process.
+//
+// ref is the pane pid runs in (nil when it is not in tmux): the helper is
+// given it so that, if this process dies, its own SIGCONT on pipe EOF can
+// be followed by the same foreground restore Thaw would have done —
+// otherwise the pane's shell keeps the pty and the resumed Claude re-stops
+// on SIGTTIN (ruling R-P3-F1).
+func (l *Local) Freeze(ctx context.Context, pid int, startTime string, ref *session.TmuxRef) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, ok := l.freezers[pid]; ok {
 		return nil
 	}
-	f, err := procx.Freeze(l.selfExe, pid, startTime)
+	var pane procx.PaneRef
+	if ref != nil {
+		pane = procx.PaneRef{SocketPath: ref.SocketPath, PaneID: ref.PaneID}
+	}
+	f, err := procx.Freeze(l.selfExe, pid, startTime, pane)
 	if err != nil {
 		return err
 	}
@@ -213,24 +266,86 @@ func (l *Local) Freeze(ctx context.Context, pid int, startTime string) error {
 	return nil
 }
 
-func (l *Local) Thaw(ctx context.Context, pid int) error {
+func (l *Local) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {
 	l.mu.Lock()
 	f, ok := l.freezers[pid]
 	delete(l.freezers, pid)
 	l.mu.Unlock()
-	if !ok {
-		return nil // not frozen by us: no-op (spec §6 step 9)
+	// A Local that never froze this pid is the NORMAL case for a re-dial:
+	// the freezer belongs to the process that ran step 4, and a dropped
+	// link, a killed runner or a plain `continue` all thaw from a fresh
+	// Local whose freezers map is empty. Releasing the SIGSTOP is then
+	// somebody else's job (the freezer helper exits with its owner and
+	// SIGCONTs on pipe EOF), but handing the terminal back is still ours:
+	// skipping restoreForeground here left the pane shell holding the pty,
+	// so the resumed Claude re-stopped on SIGTTIN and spec §6.3's "/exit"
+	// was typed into the shell instead (B2). restoreForeground's own
+	// guards no-op when there is genuinely nothing to restore.
+	if ok {
+		if err := f.Thaw(); err != nil {
+			return err
+		}
+		// The helper's own notices — "signalling the pid alone" when the
+		// process group could not safely be signalled — are only complete
+		// once Thaw has waited for it, and used to be rendered solely when
+		// the helper ALSO failed. A freeze that covered less than spec
+		// §6.1 intends belongs in log.txt on the success path too.
+		if w := f.Warnings(); w != "" {
+			l.opts.Logf("thaw: the freezer for pid %d reported: %s", pid, w)
+		}
 	}
-	return f.Thaw()
+	return l.restoreForeground(ctx, pid, ref)
+}
+
+// restoreForeground gives the thawed job the pty back by asking the pane's
+// own shell to `fg` it — see tmuxx.RestoreForeground, which is the single
+// implementation of that dance, shared with the freezer helper's
+// owner-died path (ruling R-P3-F1). Local's part is the dialling, the
+// injected /proc root, sleep and logger, and turning the "never came back"
+// case into a remote Error.
+func (l *Local) restoreForeground(ctx context.Context, pid int, ref *session.TmuxRef) error {
+	if ref == nil || l.opts.Tmux == nil {
+		return nil
+	}
+	// Dialling is the expensive part, so keep the cheap /proc checks that
+	// prove there is anything to restore ahead of it.
+	pgid, err := procx.ProcGroup(l.opts.ProcRoot, pid)
+	if err != nil {
+		return nil // the target is gone: nothing to foreground
+	}
+	fg, err := procx.ForegroundGroup(l.opts.ProcRoot, pid)
+	if err != nil || fg <= 0 || fg == pgid {
+		return nil
+	}
+	t, err := l.dial(ctx, ref.SocketPath)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+	err = tmuxx.RestoreForeground(ctx, t, ref.PaneID, pid, tmuxx.ForegroundOptions{
+		ProcRoot: l.opts.ProcRoot,
+		Logf:     func(format string, args ...any) { l.opts.Logf("thaw: "+format, args...) },
+		Sleep:    l.opts.Sleep,
+	})
+	if errors.Is(err, tmuxx.ErrNotRestored) {
+		return &Error{Code: "conflict", Message: fmt.Sprintf("thawed claude (pid %d) did not get its terminal back within %s", pid, tmuxx.ForegroundTimeout)}
+	}
+	return err
 }
 
 func (l *Local) JournalGet(ctx context.Context, jobID string) (*job.Journal, bool, error) {
+	if err := checkJobID(jobID); err != nil {
+		return nil, false, err
+	}
 	return job.Open(l.paths.DataDir, jobID)
 }
 
 func (l *Local) JournalPut(ctx context.Context, j *job.Journal) error {
 	if j == nil {
 		return &Error{Code: "usage", Message: "journal-put: nil journal"}
+	}
+	if err := checkJobID(j.ID); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(l.jobDir(j.ID), 0o700); err != nil {
 		return err
@@ -240,5 +355,8 @@ func (l *Local) JournalPut(ctx context.Context, j *job.Journal) error {
 }
 
 func (l *Local) Record(ctx context.Context, jobID string, rec job.HistoryRecord) error {
+	if err := checkJobID(jobID); err != nil {
+		return err
+	}
 	return job.AppendHistory(l.jobDir(jobID), rec)
 }

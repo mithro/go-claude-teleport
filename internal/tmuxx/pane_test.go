@@ -115,7 +115,8 @@ func TestProber(t *testing.T) {
 		`list-panes -t "%7" -F "#{pane_pid}"`:     {"100"},
 		`capture-pane -p -S -50 -t "%7"`:          {},
 		`list-panes -t "=main:2" -F "#{pane_id}"`: {"%7", "%8"},
-		listPanesCmd: {"main\t@1\t%7", "main\t@1\t%8"},
+		listPanesCmd:    {"main\t@1\t%7", "main\t@1\t%8"},
+		listSessionsCmd: {"main\tmain"},
 	}}
 	p := Prober(context.Background(), f, tb, "/tmp/tmux-1000/default")
 	argv, pid, ok := p.PaneCommand("%7")
@@ -135,6 +136,77 @@ func TestProber(t *testing.T) {
 	all, err := p.ListPanes()
 	if err != nil || len(all) != 2 || all[1].Session != "main" || all[1].WindowID != "@1" || all[1].PaneID != "%8" {
 		t.Errorf("ListPanes = %v %v", all, err)
+	}
+}
+
+// TestFindWindowMatchesDecodedSpelling covers R-PRB-9: a human types the
+// plain, decoded session name at the CLI (`claude-teleport <tmux-session>
+// <window> --to ...`), but tmux STORES (and only ever targets) the vis(3)-
+// encoded spelling. FindWindow must resolve the typed name against both
+// spellings of every session tmux reports.
+//
+// stored `p\\q` (doubled backslash) decodes, via UnvisName, to `p\q` (one
+// backslash) — 'q' is not a recognised vis escape letter (unlike 'b', 't',
+// 'n', ... it is preserved literally), so `p\q` on its own decodes to
+// itself; only the doubled form collapses to it.
+func TestFindWindowMatchesDecodedSpelling(t *testing.T) {
+	tb := fakeProc(t, nil)
+	f := &Fake{Replies: map[string][]string{
+		listSessionsCmd: {`p\\q` + "\tmain", "other\tmain"},
+		`list-panes -t "=p\\\\q:2" -F "#{pane_id}"`: {"%7"},
+	}}
+	p := Prober(context.Background(), f, tb, "/tmp/tmux-1000/default")
+	// The human types the plain, decoded name `p\q` (one backslash); the
+	// stored spelling is `p\\q` (doubled).
+	panes, err := p.FindWindow(`p\q`, "2")
+	if err != nil || len(panes) != 1 || panes[0] != "%7" {
+		t.Fatalf("FindWindow(decoded name) = %v %v", panes, err)
+	}
+}
+
+// TestFindWindowAmbiguousBetweenSpellings covers R-PRB-9's ambiguity rule:
+// if the typed name matches two DIFFERENT stored sessions (one verbatim,
+// one only after decoding), that is an error, not a silent pick.
+func TestFindWindowAmbiguousBetweenSpellings(t *testing.T) {
+	tb := fakeProc(t, nil)
+	f := &Fake{Replies: map[string][]string{
+		// Session "g1" is stored as `p\\q`, which DECODES to `p\q`.
+		// Session "g2" is literally stored as `p\q` (matches the typed
+		// text verbatim). Both match the typed string `p\q`.
+		listSessionsCmd: {`p\\q` + "\tg1", `p\q` + "\tg2"},
+	}}
+	p := Prober(context.Background(), f, tb, "/tmp/tmux-1000/default")
+	_, err := p.FindWindow(`p\q`, "2")
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("FindWindow(ambiguous name) err = %v, want an ambiguity error", err)
+	}
+}
+
+// TestFindWindowAmbiguityNamesStoredSpellings covers B7. The candidates in
+// the ambiguity message used to be run back through UnvisName — but
+// decoding them is exactly what made the two indistinguishable, so the
+// message read "ambiguous between sessions: a b, a b" and told the user
+// nothing about which `-t` target would disambiguate. The stored spellings
+// are the only useful thing to print.
+func TestFindWindowAmbiguityNamesStoredSpellings(t *testing.T) {
+	tb := fakeProc(t, nil)
+	f := &Fake{Replies: map[string][]string{
+		// Two different vis octal encodings of the same text, "a b"
+		// (3-digit and 2-digit octal for the space both decode the same
+		// way; UnvisName does not require a fixed digit count).
+		listSessionsCmd: {`a\040b` + "\tg1", `a\40b` + "\tg2"},
+	}}
+	p := Prober(context.Background(), f, tb, "/tmp/tmux-1000/default")
+	_, err := p.FindWindow("a b", "2")
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("FindWindow(ambiguous name) err = %v, want an ambiguity error", err)
+	}
+	_, list, ok := strings.Cut(err.Error(), "sessions: ")
+	if !ok {
+		t.Fatalf("err = %v, want it to list the candidate sessions", err)
+	}
+	if list != `a\040b, a\40b` {
+		t.Errorf("candidate list = %q, want the two stored spellings", list)
 	}
 }
 

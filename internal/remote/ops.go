@@ -42,15 +42,17 @@ const (
 	// Plan 03 additions (arg/result shapes in ops_plan03.go). Both the
 	// handler table and the Client method for each op use these constants,
 	// so a typo cannot make the two sides disagree silently.
-	OpGitFiles       = "git-files"
-	OpGitSourceFacts = "git-source-facts"
-	OpTmuxSessions   = "tmux-sessions"
-	OpKillWindow     = "tmux-kill"
-	OpClaudeStatus   = "claude-status"
-	OpBuildManifest  = "build-manifest"
-	OpSessionExtras  = "session-extras"
-	OpCleanup        = "cleanup"
-	OpListSessions   = "list-sessions"
+	OpGitFiles        = "git-files"
+	OpGitSourceFacts  = "git-source-facts"
+	OpTmuxSessions    = "tmux-sessions"
+	OpKillWindow      = "tmux-kill"
+	OpClaudeStatus    = "claude-status"
+	OpBuildManifest   = "build-manifest"
+	OpSessionExtras   = "session-extras"
+	OpCleanup         = "cleanup"
+	OpListSessions    = "list-sessions"
+	OpDeleteInstalled = "delete-installed"
+	OpRemoveJob       = "remove-job"
 )
 
 type HelloArgs struct {
@@ -126,9 +128,16 @@ type GitAttachArgs struct {
 type FreezeArgs struct {
 	PID       int    `json:"pid"`
 	StartTime string `json:"start_time"`
+	// Ref is the pane the frozen process runs in, when it is in tmux, so
+	// the freezer helper can restore the pane's foreground on its own if
+	// its owner dies (see Local.Freeze).
+	Ref *session.TmuxRef `json:"ref,omitempty"`
 }
 type ThawArgs struct {
 	PID int `json:"pid"`
+	// Ref is the pane the frozen process runs in, when it is in tmux, so
+	// Thaw can put it back in the pty's foreground (see Local.Thaw).
+	Ref *session.TmuxRef `json:"ref,omitempty"`
 }
 type CaptureArgs struct {
 	Ref   *session.TmuxRef `json:"ref"`

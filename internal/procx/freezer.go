@@ -29,6 +29,66 @@ func ProcState(procRoot string, pid int) (byte, error) {
 	return data[rp+2], nil
 }
 
+// statField returns field n (1-based, as proc(5) numbers them) of
+// /proc/<pid>/stat as an int. Fields are counted after the comm field, so
+// a comm containing spaces or parens cannot shift them.
+func statField(procRoot string, pid, n int) (int, error) {
+	path := filepath.Join(procRoot, strconv.Itoa(pid), "stat")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	rp := bytes.LastIndexByte(data, ')')
+	if rp < 0 {
+		return 0, fmt.Errorf("parse %s: malformed", path)
+	}
+	fields := strings.Fields(string(data[rp+1:])) // fields[0] is field 3 (state)
+	i := n - 3
+	if i < 0 || i >= len(fields) {
+		return 0, fmt.Errorf("parse %s: no field %d", path, n)
+	}
+	v, err := strconv.Atoi(fields[i])
+	if err != nil {
+		return 0, fmt.Errorf("parse %s field %d: %w", path, n, err)
+	}
+	return v, nil
+}
+
+// ProcGroup returns pid's process group id (field 5 of /proc/<pid>/stat).
+func ProcGroup(procRoot string, pid int) (int, error) { return statField(procRoot, pid, 5) }
+
+// ForegroundGroup returns the foreground process group of pid's controlling
+// terminal (tpgid, field 8), or -1 when it has no controlling terminal.
+//
+// It is how a caller tells a process that merely got SIGCONT from one that
+// actually has the terminal back: a job-control shell takes the pty away
+// from its foreground job the moment that job stops, and the resumed job
+// then re-stops on SIGTTIN at its next read (spec §6.1 freeze/thaw).
+func ForegroundGroup(procRoot string, pid int) (int, error) { return statField(procRoot, pid, 8) }
+
+// PaneRef names the tmux pane the frozen job runs in: enough for the
+// helper to hand the job its terminal back on its own (ruling R-P3-F1).
+//
+// It travels to the helper in argv rather than over the fd-3 control pipe:
+// a tmux socket path and a pane id are not secrets (both appear in the
+// tmux server's own argv and in the pane's environment), the helper is
+// re-exec'd by exec.Command anyway, and argv keeps the control pipe doing
+// the one job — thaw-or-EOF — whose semantics the whole design rests on.
+type PaneRef struct {
+	SocketPath string
+	PaneID     string
+}
+
+// Empty reports whether the ref names no pane (the no-tmux case: nothing
+// ever took the terminal away, so there is nothing to restore).
+func (r PaneRef) Empty() bool { return r.SocketPath == "" || r.PaneID == "" }
+
+// RestoreFunc gives a thawed pid its controlling terminal back. procx
+// cannot do this itself — it needs tmux — so the helper's main is handed
+// one (internal/tmuxx.FreezerRestore builds the real one; internal/cli
+// wires it into the internal-freezer subcommand).
+type RestoreFunc func(pid int) error
+
 // Freezer holds a stopped pid; Thaw releases it. If the owning process dies
 // first, the helper releases it on pipe EOF (spec §6.1).
 type Freezer struct {
@@ -57,9 +117,13 @@ func checkStart(pid int, startTime string) error {
 	return nil
 }
 
-// Freeze re-execs selfExe as `internal-freezer <pid> <start>` and waits for
-// its "stopped" acknowledgement.
-func Freeze(selfExe string, pid int, startTime string) (*Freezer, error) {
+// Freeze re-execs selfExe as `internal-freezer <pid> <start> [socket pane]`
+// and waits for its "stopped" acknowledgement.
+//
+// ref is the pane the target runs in, or the zero PaneRef when it is not in
+// tmux. The helper needs it because the owner may die: on pipe EOF nobody
+// else is left to give the SIGCONT'd job its terminal back (R-P3-F1).
+func Freeze(selfExe string, pid int, startTime string, ref PaneRef) (*Freezer, error) {
 	if err := checkStart(pid, startTime); err != nil {
 		return nil, fmt.Errorf("freeze: %w", err)
 	}
@@ -67,7 +131,11 @@ func Freeze(selfExe string, pid int, startTime string) (*Freezer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("freeze: pipe: %w", err)
 	}
-	cmd := exec.Command(selfExe, "internal-freezer", strconv.Itoa(pid), startTime)
+	argv := []string{"internal-freezer", strconv.Itoa(pid), startTime}
+	if !ref.Empty() {
+		argv = append(argv, ref.SocketPath, ref.PaneID)
+	}
+	cmd := exec.Command(selfExe, argv...)
 	cmd.ExtraFiles = []*os.File{r} // fd 3 in the child
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stderr := &bytes.Buffer{}
@@ -93,6 +161,18 @@ func Freeze(selfExe string, pid int, startTime string) (*Freezer, error) {
 	return &Freezer{cmd: cmd, control: w, stderr: stderr, pid: pid}, nil
 }
 
+// Warnings returns whatever the helper wrote to its stderr — in practice
+// the "signalling the pid alone" notices from groupToSignal, which say the
+// freeze covered only the leader instead of the whole process group and is
+// therefore weaker than spec §6.1 intends. Before this, those reached a
+// human only when the helper ALSO failed, which is exactly the case where
+// they matter least.
+//
+// Call it after Thaw: os/exec fills the buffer from a goroutine that is
+// only guaranteed to be finished once cmd.Wait (inside Thaw) has returned,
+// so reading earlier both races and can miss the tail.
+func (f *Freezer) Warnings() string { return strings.TrimSpace(f.stderr.String()) }
+
 // Thaw writes "thaw\n", closes the pipe and waits for the helper to exit.
 // It is idempotent: a repeat call is a no-op that returns the first call's
 // result, so callers can freely pair an explicit Thaw with a deferred one.
@@ -113,22 +193,104 @@ func (f *Freezer) Thaw() error {
 // RunFreezerHelper is the helper's main: SIGSTOP, ack on stdout, block on
 // control, SIGCONT on data or EOF. It ignores terminal signals so it cannot
 // die before thawing. The start time is re-checked before every kill.
-func RunFreezerHelper(pid int, startTime string, control *os.File) error {
+//
+// restore (may be nil) runs after the SIGCONT of the EOF path only — the
+// path where the owner died. A job-control shell takes the pty back the
+// moment its foreground job stops, so a bare SIGCONT leaves the target
+// re-stopping on SIGTTIN; on the ordinary "thaw" path the owner does that
+// restore itself (remote.Local.Thaw), and on the EOF path there is nobody
+// else left to do it (ruling R-P3-F1). Its failures are logged, never
+// fatal: the SIGCONT has already happened and is the part that matters.
+func RunFreezerHelper(pid int, startTime string, control *os.File, restore RestoreFunc) error {
 	signal.Ignore(syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGPIPE, syscall.SIGQUIT)
 	if err := checkStart(pid, startTime); err != nil {
 		return fmt.Errorf("freezer: %w", err)
 	}
-	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
-		return fmt.Errorf("freezer: SIGSTOP %d: %w", pid, err)
+	// The owner's group, read once while it is still alive: after it dies
+	// (the pipe EOF that thaws) getppid() is 1 and the guard would be lost.
+	ownerPgid, err := syscall.Getpgid(os.Getppid())
+	if err != nil {
+		ownerPgid = 0
+	}
+	if err := signalTarget(pid, startTime, syscall.SIGSTOP, ownerPgid); err != nil {
+		return fmt.Errorf("freezer: %w", err)
 	}
 	fmt.Fprintln(os.Stdout, "stopped")
 	buf := make([]byte, 16)
-	control.Read(buf) // data ("thaw") or EOF (owner died): either way, thaw
+	// Data ("thaw") or EOF/error (owner died): either way, thaw. Only the
+	// owner-died case also has to restore the foreground, since only there
+	// is the owner not around to do it.
+	n, rerr := control.Read(buf)
+	ownerDied := n == 0 || rerr != nil
 	if err := checkStart(pid, startTime); err != nil {
 		return nil // the target is gone or replaced: nothing to thaw
 	}
-	if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
-		return fmt.Errorf("freezer: SIGCONT %d: %w", pid, err)
+	if err := signalTarget(pid, startTime, syscall.SIGCONT, ownerPgid); err != nil {
+		return fmt.Errorf("freezer: %w", err)
+	}
+	if ownerDied && restore != nil {
+		if err := restore(pid); err != nil {
+			// stderr is the helper's only log, and on this path its
+			// reader (the owner) is dead — hence best-effort, and hence
+			// the restore's own logging goes here too.
+			fmt.Fprintf(os.Stderr, "freezer: restoring pid %d's terminal: %v\n", pid, err)
+		}
+	}
+	return nil
+}
+
+// groupToSignal returns the process group freeze/thaw should signal for
+// pid, or 0 meaning "signal the bare pid instead".
+//
+// ownerPgid is the process group of whoever owns the freeze (the freezer
+// helper's parent). Refused, in order: an unreadable group, pgid 0 or 1
+// (never a real job), the caller's own group and the owner's group —
+// stopping either of those would stop the only processes that can ever
+// thaw the target.
+func groupToSignal(pid, selfPgid, ownerPgid int, getpgid func(int) (int, error), warnf func(string, ...any)) int {
+	pgid, err := getpgid(pid)
+	switch {
+	case err != nil:
+		warnf("freezer: getpgid %d: %v; signalling the pid alone", pid, err)
+	case pgid <= 1:
+		warnf("freezer: pid %d has process group %d; signalling the pid alone", pid, pgid)
+	case pgid == selfPgid:
+		warnf("freezer: pid %d shares the freezer's process group %d; signalling the pid alone", pid, pgid)
+	case pgid == ownerPgid:
+		warnf("freezer: pid %d shares its owner's process group %d; signalling the pid alone", pid, pgid)
+	default:
+		return pgid
+	}
+	return 0
+}
+
+// signalTarget sends sig to pid's whole process group, falling back to the
+// bare pid when the group cannot be determined or would be unsafe to
+// signal (see groupToSignal).
+//
+// Claude is a job: an interactive shell puts it in its own process group
+// and gives that group the pty. SIGSTOPping only the leader leaves the
+// rest of the group running (a child could still write the transcript we
+// are copying), and the group is what the shell and the terminal both
+// think in — so the group is what freeze and thaw must move, together
+// (spec §6.1).
+//
+// checkStart is re-run before every signal and the group is derived from
+// the pid only after that check passes: a group is never signalled unless
+// the pid that names it was verified in the same breath.
+func signalTarget(pid int, startTime string, sig syscall.Signal, ownerPgid int) error {
+	if err := checkStart(pid, startTime); err != nil {
+		return err
+	}
+	warnf := func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
+	if pgid := groupToSignal(pid, syscall.Getpgrp(), ownerPgid, syscall.Getpgid, warnf); pgid > 0 {
+		if err := syscall.Kill(-pgid, sig); err != nil {
+			return fmt.Errorf("%v process group %d (pid %d): %w", sig, pgid, pid, err)
+		}
+		return nil
+	}
+	if err := syscall.Kill(pid, sig); err != nil {
+		return fmt.Errorf("%v %d: %w", sig, pid, err)
 	}
 	return nil
 }

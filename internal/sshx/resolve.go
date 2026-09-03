@@ -37,6 +37,10 @@ func canonicalOption(k string) string {
 		return "UserKnownHostsFile"
 	case "connecttimeout":
 		return "ConnectTimeout"
+	case "serveraliveinterval":
+		return "ServerAliveInterval"
+	case "serveralivecountmax":
+		return "ServerAliveCountMax"
 	}
 	return k
 }
@@ -135,6 +139,17 @@ func Resolve(t Target, cfg *ssh_config.Config, overrides map[string]string, loca
 				r.IdentityFiles = append(r.IdentityFiles, f)
 				seen[f] = true
 			}
+		}
+	}
+
+	// OpenSSH reads the keepalive keywords from the config too; an
+	// explicit -o wins (the copy loop below writes it over this).
+	for _, k := range []string{"ServerAliveInterval", "ServerAliveCountMax"} {
+		if _, ok := ov[k]; ok {
+			continue
+		}
+		if v := cfgGet(cfg, t.Host, k); v != "" {
+			r.Options[k] = v
 		}
 	}
 

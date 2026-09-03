@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
 // buildFakeClaude compiles test/fakeclaude into a temp dir and prepends it
@@ -60,5 +62,48 @@ func TestRunPtyResumeReportsLoggedOut(t *testing.T) {
 	err := l.RunPtyResume(context.Background(), sid, cwd, 5*time.Second)
 	if err == nil || !strings.Contains(err.Error(), "Not logged in") {
 		t.Fatalf("err = %v, want the marker", err)
+	}
+}
+
+// TestClaudeEnvConfigDirPresence is T26-2's second half. Real Claude Code
+// picks its global config file by whether CLAUDE_CONFIG_DIR is present in
+// its environment at all (task-26-report.md finding 2), so a claude this
+// host starts must see the variable exactly when session.Paths says the
+// variable is what put ConfigDir where it is — otherwise the destination's
+// project entry is merged into $HOME/.claude.json while the Claude we then
+// start reads $HOME/.claude/.claude.json, and the trust-dialog/mcp state
+// the transfer carried over is silently invisible to it.
+func TestClaudeEnvConfigDirPresence(t *testing.T) {
+	has := func(env []string, key string) (string, bool) {
+		v, ok := "", false
+		for _, e := range env { // last wins, as os/exec's dedupEnv does
+			if strings.HasPrefix(e, key+"=") {
+				v, ok = strings.TrimPrefix(e, key+"="), true
+			}
+		}
+		return v, ok
+	}
+	base := []string{"PATH=/bin", "CLAUDE_CONFIG_DIR=/inherited/cfg", "TERM=dumb"}
+
+	// The environment is where the config dir came from: pass it on.
+	p := session.Paths{Home: "/home/alice", ConfigDir: "/home/alice/.claude", ConfigDirFromEnv: true}
+	if v, ok := has(claudeEnv(base, p), "CLAUDE_CONFIG_DIR"); !ok || v != "/home/alice/.claude" {
+		t.Errorf("from-env config dir: CLAUDE_CONFIG_DIR = %q ok=%v, want the resolved dir", v, ok)
+	}
+	// Nobody set it: claude must not see it either, not even the value
+	// this process happens to have inherited.
+	p = session.Paths{Home: "/home/alice", ConfigDir: "/home/alice/.claude"}
+	if v, ok := has(claudeEnv(base, p), "CLAUDE_CONFIG_DIR"); ok {
+		t.Errorf("default config dir: CLAUDE_CONFIG_DIR = %q, want it absent so claude uses $HOME/.claude.json", v)
+	}
+	// A config dir that is NOT the default cannot be communicated any
+	// other way, so it is still exported.
+	p = session.Paths{Home: "/home/alice", ConfigDir: "/srv/cfg"}
+	if v, ok := has(claudeEnv(base, p), "CLAUDE_CONFIG_DIR"); !ok || v != "/srv/cfg" {
+		t.Errorf("non-default config dir: CLAUDE_CONFIG_DIR = %q ok=%v, want /srv/cfg", v, ok)
+	}
+	// HOME always wins over the inherited one, in every case.
+	if v, ok := has(claudeEnv(base, p), "HOME"); !ok || v != "/home/alice" {
+		t.Errorf("HOME = %q ok=%v", v, ok)
 	}
 }

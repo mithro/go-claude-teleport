@@ -11,34 +11,42 @@ import (
 )
 
 // teleportFlags holds every option of the teleport command (spec §5).
-// Plans 02/03 consume it; this plan only parses and validates it.
+// validate applies the cross-flag rules below; teleportOptions (teleport.go,
+// Task 21) turns a validated set into orchestrate.Options.
 type teleportFlags struct {
-	To, From     string
-	Via          []string
-	SSHOptions   []string // -o KEY=VALUE
-	DestPath     string
-	Maps         []string
-	State        string
-	AllowDrift   bool
-	Force        bool
-	TmuxSocket   string
-	NoTmux       bool
-	Excludes     []string
-	DryRun       bool
-	ExitTimeout  time.Duration
-	StartTimeout time.Duration
-	LogFile      string
-	JSON         bool
-	Verbose      bool
-	Quiet        bool
+	To, From       string
+	Via            []string
+	SSHOptions     []string // -o KEY=VALUE
+	DestPath       string
+	Maps           []string
+	State          string
+	AllowDrift     bool
+	Force          bool
+	TmuxSocket     string
+	NoTmux         bool
+	Excludes       []string
+	IncludeIgnored bool
+	DryRun         bool
+	ExitTimeout    time.Duration
+	StartTimeout   time.Duration
+	LogFile        string
+	JSON           bool
+	Verbose        bool
+	Quiet          bool
 }
 
 var validStates = map[string]bool{"auto": true, "running": true, "suspended": true, "idle": true}
 
-// validate applies the cross-flag rules; it returns usage errors.
-func (f *teleportFlags) validate(args []string) error {
+// validate applies the cross-flag rules; it returns usage errors. bare is
+// true only for the literal zero-argument invocation (`claude-teleport`,
+// nothing else) — see helpPointer's doc comment.
+func (f *teleportFlags) validate(args []string, bare bool) error {
 	if (f.To == "") == (f.From == "") {
-		return Exit(ExitUsage, "exactly one of --teleport-to/--to or --teleport-from/--from is required")
+		msg := "exactly one of --teleport-to/--to or --teleport-from/--from is required"
+		if bare {
+			msg += helpPointer()
+		}
+		return Exit(ExitUsage, "%s", msg)
 	}
 	if !validStates[f.State] {
 		return Exit(ExitUsage, "--state must be auto, running, suspended or idle (got %q)", f.State)
@@ -79,24 +87,29 @@ func (a *app) rootCmd() *cobra.Command {
 		SilenceErrors: true,
 		Args:          cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if tf.To == "" && tf.From == "" && len(args) == 0 {
-				return cmd.Help()
-			}
-			if err := tf.validate(args); err != nil {
+			bare := len(args) == 0 && cmd.Flags().NFlag() == 0
+			if err := tf.validate(args, bare); err != nil {
 				return err
 			}
-			// Parsed (not resolved) here only so a malformed selector fails as a
-			// usage error before the transport stub runs; resolveSession (used by
-			// inspect/list) does the full parse-then-Resolve for those commands.
-			if _, err := session.ParseSelector(args, a.selectorEnv()); err != nil {
-				return Exit(ExitUsage, "%v", err)
-			}
-			// The orchestrator (git, tmux, ssh transport) arrives with Plans 02
-			// and 03; until then a teleport is a clean usage error.
-			return Exit(ExitUsage, "transport not implemented yet: this build parses the command line only")
+			return exitErr(a.runTeleport(cmd.Context(), tf, args))
 		},
 	}
-	root.SetHelpTemplate("{{.Long}}\n")
+	// R-P3-28b: this template is inherited by every child command (cobra
+	// walks up to the nearest ancestor with one set), so it must work for
+	// all of them, not only root. Root keeps its old, exact behaviour — a
+	// hand-written Long that already documents everything, with nothing
+	// auto-appended. Every other command falls back to Short (if any) plus
+	// cobra's own UsageString (Use line, its own flags, subcommands) when
+	// it has no Long, and gets UsageString appended after its Long when it
+	// does — otherwise a command with no Long (continue, status, abandon,
+	// list, doctor, version, and the hidden internal-* / remote commands)
+	// printed nothing at all for `--help`.
+	root.SetHelpTemplate(`{{if not .HasParent}}{{.Long}}
+{{else}}{{if .Long}}{{.Long}}
+
+{{else if .Short}}{{.Short}}
+
+{{end}}{{.UsageString}}{{end}}`)
 	root.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
 		return Exit(ExitUsage, "%v", err)
 	})
@@ -114,6 +127,7 @@ func (a *app) rootCmd() *cobra.Command {
 	f.StringVar(&tf.TmuxSocket, "tmux-socket", "", "destination tmux socket name")
 	f.BoolVar(&tf.NoTmux, "no-tmux", false, "do not use tmux on the destination")
 	f.StringArrayVar(&tf.Excludes, "exclude", nil, "exclude glob, repeatable")
+	f.BoolVar(&tf.IncludeIgnored, "include-ignored", false, "also transfer gitignored files")
 	f.BoolVar(&tf.DryRun, "dry-run", false, "preflight only")
 	f.DurationVar(&tf.ExitTimeout, "exit-timeout", 30*time.Second, "source exit wait")
 	f.DurationVar(&tf.StartTimeout, "start-timeout", 90*time.Second, "destination start wait")
@@ -124,8 +138,9 @@ func (a *app) rootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.configDir, "config-dir", "", "local CLAUDE_CONFIG_DIR override")
 	a.flags = &tf
 
-	root.AddCommand(a.versionCmd(), a.internalFreezerCmd(), a.placeholderCmd(), a.inspectCmd(), a.listCmd(), a.compareConfigCmd(), a.doctorCmd())
+	root.AddCommand(a.versionCmd(), a.internalFreezerCmd(), a.placeholderCmd(), newInspectCmd(a), a.listCmd(), a.compareConfigCmd(), newDoctorCmd(a))
 	AddTransportCommands(root)
+	root.AddCommand(newContinueCmd(a), newInternalRunnerCmd(a), newAbandonCmd(a))
 	return root
 }
 

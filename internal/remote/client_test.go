@@ -114,8 +114,21 @@ func TestClientProtocolMismatchIsUsageError(t *testing.T) {
 // dial boilerplate.
 func newSSHTestClient(t *testing.T) (*Client, *Local, session.Paths) {
 	t.Helper()
+	return newSSHTestClientOpts(t, nil)
+}
+
+// newSSHTestClientOpts is newSSHTestClient with the far side's
+// LocalOptions adjustable — the server-side Local is built here, so a test
+// that needs the peer to have a tmux probe (suspended-pane discovery) has
+// no other seam to reach it through.
+func newSSHTestClientOpts(t *testing.T, tweak func(*LocalOptions)) (*Client, *Local, session.Paths) {
+	t.Helper()
 	destPaths := testPaths(t)
-	dest := NewLocal(destPaths, "claude-teleport", LocalOptions{Logf: t.Logf})
+	destOpts := LocalOptions{Logf: t.Logf}
+	if tweak != nil {
+		tweak(&destOpts)
+	}
+	dest := NewLocal(destPaths, "claude-teleport", destOpts)
 	exec := func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
 		args := strings.Fields(cmd)
 		switch {
@@ -315,4 +328,85 @@ func TestClientOpenStreamPackBothDirectionsOverSSH(t *testing.T) {
 			t.Errorf("pack pull = %d bytes, prefix %q, want a git packfile (PACK magic)", buf.Len(), buf.Bytes()[:min(4, buf.Len())])
 		}
 	})
+}
+
+// paneProbe is a session.PaneProbe stand-in for the server side of the
+// ssh harness (the real one is tmuxx.Prober, which needs a live tmux
+// server): panes maps a pane id to the foreground argv ListSessions
+// classifies with session.ArgvSessionID.
+type paneProbe struct {
+	panes  map[string][]string
+	infos  []session.PaneInfo
+	socket string
+}
+
+func (p *paneProbe) PaneCommand(paneID string) ([]string, int, bool) {
+	argv, ok := p.panes[paneID]
+	return argv, 0, ok
+}
+func (p *paneProbe) FindWindow(string, string) ([]string, error) { return nil, nil }
+func (p *paneProbe) ListPanes() ([]session.PaneInfo, error)      { return p.infos, nil }
+func (p *paneProbe) SocketPath() string                          { return p.socket }
+
+// TestListSessionsOverSSHReportsSuspended is the wire half of the
+// suspended-state fix: `list --host` dispatches to Local.ListSessions on
+// the far side, so a session whose only trace there is a placeholder pane
+// has to arrive as "suspended". Until Local.ListSessions consulted
+// opts.Probe (as session.Load and ResolveSession already did) it arrived
+// as "idle" — indistinguishable from a session nobody had ever suspended,
+// which is the one state the placeholder mechanism exists to make visible.
+func TestListSessionsOverSSHReportsSuspended(t *testing.T) {
+	suspendedID := session.ID("1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d")
+	idleID := session.ID("2b3c4d5e-6f7a-4b1c-9d3e-4f5a6b7c8d9e")
+	probe := &paneProbe{
+		socket: "/run/tmux/default",
+		panes: map[string][]string{
+			// A placeholder holding suspendedID, and — in the same
+			// window — an ordinary shell that must be ignored rather
+			// than misread as a session.
+			"%4": {"claude-teleport", "placeholder", "--resume", string(suspendedID)},
+			"%5": {"-bash"},
+		},
+		infos: []session.PaneInfo{
+			{Session: "work", WindowID: "@2", PaneID: "%4"},
+			{Session: "work", WindowID: "@2", PaneID: "%5"},
+		},
+	}
+	c, _, destPaths := newSSHTestClientOpts(t, func(o *LocalOptions) { o.Probe = probe })
+
+	for _, tc := range []struct {
+		id  session.ID
+		cwd string
+	}{{suspendedID, "/home/bob/suspended"}, {idleID, "/home/bob/idle"}} {
+		proj := destPaths.ProjectDir(tc.cwd)
+		if err := os.MkdirAll(proj, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		line := `{"type":"user","cwd":"` + tc.cwd + `","timestamp":"2026-01-01T00:00:00Z"}` + "\n"
+		if err := os.WriteFile(filepath.Join(proj, string(tc.id)+".jsonl"), []byte(line), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sums, err := c.ListSessions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[session.ID]SessionSummary{}
+	for _, s := range sums {
+		byID[s.ID] = s
+	}
+	got, ok := byID[suspendedID]
+	if !ok {
+		t.Fatalf("list over ssh returned no row for %s: %+v", suspendedID, sums)
+	}
+	if got.State != session.StateSuspended.String() {
+		t.Errorf("session held by a placeholder pane over the wire = %q, want %q", got.State, session.StateSuspended)
+	}
+	if got.Tmux != "work:@2.%4" {
+		t.Errorf("suspended row tmux ref = %q, want the placeholder's pane", got.Tmux)
+	}
+	if got := byID[idleID]; got.State != session.StateIdle.String() || got.Tmux != "" {
+		t.Errorf("session with no pane and no registry entry = %+v, want idle with no tmux ref", got)
+	}
 }

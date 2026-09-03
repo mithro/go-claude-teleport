@@ -413,3 +413,108 @@ func TestServeStreamLocalTarCompletesOnClientWriteThenClose(t *testing.T) {
 		t.Fatalf("after ServeStream: status = %v, want staged-same", st)
 	}
 }
+
+// TestLocalNilPayloadsAreUsageErrors covers B3. Every one of these
+// arguments arrives as a decoded wire field, so a peer that omits it (or
+// sends `null`) reaches Local with a nil pointer. Before this fix the nil
+// dereferenced deep inside transfer/gitx and the dispatch's recover shipped
+// the panic — debug.Stack() and all — back to the peer as an "internal"
+// error. They must be plain usage errors instead, like ManifestDiff's.
+func TestLocalNilPayloadsAreUsageErrors(t *testing.T) {
+	l := NewLocal(testPaths(t), "x", LocalOptions{ProcRoot: "/proc"})
+	ctx := context.Background()
+	jobID := sid
+
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"manifest-diff", func() error { _, err := l.ManifestDiff(ctx, nil, jobID); return err }},
+		{"install", func() error { _, err := l.Install(ctx, nil, jobID); return err }},
+		{"git-attach", func() error { return l.GitAttach(ctx, nil, jobID) }},
+		{"delete-installed", func() error { _, err := l.DeleteInstalled(ctx, nil, []int{0}); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			var re *Error
+			if !errors.As(err, &re) || re.Code != "usage" {
+				t.Fatalf("err = %v (%T), want a remote.Error with code usage", err, err)
+			}
+			if !strings.Contains(re.Message, "nil") {
+				t.Errorf("message = %q, want it to name the missing payload", re.Message)
+			}
+		})
+	}
+}
+
+// TestLocalManifestDiffAndInstallRejectMismatchedJobID covers ruling
+// R-P3-B1c minor 4: ManifestDiff/Install thread the caller's jobID
+// argument straight into stagingDir (job.StagingDir(DataDir, jobID)) and
+// jobDir, but transfer.Diff/transfer.Install's own destination re-checks
+// (canonicalCaptureDst, validateDst) derive their answers from m.JobID —
+// the manifest's OWN wire field, never cross-checked against the jobID
+// this call actually received. A source that sends a manifest whose JobID
+// names a DIFFERENT job than the one this RPC's jobID argument identifies
+// would have its capture/session checks computed against the wrong job's
+// directory. Local must refuse the mismatch itself, before ever touching
+// the (correct) job's staging or job directory.
+func TestLocalManifestDiffAndInstallRejectMismatchedJobID(t *testing.T) {
+	p := testPaths(t)
+	l := NewLocal(p, "self", LocalOptions{Logf: t.Logf})
+	m := sourceManifest(t, p) // m.JobID == sid
+	otherJobID := "other-job-id-not-sid"
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"manifest-diff", func() error { _, err := l.ManifestDiff(ctx, m, otherJobID); return err }},
+		{"install", func() error { _, err := l.Install(ctx, m, otherJobID); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			var re *Error
+			if !errors.As(err, &re) || re.Code != "usage" {
+				t.Fatalf("err = %v (%T), want a remote.Error with code usage", err, err)
+			}
+			if !strings.Contains(re.Message, m.JobID) || !strings.Contains(re.Message, otherJobID) {
+				t.Errorf("message = %q, want it to name both the manifest's JobID %q and the job %q", re.Message, m.JobID, otherJobID)
+			}
+		})
+	}
+	if _, err := os.Stat(job.Dir(p.DataDir, otherJobID)); !os.IsNotExist(err) {
+		t.Errorf("the mismatched job's directory must not have been created: err=%v", err)
+	}
+}
+
+// TestLocalManifestDiffReportsRefusalsAsRefused covers ruling R-P3-B1e
+// item 5: a manifest entry the destination may never install (here an
+// unknown category aimed at ~/.bash_profile) must come back from the
+// manifest-diff RPC as a REFUSAL — its own error code, naming the entry
+// and the reason — so the driver's preflight reports it as a refusal
+// (exit 3) rather than as an internal failure or a content collision.
+func TestLocalManifestDiffReportsRefusalsAsRefused(t *testing.T) {
+	p := testPaths(t)
+	l := NewLocal(p, "self", LocalOptions{Logf: t.Logf})
+	m := sourceManifest(t, p)
+	target := filepath.Join(p.Home, ".bash_profile")
+	m.Entries[0].Category = "junk"
+	m.Entries[0].Dst = target
+	ctx := context.Background()
+
+	_, err := l.ManifestDiff(ctx, m, sid)
+	var re *Error
+	if !errors.As(err, &re) || re.Code != "refused" {
+		t.Fatalf("err = %v (%T), want a remote.Error with code refused", err, err)
+	}
+	if !strings.Contains(re.Message, target) || !strings.Contains(re.Message, "category") {
+		t.Errorf("message = %q, want it to name the entry and the reason", re.Message)
+	}
+	if _, err := l.Install(ctx, m, sid); !errors.As(err, &re) || re.Code != "refused" {
+		t.Fatalf("install err = %v, want the same refusal", err)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Errorf("%s was created (err %v)", target, err)
+	}
+}

@@ -93,9 +93,12 @@ func renderStatus(w io.Writer, j *job.Journal, m *transfer.Manifest, logTail []s
 			fmt.Fprintln(w, "  "+l)
 		}
 	}
-	if !j.Finished {
-		// `continue` is registered by Plan 03; until then, point at status
-		// (to recheck) and abandon (to give up cleanly) only.
-		fmt.Fprintf(w, "\nnext: claude-teleport status %s   |   claude-teleport abandon %s\n", j.ID, j.ID)
+	// Gated on the OUTCOME, not on Finished: a FAILED job is finished too
+	// (the runner sets both), and that is exactly the job whose reader
+	// most needs to be told about continue/abandon (finding A6). Only a
+	// successful or abandoned job has nothing left to do.
+	if j.Outcome != "success" && j.Outcome != "abandoned" {
+		fmt.Fprintln(w)
+		nextHint(w, j.ID)
 	}
 }

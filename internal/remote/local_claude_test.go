@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +34,16 @@ func fakeProcRoot(t *testing.T, procs [][4]string) string {
 
 func writeRegistry(t *testing.T, p session.Paths, pid int, status, tmux string) {
 	t.Helper()
-	b, _ := json.Marshal(map[string]any{"pid": pid, "sessionId": sid, "cwd": "/home/alice/x", "procStart": "777", "version": "2.1.247", "status": status, "tmux": tmux, "updatedAt": time.Now().UnixMilli()})
+	writeRegistryEntrypoint(t, p, pid, status, tmux, "cli")
+}
+
+// writeRegistryEntrypoint is writeRegistry with an explicit "entrypoint"
+// (T26-1: "cli" for a terminal session, "sdk-cli" for a `claude -p` run).
+// "kind" is "interactive" either way, exactly as real Claude Code 2.1.247
+// and 2.1.259 write it — see task-26-report.md's captured samples.
+func writeRegistryEntrypoint(t *testing.T, p session.Paths, pid int, status, tmux, entrypoint string) {
+	t.Helper()
+	b, _ := json.Marshal(map[string]any{"pid": pid, "sessionId": sid, "cwd": "/home/alice/x", "procStart": "777", "version": "2.1.247", "kind": "interactive", "entrypoint": entrypoint, "status": status, "tmux": tmux, "updatedAt": time.Now().UnixMilli()})
 	// Atomic (temp file + rename) so a concurrent reader (e.g. ConfirmClaude's
 	// poll loop, especially with a no-op Sleep) never observes a partial
 	// write — plain os.WriteFile raced procx.RegistryForSession here.
@@ -59,15 +69,126 @@ func TestConfirmClaudeSucceedsWhenIdleInOurPane(t *testing.T) {
 	}
 }
 
-func TestConfirmClaudeFailsOnMarker(t *testing.T) {
+// growingCapture answers ConfirmClaude's repeated `capture-pane` calls with
+// pane content that only grows, appending extraLines starting from
+// appendFrom (a 1-based call count) — a stand-in for a real tmux pane
+// where NEW output can appear on a later poll than the first. It errors on
+// any other command since it is only ever used for this one capture.
+type growingCapture struct {
+	target     string // the exact capture-pane command it answers
+	extraLines []string
+	appendFrom int
+	calls      int
+}
+
+func (g *growingCapture) Run(_ context.Context, cmd string) ([]string, error) {
+	if cmd != g.target {
+		return nil, fmt.Errorf("growingCapture: unexpected cmd %q", cmd)
+	}
+	g.calls++
+	lines := []string{"> "}
+	if g.calls >= g.appendFrom {
+		lines = append(lines, g.extraLines...)
+	}
+	return lines, nil
+}
+
+func (g *growingCapture) Close() error { return nil }
+
+// TestConfirmClaudeFailsOnMarkerAppearingDuringThisAttempt covers a
+// failure marker that appears WHILE this confirmation attempt is polling
+// (as opposed to M4's stale-scrollback-from-an-earlier-attempt case,
+// below) — it must still be caught.
+func TestConfirmClaudeFailsOnMarkerAppearingDuringThisAttempt(t *testing.T) {
 	p := testPaths(t)
 	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
-	f := &tmuxx.Fake{Replies: map[string][]string{`capture-pane -epJ -S - -t "%7"`: {"Not logged in · Please run /login"}}}
-	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: fakeDialer(f), Sleep: func(time.Duration) {}})
-	writeRegistry(t, p, 5150, "idle", "work:@1.%7")
+	f := &growingCapture{target: `capture-pane -epJ -S - -t "%7"`, extraLines: []string{"Not logged in · Please run /login"}, appendFrom: 2}
+	dial := func(context.Context, string) (tmuxx.Transport, error) { return f, nil }
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: dial, Sleep: func(time.Duration) {}})
+	writeRegistry(t, p, 5150, "busy", "work:@1.%7") // never idle: the marker must trip first
 	_, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), time.Second)
 	if err == nil || !strings.Contains(err.Error(), "Not logged in") {
 		t.Fatalf("err = %v, want marker failure", err)
+	}
+	if f.calls < 2 {
+		t.Fatalf("marker only appears on call 2+; got %d calls", f.calls)
+	}
+}
+
+// TestConfirmClaudeIgnoresStaleMarkerFromEarlierAttempt is M4: a failure
+// marker already sitting in the pane's scrollback at the START of this
+// confirm attempt (as if left there by an earlier, unrelated attempt — a
+// previous job resume, or a user's own shell history) must not
+// permanently abort confirmation. Here the marker is present in EVERY
+// capture (a real tmux pane's scrollback never un-writes itself), so
+// pre-fix code would fail on the very first poll; the fix must instead
+// let the job succeed once the registry catches up to idle.
+func TestConfirmClaudeIgnoresStaleMarkerFromEarlierAttempt(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	f := &tmuxx.Fake{Replies: map[string][]string{`capture-pane -epJ -S - -t "%7"`: {"stale scrollback: Not logged in · Please run /login", "> "}}}
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: fakeDialer(f), Sleep: func(time.Duration) {}})
+	writeRegistry(t, p, 5150, "busy", "work:@1.%7")
+	go func() { time.Sleep(50 * time.Millisecond); writeRegistry(t, p, 5150, "idle", "work:@1.%7") }()
+	reg, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), 5*time.Second)
+	if err != nil {
+		t.Fatalf("err = %v, want the stale marker to be ignored", err)
+	}
+	if reg.Status != "idle" {
+		t.Errorf("reg = %+v", reg)
+	}
+}
+
+// TestConfirmClaudeAcceptsBusyPrintModeAfterTurn is M5 (spec §6.2 case 3):
+// a `-p` run's registry status never becomes "idle" (fakeclaude/real
+// Claude Code remove the entry entirely on a clean exit instead), so
+// success must be declared once the session's transcript has grown past
+// this call's own baseline while status stays "busy".
+func TestConfirmClaudeAcceptsBusyPrintModeAfterTurn(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Sleep: func(time.Duration) {}})
+	proj := filepath.Join(p.ProjectsDir(), "-home-alice-x")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(proj, sid+".jsonl")
+	if err := os.WriteFile(transcript, []byte(`{"type":"user"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeRegistryEntrypoint(t, p, 5150, "busy", "", "sdk-cli")
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		f.WriteString(`{"type":"assistant"}` + "\n")
+	}()
+	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second)
+	if err != nil {
+		t.Fatalf("err = %v, want the busy print-mode run to be accepted once its turn lands", err)
+	}
+	if reg.Status != "busy" || reg.Entrypoint != "sdk-cli" {
+		t.Errorf("reg = %+v", reg)
+	}
+}
+
+// TestConfirmClaudeBusyPrintModeTimesOutWithoutATurn pins the negative
+// case: busy+print alone (no transcript growth ever observed) must not be
+// treated as success — it must still time out like any other stuck run.
+func TestConfirmClaudeBusyPrintModeTimesOutWithoutATurn(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Sleep: func(time.Duration) {}})
+	proj := filepath.Join(p.ProjectsDir(), "-home-alice-x")
+	os.MkdirAll(proj, 0o700)
+	os.WriteFile(filepath.Join(proj, sid+".jsonl"), []byte(`{"type":"user"}`+"\n"), 0o600)
+	writeRegistryEntrypoint(t, p, 5150, "busy", "", "sdk-cli")
+	_, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 300*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "not confirmed within") {
+		t.Fatalf("err = %v, want a timeout", err)
 	}
 }
 
@@ -237,5 +358,130 @@ func TestConfirmClaudeDialsTmuxOnce(t *testing.T) {
 	}
 	if dials != 1 {
 		t.Errorf("dialed tmux %d times over %d polls, want exactly 1", dials, slept)
+	}
+}
+
+// TestConfirmClaudeAcceptsPrintModeThatExitedBetweenPolls covers B11. A
+// `-p` run removes its registry entry the moment it finishes, so the poll
+// can easily miss the "busy with a completed turn" window entirely: one
+// iteration sees busy+print, the next sees no live entry at all, and the
+// confirm then burns the whole --start-timeout on a run that in fact
+// succeeded. Entry gone + the transcript grown past this call's baseline
+// is that same evidence, one poll late.
+func TestConfirmClaudeAcceptsPrintModeThatExitedBetweenPolls(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	proj := filepath.Join(p.ProjectsDir(), "-home-alice-x")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(proj, sid+".jsonl")
+	if err := os.WriteFile(transcript, []byte(`{"type":"user"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The first poll sees the busy print run; the sleep between polls is
+	// when it finishes, removes its entry and leaves the extra turn behind.
+	exited := false
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Sleep: func(time.Duration) {
+		if exited {
+			return
+		}
+		exited = true
+		if err := os.Remove(filepath.Join(p.SessionsDir(), "5150.json")); err != nil {
+			t.Errorf("remove registry: %v", err)
+		}
+		f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Errorf("append transcript: %v", err)
+			return
+		}
+		defer f.Close()
+		f.WriteString(`{"type":"assistant"}` + "\n")
+	}})
+	writeRegistryEntrypoint(t, p, 5150, "busy", "", "sdk-cli")
+
+	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second)
+	if err != nil {
+		t.Fatalf("err = %v, want the finished print-mode run to be accepted", err)
+	}
+	if reg == nil || reg.Entrypoint != "sdk-cli" {
+		t.Fatalf("reg = %+v, want the print run's own last registry entry", reg)
+	}
+}
+
+// TestConfirmClaudeDoesNotAcceptAVanishedInteractiveRun is the guard on the
+// case above: the lost-race acceptance is for print runs only. An
+// interactive Claude whose registry entry disappears has NOT resumed,
+// however much its transcript grew on the way down.
+func TestConfirmClaudeDoesNotAcceptAVanishedInteractiveRun(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	proj := filepath.Join(p.ProjectsDir(), "-home-alice-x")
+	os.MkdirAll(proj, 0o700)
+	transcript := filepath.Join(proj, sid+".jsonl")
+	os.WriteFile(transcript, []byte(`{"type":"user"}`+"\n"), 0o600)
+	gone := false
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Sleep: func(time.Duration) {
+		if gone {
+			return
+		}
+		gone = true
+		os.Remove(filepath.Join(p.SessionsDir(), "5150.json"))
+		f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err == nil {
+			f.WriteString(`{"type":"assistant"}` + "\n")
+			f.Close()
+		}
+	}})
+	writeRegistryEntrypoint(t, p, 5150, "busy", "", "cli")
+	_, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 300*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "not confirmed within") {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+}
+
+// TestConfirmClaudeAcceptsTheRealPrintModeRegistryEntry is T26-1, written
+// against the registry entry a REAL `claude -p` wrote (Claude Code 2.1.247,
+// captured verbatim by the layer-2 suite — task-26-report.md; 2.1.259 wrote
+// the same shape). Only pid/sessionId/procStart are substituted so the
+// fixture's /proc tree and session id line up; every other field, above all
+// "kind":"interactive" alongside "entrypoint":"sdk-cli", is exactly what
+// real Claude Code wrote. A print run is NOT distinguishable by "kind" —
+// interactive sessions carry the same value — so the spec §6.2 case-3
+// acceptance has to gate on "entrypoint".
+func TestConfirmClaudeAcceptsTheRealPrintModeRegistryEntry(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Sleep: func(time.Duration) {}})
+	proj := filepath.Join(p.ProjectsDir(), "-home-alice-x")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(proj, sid+".jsonl")
+	if err := os.WriteFile(transcript, []byte(`{"type":"user"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sample := `{"pid":5150,"sessionId":"` + sid + `","cwd":"/home/alice/x","startedAt":1788439163760,` +
+		`"procStart":"777","version":"2.1.247","peerProtocol":1,"peerFeatures":["notify_idle","artifact_yield"],` +
+		`"kind":"interactive","entrypoint":"sdk-cli","pidDomain":"linux:0","name":"proj-be",` +
+		`"nameSource":"derived","nameSince":1788439163770,"status":"busy"}`
+	if err := session.WriteFileAtomic(filepath.Join(p.SessionsDir(), "5150.json"), []byte(sample), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		f.WriteString(`{"type":"assistant"}` + "\n")
+	}()
+	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second)
+	if err != nil {
+		t.Fatalf("err = %v, want the real print-mode entry accepted once its turn lands", err)
+	}
+	if reg.Entrypoint != "sdk-cli" || reg.Kind != "interactive" {
+		t.Errorf("reg = %+v", reg)
 	}
 }

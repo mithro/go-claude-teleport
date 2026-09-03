@@ -115,6 +115,40 @@ func TestBuildHashesRewrittenContent(t *testing.T) {
 	}
 }
 
+// TestBuildProjectDirMappingRecomputesMungedComponent covers spec §7.2
+// (ruling R-P3-18a): a plain Home-prefix mapping cannot rewrite the
+// Munge()'d project-directory path component embedded in a CatSession
+// entry's Root (Munge flattens the whole cwd into one path segment, so a
+// leading-prefix rewrite of Root never reaches inside it). When the caller
+// also supplies a mapping FROM the source project directory TO the
+// destination's own (recomputed) munged project directory, NewPathMap's
+// longest-prefix-first ordering makes that more specific mapping win, and
+// Dst carries the destination's munged spelling instead of the source's.
+func TestBuildProjectDirMappingRecomputesMungedComponent(t *testing.T) {
+	cfg, home, files := sourceTree(t)
+	bob := bobHome(home)
+	bobCfg := filepath.Join(bob, ".claude")
+	srcProj := filepath.Join(cfg, "projects/-home-alice-work")
+	dstProj := filepath.Join(bobCfg, "projects/-home-bob-elsewhere") // recomputed from the dest cwd, not a mechanical text substitution of srcProj
+	pm := session.NewPathMap(
+		session.Mapping{From: home, To: bob},
+		session.Mapping{From: srcProj, To: dstProj},
+	)
+	m, err := Build(context.Background(), sid, session.ID(sid), "a", "b", files, pm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := m.Entries[1]
+	wantDst := filepath.Join(dstProj, sid+".jsonl")
+	if tr.Dst != wantDst {
+		t.Errorf("Dst = %q, want dest munged project dir %q", tr.Dst, wantDst)
+	}
+	dir := m.Entries[0]
+	if dir.Dst != dstProj {
+		t.Errorf("dir Dst = %q, want %q", dir.Dst, dstProj)
+	}
+}
+
 func TestBuildRawHashWithoutRewrite(t *testing.T) {
 	cfg, _, files := sourceTree(t)
 	files[1].Rewrite = false

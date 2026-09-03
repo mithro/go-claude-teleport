@@ -35,6 +35,12 @@ func TestQuoteCommandSeparators(t *testing.T) {
 // creation (backslash doubled, control chars → \t/\n/\ooo...), so restore
 // must decode a stored name before handing it back to -s/-n — tmux's own
 // re-encoding then reproduces the stored spelling exactly.
+//
+// Not every tmux vis-encodes (PR #8 CI: ubuntu-latest's tmux 3.4 stores
+// window names raw), so UnvisName must also be safe on a raw, never-encoded
+// name: the `w\x` and `a\b` cases below are exactly what such a tmux would
+// hand back for the live-test fixture names, and both must round-trip as
+// the identity rather than being misread as a vis(3) escape.
 func TestUnvisName(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{`plain name`, `plain name`},
@@ -47,6 +53,9 @@ func TestUnvisName(t *testing.T) {
 		{`mixed\\and\ttab`, "mixed\\and\ttab"},
 		{`unknown\qkeep`, `unknown\qkeep`}, // unknown escape preserved
 		{`q"uo\\te.s;s`, `q"uo\te.s;s`},    // the live-test fixture shape
+		{`w\x`, `w\x`},                     // raw backslash, non-escape char: identity
+		{`a\b`, `a\b`},                     // raw backslash + 'b': NOT read as vis(3) \b (backspace)
+		{`a\r`, `a\r`},                     // raw backslash + 'r': NOT read as vis(3) \r (carriage return)
 	}
 	for _, c := range cases {
 		if got := UnvisName(c.in); got != c.want {

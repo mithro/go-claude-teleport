@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
@@ -104,27 +105,102 @@ func ffPrefixCheck(dst, staged string) (bool, error) {
 	return session.IsPrefix(dst, staged)
 }
 
+// deferrableCategory reports whether Entry.Deferred is meaningful for cat.
+//
+// Deferred is a SOURCE-controlled wire field that tells the destination to
+// classify an entry by staging state alone, without ever looking at Dst.
+// That is exactly right for the three categories that own their Dst by
+// construction — the job's own pane capture (CatCapture, whose Dst is
+// <jobID>/capture.txt) and existing-main git-attach's dirty index and
+// worktree files (CatRepo/CatWorktree, which git-attach places itself with
+// git's own semantics) — and a licence to overwrite anything at all for
+// every other category. So the DESTINATION decides, from the category, not
+// from the flag: for anything else the flag is ignored and Dst is compared
+// as usual, which turns a smuggled ~/.bashrc entry into present-different
+// and hence a Blocking collision (spec §7.4).
+func deferrableCategory(cat session.Category) bool {
+	switch cat {
+	case session.CatCapture, session.CatRepo, session.CatWorktree:
+		return true
+	}
+	return false
+}
+
+// canonicalCaptureDst is the ONE legitimate Dst a manifest's CatCapture
+// entry may ever name: job.Dir(dataDir, jobID)/capture.txt — exactly the
+// path internal/orchestrate/steps.go's runCapture builds on the source
+// side. jobID is re-validated with job.ValidateID even though callers
+// already check it at the dispatch boundary (internal/remote/jobid.go):
+// this function itself joins it straight into a filesystem path, so it
+// re-derives the safety property rather than trusting it was already
+// applied.
+func canonicalCaptureDst(dataDir, jobID string) (string, error) {
+	if err := job.ValidateID(jobID); err != nil {
+		return "", fmt.Errorf("capture entry: %w", err)
+	}
+	return filepath.Join(job.Dir(dataDir, jobID), "capture.txt"), nil
+}
+
 // Diff runs on the destination and classifies every entry.
-func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, error) {
+//
+// p is the DESTINATION's own Paths (ruling R-P3-B1e item 5): it is what
+// lets this function run the very same validator Install runs, so a
+// category/root/symlink refusal is diagnosed HERE — at preflight, naming
+// the entry and the reason — instead of being mistaken for an ordinary
+// content collision or only surfacing at the moment of the write. A
+// manifest carrying even one refused entry is never classified at all:
+// Diff returns a *RefusalError listing every refusal it found.
+func Diff(ctx context.Context, m *Manifest, stagingDir string, p session.Paths) (map[int]Status, error) {
 	out := make(map[int]Status, len(m.Entries))
+	v, err := newValidator(m, p, modeDiff)
+	if err != nil {
+		return nil, err
+	}
+	var refusals []Refusal
 	for _, e := range m.Entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		// The destination's ONE validation of an entry (validate.go): the
+		// category allow-list, home/config-dir/forbidden containment, this
+		// job's canonical capture path, declared-root membership,
+		// real-path containment, symlink targets and root provenance.
+		// Install re-runs the identical check as the authoritative gate.
+		if verr := v.check(e); verr != nil {
+			var re *RefusalError
+			if errors.As(verr, &re) {
+				refusals = append(refusals, re.Refusals...)
+				continue
+			}
+			return nil, verr
 		}
 		staged, mismatch, err := stagedState(stagingDir, e)
 		if err != nil {
 			return nil, err
 		}
-		st, err := os.Lstat(e.Dst)
-		if errors.Is(err, os.ErrNotExist) {
+		stagedStatus := func() Status {
 			switch {
 			case staged:
-				out[e.ID] = StagedSame
+				return StagedSame
 			case mismatch:
-				out[e.ID] = StagedMismatch
+				return StagedMismatch
 			default:
-				out[e.ID] = Absent
+				return Absent
 			}
+		}
+		if e.Deferred && deferrableCategory(e.Category) {
+			// A deferred entry is never compared against Dst: Dst is
+			// whatever the destination's own current checkout already
+			// holds there (an existing-main teleport's whole premise), not
+			// a prior install of THIS entry, so a "difference" there is
+			// meaningless — only "is the source's copy correctly staged
+			// for the later step to read" matters.
+			out[e.ID] = stagedStatus()
+			continue
+		}
+		st, err := os.Lstat(e.Dst)
+		if errors.Is(err, os.ErrNotExist) {
+			out[e.ID] = stagedStatus()
 			continue
 		}
 		if err != nil {
@@ -186,6 +262,9 @@ func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, 
 			}
 		}
 	}
+	if len(refusals) > 0 {
+		return nil, &RefusalError{Refusals: refusals}
+	}
 	return out, nil
 }
 
@@ -211,12 +290,51 @@ func Need(m *Manifest, st map[int]Status) []int {
 	return ids
 }
 
+// Pending lists entry ids with no verified staged (or better) copy yet:
+// Absent and StagedMismatch only. Unlike Need — deliberately over-inclusive
+// so a re-send of an already-staged ff-candidate is never skipped by
+// mistake — Pending is the completeness check: an ff-candidate, a
+// present-same/staged-same, or a present-different FFAllowed entry (which,
+// by Diff's construction, is reachable only once a verified staged copy
+// already failed its ff-prefix check) all already have everything the
+// later install/git-attach step needs staged; go/claude-teleport's own
+// transfer step is done at that point even though Need would still list
+// some of them.
+//
+// Caveat (carry-6): an ff-candidate is assigned that Status unconditionally
+// while nothing is staged yet, so before any pump has run Pending cannot
+// tell an optimistic ff-candidate from a staged-and-verified one and a
+// caller must gate on having attempted the transfer at least once —
+// internal/orchestrate/steps.go's verifyTransfer does exactly that with its
+// `Step("transfer").Attempts == 0` guard.
+func Pending(m *Manifest, st map[int]Status) []int {
+	var ids []int
+	for _, e := range m.Entries {
+		switch st[e.ID] {
+		case Absent, StagedMismatch:
+			ids = append(ids, e.ID)
+		}
+	}
+	return ids
+}
+
 // Blocking lists entries whose status forbids install: present-different,
 // unless force is set and the entry belongs to this session (FFAllowed).
+//
+// Ruling R-P3-B1c: FFAllowed is a SOURCE-computed wire field
+// (manifest.go's Build sets it true only for CatSession, but nothing
+// stops a hostile or buggy source from also setting it on any other
+// entry), so the exemption additionally requires CatSession itself —
+// spec §7.3's force-overwrite is a session-transcript feature, and in
+// particular a CatCapture entry (already forced present-different above
+// by Diff's canonical-Dst check whenever it is not this job's own
+// capture.txt) must never be exempted from blocking just because a
+// hostile source also set FFAllowed:true on it.
 func Blocking(m *Manifest, st map[int]Status, force bool) []Entry {
 	var out []Entry
 	for _, e := range m.Entries {
-		if st[e.ID] == PresentDifferent && !(force && e.FFAllowed) {
+		exempt := force && e.FFAllowed && e.Category == session.CatSession
+		if st[e.ID] == PresentDifferent && !exempt {
 			out = append(out, e)
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"runtime/debug"
 	"sync"
 
@@ -18,13 +19,34 @@ const maxLine = 256 << 20
 
 type handler func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error)
 
+// decode is the ONE funnel every handler's arguments pass through, so it
+// is where a wire-supplied job id is validated (R-P3-23n): an args type
+// carrying one implements jobIDCarrier (jobid.go), and a bad id fails here
+// — before the handler has called a single Endpoint method, let alone
+// joined the id into jobs/<id> or staging/<id>.
 func decode[T any](args json.RawMessage) (T, error) {
 	var v T
-	if len(args) == 0 {
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &v); err != nil {
+			return v, &Error{Code: "usage", Message: "bad args: " + err.Error()}
+		}
+	}
+	// Every args type in ops.go/ops_plan03.go is a STRUCT, so v is a
+	// usable value even when the wire sent no args at all. A pointer
+	// instantiation would not be: decode[*T] with empty args leaves v nil,
+	// and a wireJobIDs with a pointer receiver would then panic inside the
+	// dispatch (recovered and shipped to the peer as an "internal" error)
+	// instead of failing as a usage error. Guarded rather than merely
+	// assumed, since the instantiation is chosen at each call site.
+	if rv := reflect.ValueOf(v); rv.Kind() == reflect.Pointer && rv.IsNil() {
 		return v, nil
 	}
-	if err := json.Unmarshal(args, &v); err != nil {
-		return v, &Error{Code: "usage", Message: "bad args: " + err.Error()}
+	if c, ok := any(v).(jobIDCarrier); ok {
+		for _, id := range c.wireJobIDs() {
+			if err := checkJobID(id); err != nil {
+				return v, err
+			}
+		}
 	}
 	return v, nil
 }
@@ -154,14 +176,14 @@ var plan02Ops = map[string]handler{
 		if err != nil {
 			return nil, err
 		}
-		return Empty{}, ep.Freeze(ctx, a.PID, a.StartTime)
+		return Empty{}, ep.Freeze(ctx, a.PID, a.StartTime, a.Ref)
 	},
 	OpThaw: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {
 		a, err := decode[ThawArgs](args)
 		if err != nil {
 			return nil, err
 		}
-		return Empty{}, ep.Thaw(ctx, a.PID)
+		return Empty{}, ep.Thaw(ctx, a.PID, a.Ref)
 	},
 	OpCapture: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {
 		a, err := decode[CaptureArgs](args)

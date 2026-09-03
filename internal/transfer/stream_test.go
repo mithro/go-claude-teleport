@@ -15,7 +15,7 @@ import (
 
 func TestSendReceiveRoundTrip(t *testing.T) {
 	m, staging := newTwoHosts(t)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, destPaths(t, m))
 	need := Need(m, st)
 
 	var buf bytes.Buffer
@@ -50,7 +50,7 @@ func TestSendReceiveRoundTrip(t *testing.T) {
 	if string(link) != "../"+sid+".jsonl" {
 		t.Errorf("symlink metadata = %q", link)
 	}
-	st, _ = Diff(context.Background(), m, staging)
+	st, _ = Diff(context.Background(), m, staging, destPaths(t, m))
 	for id, s := range st {
 		if s != StagedSame {
 			t.Errorf("entry %d after receive = %s, want staged-same", id, s)
@@ -82,7 +82,7 @@ func TestReceiveInterruptedLosesOnlyInFlightEntry(t *testing.T) {
 	if len(parts) != 0 {
 		t.Errorf(".part remnants: %v", parts)
 	}
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, destPaths(t, m))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestReceiveInterruptedLosesOnlyInFlightEntry(t *testing.T) {
 	if err := Receive(context.Background(), m, &again, staging, nil); err != nil {
 		t.Fatal(err)
 	}
-	st, _ = Diff(context.Background(), m, staging)
+	st, _ = Diff(context.Background(), m, staging, destPaths(t, m))
 	for id, s := range st {
 		if s != StagedSame {
 			t.Errorf("entry %d = %s after resume", id, s)

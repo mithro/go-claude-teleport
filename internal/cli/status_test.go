@@ -31,14 +31,10 @@ func TestStatusRendersJournal(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
-	for _, want := range []string{"laptop.example", "big-storage.example", "preflight", "done", "transfer", "failed", "connection reset", "attempts 2", "l3", "status " + tsid, "abandon " + tsid} {
+	for _, want := range []string{"laptop.example", "big-storage.example", "preflight", "done", "transfer", "failed", "connection reset", "attempts 2", "l3", "status " + tsid, "continue " + tsid, "abandon " + tsid} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("status output lacks %q:\n%s", want, out.String())
 		}
-	}
-	// `continue` is registered by Plan 03; the hint must not mention it yet.
-	if strings.Contains(out.String(), "continue "+tsid) {
-		t.Errorf("status output must not hint at claude-teleport continue (not registered until Plan 03):\n%s", out.String())
 	}
 
 	out.Reset()
@@ -105,5 +101,40 @@ func TestStatusMissingAndBadID(t *testing.T) {
 	}
 	if code := Main([]string{"status", "not-a-uuid"}, strings.NewReader(""), &out, &errOut, env); code != ExitUsage {
 		t.Errorf("bad id: exit %d", code)
+	}
+}
+
+// TestStatusHintsAfterAFailedJob pins A6: the runner marks a FAILED job
+// finished as well, so gating the next-step hint on Finished hid
+// continue/abandon from exactly the reader who needs them — while a
+// successful or abandoned job (nothing left to do) must still not show
+// them.
+func TestStatusHintsAfterAFailedJob(t *testing.T) {
+	for _, tc := range []struct {
+		outcome string
+		want    bool
+	}{
+		{"failed", true},
+		{"", true},
+		{"success", false},
+		{"abandoned", false},
+	} {
+		env, home := testEnv(t)
+		dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+		j, _ := job.New(dataDir, tsid)
+		j.Direction, j.SourceHost, j.DestHost = "to", "laptop.example", "big-storage.example"
+		st := j.Step("transfer")
+		st.Status, st.Error = job.Failed, "tar stream: EOF"
+		j.Outcome, j.Finished = tc.outcome, tc.outcome != ""
+		if err := j.Save(); err != nil {
+			t.Fatal(err)
+		}
+		code, out, stderr := run(t, env, "status", tsid)
+		if code != ExitOK {
+			t.Fatalf("status: %d %s", code, stderr)
+		}
+		if got := strings.Contains(out, "continue "+tsid); got != tc.want {
+			t.Errorf("outcome %q: next-step hint shown = %v, want %v:\n%s", tc.outcome, got, tc.want, out)
+		}
 	}
 }

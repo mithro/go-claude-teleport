@@ -1,8 +1,10 @@
 package claudecfg
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -12,17 +14,18 @@ import (
 
 const cwd = "/home/alice/github/example/widget"
 
-func srcPaths() session.Paths { return session.NewPaths("/home/alice", "testdata/src", "/tmp/x") }
-func dstPaths() session.Paths { return session.NewPaths("/home/alice", "testdata/dst", "/tmp/x") }
+func srcPaths() session.Paths { return session.NewPaths("/home/alice", "testdata/src", "/tmp/x", true) }
+func dstPaths() session.Paths { return session.NewPaths("/home/alice", "testdata/dst", "/tmp/x", true) }
 
 func TestCollectSrc(t *testing.T) {
 	inv, err := Collect(srcPaths(), cwd, "laptop.example", "2.1.247")
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantHooksJSON := `{"PreToolUse":[{"hooks":[{"command":"/home/alice/bin/guard.sh","type":"command"}],"matcher":"Bash"}]}`
 	want := &Inventory{
 		Host: "laptop.example", ClaudeVersion: "2.1.247",
-		Hooks:          `{"PreToolUse":[{"hooks":[{"command":"/home/alice/bin/guard.sh","type":"command"}],"matcher":"Bash"}]}`,
+		HooksHash:      configHash(wantHooksJSON),
 		Permissions:    Permissions{DefaultMode: "acceptEdits", Allow: []string{"Bash(go test:*)", "Bash(go vet:*)"}, Deny: []string{"Read(./.env)"}},
 		Env:            map[string]string{"GOFLAGS": "-mod=mod"},
 		EnabledPlugins: map[string]bool{"superpowers@claude-plugins-official": true},
@@ -60,16 +63,67 @@ func TestCollectDstMissingFilesAreNotErrors(t *testing.T) {
 		inv.Plugins["superpowers@claude-plugins-official"].Version != "6.2.0" || len(inv.Env) != 0 {
 		t.Fatalf("%+v", inv)
 	}
-	empty, err := Collect(session.NewPaths("/home/nobody", t.TempDir(), "/tmp/x"), cwd, "h", "")
-	if err != nil || empty.Hooks != "" || empty.ProjectPresent {
+	empty, err := Collect(session.NewPaths("/home/nobody", t.TempDir(), "/tmp/x", true), cwd, "h", "")
+	if err != nil || empty.HooksHash != "" || empty.ProjectPresent {
 		t.Fatalf("%+v %v", empty, err)
+	}
+}
+
+// TestHooksNeverLeakRawContent is R-P3-28a: a settings.json hooks command
+// can carry a secret (an inline token, a path revealing something private),
+// so — like MCP server configs and settings.env (TestCompareRedactsSecrets
+// in compare_test.go) — only a hash of it may ever reach Collect's
+// Inventory or the drift table, never the raw content. Before the fix,
+// Collect stores canonical(hooks) verbatim and Compare's "hooks" row
+// renders/JSON-encodes a 40-char prefix of it directly, so a short secret
+// (as used here, so short() never truncates it away) leaks in both Render
+// and JSON output.
+func TestHooksNeverLeakRawContent(t *testing.T) {
+	const sentinel = "SENTINEL-hunter2-example"
+	srcDir, dstDir := t.TempDir(), t.TempDir()
+	srcSettings := `{"hooks":{"cmd":"` + sentinel + `"}}`
+	if err := os.WriteFile(filepath.Join(srcDir, "settings.json"), []byte(srcSettings), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	src, err := Collect(session.NewPaths("/home/alice", srcDir, "/tmp/x", true), cwd, "laptop.example", "2.1.247")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst, err := Collect(session.NewPaths("/home/bob", dstDir, "/tmp/x", true), cwd, "big-storage.example", "2.1.247")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(src.HooksHash, sentinel) {
+		t.Fatalf("Inventory.HooksHash carries raw hook content: %q", src.HooksHash)
+	}
+
+	r := Compare(src, dst, nil)
+	if classes(r)["hooks"] != Block {
+		t.Fatalf("hooks drift must still be reported: %+v", r)
+	}
+	var buf bytes.Buffer
+	r.Render(&buf)
+	js, err := r.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), sentinel) {
+		t.Errorf("Render leaked hook content:\n%s", buf.String())
+	}
+	if strings.Contains(string(js), sentinel) {
+		t.Errorf("JSON leaked hook content:\n%s", js)
+	}
+	for _, d := range r.Diffs {
+		if d.Key == "hooks" && (strings.Contains(d.Source, sentinel) || strings.Contains(d.Dest, sentinel)) {
+			t.Errorf("Difference %+v leaks hook content", d)
+		}
 	}
 }
 
 func TestCollectMalformedIsError(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "settings.json"), []byte("{nope"), 0o600)
-	if _, err := Collect(session.NewPaths("/home/alice", dir, "/tmp/x"), cwd, "h", ""); err == nil {
+	if _, err := Collect(session.NewPaths("/home/alice", dir, "/tmp/x", true), cwd, "h", ""); err == nil {
 		t.Fatal("malformed settings.json must be an error")
 	}
 }
@@ -86,7 +140,7 @@ func TestCollectPluginHashesAndSkills(t *testing.T) {
 	os.WriteFile(filepath.Join(plug, "agents", "explorer.md"), []byte("# explorer"), 0o600)
 	os.WriteFile(filepath.Join(dir, "plugins", "installed_plugins.json"),
 		[]byte(`{"version":2,"plugins":{"p@m":[{"version":"1.0.0","installPath":"`+plug+`"}]}}`), 0o600)
-	inv, err := Collect(session.NewPaths("/home/alice", dir, "/tmp/x"), cwd, "h", "")
+	inv, err := Collect(session.NewPaths("/home/alice", dir, "/tmp/x", true), cwd, "h", "")
 	if err != nil {
 		t.Fatal(err)
 	}

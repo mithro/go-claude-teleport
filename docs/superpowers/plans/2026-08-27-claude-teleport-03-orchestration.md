@@ -11061,29 +11061,64 @@ Everything below is new relative to `2026-08-27-claude-teleport-00-interfaces.md
 
 **internal/tmuxx**
 - `DialControl` takes a socket **path** (`tmux -S`); `ErrNoServer`
-- `var Dial Dialer = DialControl` (FindServer's liveness probe; tests swap it)
+- `var Dial Dialer = DialControl` (FindServer's liveness probe; tests swap it) — `internal/cli` dials through this var too, so a test that swaps it also covers `remote serve`'s own probe
 - `SessionInfo{Name, Group string}`, `ListSessions(ctx, t) ([]SessionInfo, error)`, `BaseSession(sessions, group) (string, bool)`
 - `ShellQuote(argv []string) string`
+- `RefString(ref *session.TmuxRef) string` — the one spelling of `<session>:<window>.<pane>`; every caller that formats a pane ref (steps, `list`, the registry comparison in `verifyStart`) uses it
+- `IsShell(comm string) bool` — the shared "is this pane running a shell" predicate (`orchestrate` had a private copy; C4/B6)
+- `PanePID(ctx, t, paneID) (int, error)` — the pid tmux itself started in the pane; the group the pty's foreground reverts to after a stopped job is thawed
+- `RestoreForeground(ctx, t Transport, paneID string, pid int, opts ForegroundOptions) error`, `ForegroundOptions{ProcRoot, Logf, Sleep, Timeout, Poll}`, `ForegroundPoll`, `ForegroundTimeout`, `ErrNotRestored` — the ONE implementation of "ask the pane's shell to `fg` the thawed job back into the pty" (ruling R-P3-F1). `remote.Local.restoreForeground` delegates to it; nothing else re-implements the check-then-type dance
+- `FreezerRestore(socketPath, paneID string) procx.RestoreFunc` — that same restore, packaged as the hook the freezer helper runs after the SIGCONT of its owner-died path (it dials the pane's own server; `procx` cannot import `tmuxx`, so `internal/cli` hands it in)
 - `StartTestServer(t) (socketPath, socketDir string)` under build tag `tmuxlive`
+- **Knowing deviation from the "no package reads the environment" rule:** `utf8Env` (client.go) reads `LC_ALL`/`LC_CTYPE`/`LANG` out of the environment it is given and forces a UTF-8 locale for the `tmux -C` child. It is not a directory or a default a caller could pass instead — it is the locale of the very process being spawned, and a non-UTF-8 one makes tmux mangle non-ASCII pane names and content. Documented here rather than plumbed through every call site.
+
+**internal/job**
+- `ValidateID(id string) error` — the one rule for what may appear as `jobs/<id>`/`staging/<id>` on either host (non-empty, no separators, no `.`/`..`, no control characters); the wire dispatch and every `Local` method that turns an id into a path call it (rulings R-P3-23i/R-P3-23n)
+
+**internal/sshx**
+- `DefaultKeepaliveInterval = 15 * time.Second`, `DefaultKeepaliveCountMax = 3` and `Options.KeepaliveInterval time.Duration` / `Options.KeepaliveCountMax int` (OpenSSH's `ServerAliveInterval`/`ServerAliveCountMax`). Unlike OpenSSH they are ON by default: a teleport runs unattended, and a half-open link must fail the job into a continuable journal rather than hang it. `interval <= 0` disables them; `-o ServerAliveInterval=`/`-o ServerAliveCountMax=` and the same two keywords in `~/.ssh/config` override, and `ServerAliveCountMax=0` is an error rather than a silent default
+- `sshtest.Options.GlobalRequestDelay func(n int) time.Duration` — delays the n-th global request so a test can simulate a link that stops answering keepalives
+
+**internal/procx**
+- `(*Freezer).Warnings() string` — whatever the freezer helper wrote to stderr (its degrade-to-bare-pid notes), so the caller can put them in `log.txt` on the success path too
+- `PaneRef{SocketPath, PaneID string}` with `Empty() bool`, and `RestoreFunc func(pid int) error`; `Freeze(selfExe string, pid int, startTime string, ref PaneRef)` and `RunFreezerHelper(pid int, startTime string, control *os.File, restore RestoreFunc)` take them (ruling R-P3-F1). The ref reaches the helper through its argv (`internal-freezer <pid> <start> [socket pane]`, hence `internal/cli`'s `cobra.RangeArgs(2, 4)`); the hook runs only on the owner-died path, since the ordinary thaw's owner does the restore itself
 
 **internal/remote**
-- `Endpoint` gains: `GitFiles`, `GitSourceFacts`, `BuildManifest`, `SessionExtras`, `TmuxSessions`, `KillWindow`, `ClaudeStatus`, `ListSessions`, `Cleanup`, `DeleteInstalled` (signatures in Tasks 13, 16, 23)
+- `Endpoint` gains: `GitFiles`, `GitSourceFacts`, `BuildManifest`, `SessionExtras`, `TmuxSessions`, `KillWindow`, `ClaudeStatus`, `ListSessions`, `Cleanup`, `DeleteInstalled`, `RemoveJob` (signatures in Tasks 13, 16, 23; `RemoveJob` removes `jobs/<id>/` entirely — the wire dispatch handler refuses any id not prefixed `inspect-`, ruling R-P3-23i)
+- `Endpoint.Freeze(ctx, pid int, startTime string, ref *session.TmuxRef) error` — the pane joins the freeze so the freezer helper can restore its foreground unaided if this process dies (ruling R-P3-F1); `FreezeArgs.Ref *session.TmuxRef` carries it over the wire
 - `SessionSummary` struct
 - `LocalOptions.TmuxSocketDir string`, `LocalOptions.Sleep func(time.Duration)`
 - `FailureMarkers`, `HasFailureMarker`
 - `PipeStream(fn func(r io.Reader, w io.Writer) error) io.ReadWriteCloser`
 - Stream ids carry a direction: `send:<n>` / `recv:<n>`; `tar`/`pack` receive into `staging/<job>/`, `pack` lands at `staging/<job>/objects.pack`
 - `Local.ManifestDiff` and `Local.BuildManifest` persist `jobs/<job>/manifest.json`; `Local.Install` reads `InstallExtras` from `jobs/<job>/extras.json` exactly as Plan 02 wrote it (the orchestrator calls Plan 02's `PutInstallExtras` first); `planView` serves the streams only
-- Ops added to the protocol: `git-files`, `git-source-facts`, `tmux-sessions`, `tmux-kill`, `claude-status`, `build-manifest`, `session-extras`, `cleanup`, `list-sessions`, `delete-installed` (Plan 02's existing ops, incl. `shape-state` and `claude-pty-resume`, keep their names, `dispatch` entries and `Client` methods)
+- Ops added to the protocol: `git-files`, `git-source-facts`, `tmux-sessions`, `tmux-kill`, `claude-status`, `build-manifest`, `session-extras`, `cleanup`, `list-sessions`, `delete-installed`, `remove-job` (Plan 02's existing ops, incl. `shape-state` and `claude-pty-resume`, keep their names, `dispatch` entries and `Client` methods)
 - Dependency added: `github.com/creack/pty` (RunPtyResume only)
 
-**internal/transfer (no additions)**
+**internal/transfer**
 - Plan 02's `Build` already takes `Size` from the bytes it hashes and `Mode`/`ModTime` from `os.Stat` when the `FileEntry` leaves them zero, which is what the capture entry (`runCapture`, built on the driver and hashed by `BuildManifest` on the source) relies on.
+- `InstallReport.InstalledIDs []int` (`json:"InstalledIDs"`, ruling R-P3-23a: ids `Install` placed at `Dst` from scratch) and `InstallReport.FastForwardedIDs []int` (ruling R-P3-23h: ids `Install` fast-forwarded — folded into `Plan.InstalledIDs`, below, only when already recorded there)
+- `InstallExtras.Force bool` (the driver's `--force`, relayed to the destination) and `InstallReport.ForceOverwritten int` (entries replaced wholesale under it, hash-verified) — B12
+- `Manifest.Roots []Root` (`json:"roots,omitempty"`) and `Root{Path string; MayPreExist bool}` (rulings R-P3-B1d/B1e): the destination repository root(s) a `CatRepo`/`CatWorktree` entry's `Dst` must lie under — `gitx.Plan`'s own `DstMain`/`DstWorktree`, populated by `orchestrate`'s `annotateManifest`. `MayPreExist` marks not-a-repo mode's single root (the driver's chosen destination cwd, which legitimately already exists and holds unrelated files); it relaxes ONLY the provenance rule, never a containment rule
+- `GitRoots(dstMain, dstWorktree string, mayPreExist bool) []Root` — builds that field (dedup, empties dropped)
+- `Diff(ctx, m, stagingDir string, p session.Paths) (map[int]Status, error)` (R-P3-B1e item 5) — the destination's own `Paths` let `Diff` run the very same validator `Install` runs, so a category/root/symlink refusal is diagnosed at preflight instead of being mistaken for a content collision. A manifest with any refused entry is not classified at all: `Diff` returns `*RefusalError`
+- `Refusal{ID, Dst, Category, Reason}`, `RefusalError{Refusals []Refusal}`, `IsRefusal(err) bool` — the "this entry may never be written here" verdict. `remote.Local.ManifestDiff`/`Install` relay it as a `remote.Error` with code `refused`; `orchestrate.Preflight` turns that into a `RefusedError` (exit 3)
+- `Refuse(dst, format, …) *RefusalError`, `ResolveRealPath(path) (string, error)`, `CheckDestDir(p session.Paths, dir string) error`, `JobCreatedRoot(p session.Paths, jobID, dir string) (bool, error)` (R-P3-B1f N1) — the destination's own path rules, exported so `internal/remote` can apply the identical resolved-root reasoning to the `DstMain`/`DstWorktree`/`WorktreeName`/`IndexRel`/dirty-file paths a wire `gitx.Plan` names, BEFORE `gitx.Attach` writes anything (git-attach is the destination's second write path)
+- `jobs/<id>/installed.json` on the DESTINATION (`{"version":1,"entries":[{dst, sha256, category, kind, symlink}]}`, 0600, R-P3-B1f N3) — what `Install` actually placed, written on every exit path (a partial install's placements stay deletable). `Uninstall`/`UninstallIDs`/`DeleteInstalled` may remove ONLY what it records, and only while the content still matches; the manifest and the caller's ids can narrow that set, never widen it. Removed with the job directory by `abandon`/`RemoveJob`, and untouched by `Cleanup` (staging only)
+- `Root.MayPreExist` is corroborated, never believed (R-P3-B1f N2): honoured only when the root really is an existing directory AND the manifest's own `CatSession` entries place the transcript under `projects/<session.Munge(root)>`
+- `jobs/<id>/roots.json` on the DESTINATION (`{"version":1,"roots":[…]}`, 0600) — the repo roots THIS job created there. `Install` claims a root once the whole manifest has validated and still before placing anything under it (R-P3-B1f N5), recording and comparing EvalSymlinks-resolved paths (N4); "freshness" is that record, not a directory's current contents, so the destination's own re-runs (verifyInstall's re-diff, a resumed job) still recognise a legitimately non-empty root as their own. Removed with the job directory by `abandon`/`RemoveJob`
 
 **internal/orchestrate**
 - `Options.Target string`, `Options.Via []string`, `Options.SSHOptions map[string]string`, `Options.LocalDest *session.Paths` (tests)
-- `Plan` JSON tags (`options`, `statuses`, `git`, `extras`, … — `remote.planView` depends on them) and fields `JobID`, `SourceFacts`, `Files`, `Statuses`, `Extras`, `CaptureEntryID`, `DestCwd`, `DestCapture`, `DestRef`, `CreatedSession`, `CreatedWindow`, `DestRegistry`, `StartedAt`
+- `Plan` JSON tags (`options`, `statuses`, `git`, `extras`, … — `remote.planView` depends on them) and fields `JobID`, `SourceFacts`, `Files`, `Statuses`, `InstalledIDs` (`json:"installed_ids"`, ruling R-P3-23a — the durable record of what THIS job installed; `Statuses` is overwritten by later manifest-diffs and cannot answer that once a job finishes), `Extras`, `CaptureEntryID`, `DestCwd`, `DestCapture`, `DestRef`, `CreatedSession`, `CreatedWindow`, `DestRegistry`, `StartedAt`
 - `(*Plan).ToJSON()`, `PlanFromJournal(j)`, `RefusedError`, `UnreachableError`, `PlaceholderArgv`, `SuspendArgv`, `StepNames`, `EndpointFactory`, `RunJob`, `ExitCode`, `FailedStep`
+- `Plan.RecordedSrc`/`Plan.RecordedDst bool` (`json:"recorded_src"`/`"recorded_dst"`) — each host's history row is appended once per job, so a re-run of the record step cannot duplicate it (finding A8)
+- `ExitOK = 0`, `ExitFailed = 1`, `ExitNotResumed = 5` — the spec §5 codes a journal can decide, defined once here next to `ExitCode` and re-exported by `internal/cli` (finding A13)
+- `Steps(p, j, src, dst, logf)` and `RunJob(ctx, dataDir, jobID, factory, logf)` take no `selfExe`: no step re-execs the binary (finding A9)
+
+**internal/session** (Plan 01 types, extended here)
+- `NewPaths(home, configDir, xdgDataHome string, configDirFromEnv bool) Paths` — the fourth argument, and the `Paths.ConfigDirFromEnv bool` field it sets, record that `CLAUDE_CONFIG_DIR` was actually SET rather than `ConfigDir` merely defaulting to `~/.claude`. Claude Code picks `$HOME/.claude.json` vs `<ConfigDir>/.claude.json` by the variable's presence, not its value, and `remote.claudeEnv` decides from it whether a claude this host starts sees the variable at all. `internal/cli` is the only reader of the environment and so the only caller that can pass `true`
+- `Registry.Entrypoint string` (`json:"entrypoint"`) — how the session was launched: `"cli"` for a terminal session, `"sdk-cli"` for a `claude -p` run. Verified against real Claude Code 2.1.247 and 2.1.259: `kind` is `"interactive"` for both, so this is the only field that tells a print run apart
 
 **test/fakeclaude**
 - (no additions) `FAKECLAUDE_TMUX`, `FAKECLAUDE_FAIL=not-logged-in` and `FAKECLAUDE_RUN_CHILD` are Plan 01 Task 19's env contract, used as defined there

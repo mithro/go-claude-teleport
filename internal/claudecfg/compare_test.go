@@ -10,7 +10,7 @@ import (
 )
 
 func base() *Inventory {
-	return &Inventory{Host: "laptop.example", ClaudeVersion: "2.1.247", Hooks: `{"a":1}`,
+	return &Inventory{Host: "laptop.example", ClaudeVersion: "2.1.247", HooksHash: "hooksA",
 		Permissions: Permissions{DefaultMode: "acceptEdits", Allow: []string{"x"}, Deny: []string{"d"}},
 		Env:         map[string]string{"A": "1"}, EnabledPlugins: map[string]bool{"p@m": true}, Model: "opus", Effort: "high",
 		MCPServers: map[string]string{"playwright": "cfg1", "unused": "u"}, ProjectPresent: true,
@@ -41,7 +41,7 @@ func TestCompareClassification(t *testing.T) {
 	dst := base()
 	dst.Host = "big-storage.example"
 	dst.ClaudeVersion = "2.1.250"
-	dst.Hooks = `{"a":2}`
+	dst.HooksHash = "hooksB"
 	dst.MCPServers = map[string]string{"playwright": "cfg2", "extra": "e"} // playwright differs, unused absent, extra only on dst
 	dst.ProjectMCP = map[string]string{}                                   // filesystem absent
 	dst.Plugins = map[string]PluginInfo{"p@m": {Version: "1", HooksHash: "h2"}, "q@m": {Version: "3"}}
@@ -132,6 +132,49 @@ func TestCompareClassification(t *testing.T) {
 	}
 	if err := json.Unmarshal(js, &parsed); err != nil || !parsed.Blocking || parsed.Diffs[0].Class != "block" {
 		t.Fatalf("json: %s %v", js, err)
+	}
+}
+
+// TestClassJSONRoundTrips pins Class's MarshalJSON/UnmarshalJSON pair: a
+// *Report (and so a *Plan carrying one, per orchestrate.Plan.Drift) is
+// written to the job journal and read back on every resumed step
+// (PlanFromJournal decodes exactly what ToJSON wrote) — a Class that only
+// implements MarshalJSON silently breaks that round trip for any report
+// with a diff, not only a blocking one.
+func TestClassJSONRoundTrips(t *testing.T) {
+	for _, c := range []Class{Info, Warn, Block} {
+		b, err := json.Marshal(c)
+		if err != nil {
+			t.Fatalf("%v: marshal: %v", c, err)
+		}
+		var got Class
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("%v: unmarshal %s: %v", c, b, err)
+		}
+		if got != c {
+			t.Fatalf("round trip = %v, want %v (json %s)", got, c, b)
+		}
+	}
+	var bogus Class
+	if err := bogus.UnmarshalJSON([]byte(`"bogus"`)); err == nil {
+		t.Fatal("unknown class string must error, not silently zero out")
+	}
+	src, dst := base(), base()
+	src.HooksHash = "different"
+	r := Compare(src, dst, nil)
+	if len(r.Diffs) == 0 {
+		t.Fatal("fixture must produce at least one diff")
+	}
+	js, err := r.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Report
+	if err := json.Unmarshal(js, &back); err != nil {
+		t.Fatalf("Report round trip: %v\njson: %s", err, js)
+	}
+	if len(back.Diffs) != len(r.Diffs) || back.Diffs[0].Class != r.Diffs[0].Class {
+		t.Fatalf("round-tripped report = %+v, want %+v", back, r)
 	}
 }
 

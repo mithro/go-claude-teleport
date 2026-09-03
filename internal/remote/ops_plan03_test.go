@@ -259,6 +259,62 @@ func TestServeListSessionsOp(t *testing.T) {
 	}
 }
 
+// TestServeRemoveJobOpRemovesInspectThrowawayJobs is ruling R-P3-23i: the
+// remove-job op removes jobs/<id>/ entirely for an inspect --host
+// throwaway id (the only kind inspect ever asks for), round-tripped
+// through Serve exactly as a real remote host would dispatch it.
+func TestServeRemoveJobOpRemovesInspectThrowawayJobs(t *testing.T) {
+	p := testPaths(t)
+	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
+	const jobID = "inspect-deadbeefcafef00d"
+	dir := job.Dir(p.DataDir, jobID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if e := callOp(t, ep, OpRemoveJob, removeJobArgs{JobID: jobID}, nil); e != nil {
+		t.Fatal(e)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("jobs/%s still exists after remove-job: %v", jobID, err)
+	}
+}
+
+// TestServeRemoveJobOpRefusesNonInspectJobs is R-P3-23i's safety half: a
+// jobID not prefixed "inspect-" (a REAL job — abandon/continue/status all
+// depend on jobs/<id>/manifest.json and job.json surviving) must never be
+// removable through this op, whatever the caller claims — the dispatch
+// handler refuses before ever calling Endpoint.RemoveJob.
+func TestServeRemoveJobOpRefusesNonInspectJobs(t *testing.T) {
+	p := testPaths(t)
+	ep := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
+	const jobID = sid // a real session id, the shape every genuine job uses
+	dir := job.Dir(p.DataDir, jobID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte(`{"job_id":"` + jobID + `"}`)
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := callOp(t, ep, OpRemoveJob, removeJobArgs{JobID: jobID}, nil)
+	if e == nil {
+		t.Fatal("expected remove-job to refuse a non-inspect- job id")
+	}
+	if e.Code != "usage" {
+		t.Errorf("error code = %q, want usage", e.Code)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("jobs/%s must survive a refused remove-job: %v", jobID, err)
+	}
+	if string(got) != string(marker) {
+		t.Errorf("manifest.json content changed: got %s, want %s", got, marker)
+	}
+}
+
 func containsBytes(b json.RawMessage, s string) bool { return bytes.Contains(b, []byte(s)) }
 
 // TestPlan03OpsServeThroughAChainedClient is the I5 regression: the nine
