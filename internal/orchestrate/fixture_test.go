@@ -101,7 +101,18 @@ func newHost(t *testing.T, name, user string, tm *fakeTmux) *host {
 		tm.env = func(paneID, sess, win string) []string {
 			return []string{"HOME=" + home, "CLAUDE_CONFIG_DIR=" + p.ConfigDir, "TMUX_PANE=" + paneID, "TMUX=" + tm.socket + ",1,0", "FAKECLAUDE_TMUX=" + sess + ":" + win + "." + paneID, "PATH=" + os.Getenv("PATH"), "XDG_DATA_HOME=" + filepath.Join(home, ".local", "share")}
 		}
-		opts.Tmux = func(context.Context, string) (tmuxx.Transport, error) { return tm, nil }
+		// PROOF2-1: honour tm.gone the same way a real dial would once the
+		// server it was pointed at has died — Local's own dial() maps
+		// tmuxx.ErrNoServer to Code "unavailable" (internal/remote/local_tmux.go).
+		opts.Tmux = func(context.Context, string) (tmuxx.Transport, error) {
+			tm.mu.Lock()
+			gone := tm.gone
+			tm.mu.Unlock()
+			if gone {
+				return nil, tmuxx.ErrNoServer
+			}
+			return tm, nil
+		}
 		os.MkdirAll(opts.TmuxSocketDir, 0o700)
 		tm.socket = filepath.Join(opts.TmuxSocketDir, "default")
 		os.WriteFile(tm.socket, nil, 0o600) // FindServer lists it; Dial is the fake above

@@ -11,8 +11,11 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"testing"
+	"time"
 
 	"github.com/creack/pty"
+	"github.com/mithro/go-claude-teleport/internal/procx"
 )
 
 // fakeTmux implements tmuxx.Transport by interpreting the exact command
@@ -29,6 +32,62 @@ type fakeTmux struct {
 	nextW    int
 	nextP    int
 	env      func(paneID, sess, win string) []string
+	// gone marks that the fake server itself has "died", as tmux's default
+	// exit-empty behaviour does when a detached server with no client
+	// attached loses its last session (PROOF2-1: a source Claude launched
+	// with `exec claude`, or via `tmux new-window claude`, IS the pane's
+	// own command, so it takes the pane, the window, the session and the
+	// whole server down with it when it exits). fixture_test.go's
+	// newHost wires this into opts.Tmux so every dial after that point
+	// fails exactly as a real dead socket does (tmuxx.ErrNoServer).
+	gone bool
+	// exitTrig, when armed (armOnExitDelivered), fires once send-keys
+	// actually delivers an Enter to the pane it names — see waitThenApply.
+	exitTrig *exitTrigger
+}
+
+// exitTrigger backs the PROOF2-1 "gone"/"not-found" fake-tmux modes.
+// Fix round 1 (R-P3-PROOF-1a): earlier versions applied the transition
+// from an independent goroutine racing the real ExitClaude call — first a
+// pid-polling watcher started before send-keys had even begun, then one
+// merely gated on Enter having been delivered — either way leaving a
+// window between "Enter written" and "gone applied" that a slow CI runner
+// could land production code's OWN next tmux call (steps.go's runThawExit,
+// calling PaneState or — once PaneState still finds the shell, i.e. before
+// the transition landed — TypeCommand) inside, producing an unforgiven
+// error from a call the ruling never meant to cover. Run's own "send-keys"
+// case below now BLOCKS synchronously (off the lock — see the Run/runLocked
+// split) until pid has actually exited before returning to its caller,
+// which is ExitClaude's own SendKeys("Enter") — so by the time ExitClaude
+// returns to runThawExit, the transition has unconditionally already
+// happened. Checking pid+start-time (procx.Table.Alive), not a bare pid,
+// additionally rules out mistaking a reused pid for it.
+type exitTrigger struct {
+	paneID    string
+	pid       int
+	procStart string
+	apply     func()
+}
+
+// armOnExitDelivered arms apply to run, blocking the "send-keys ... Enter"
+// call that delivers it, once pid (identified by pid AND procStart, so a
+// reused pid cannot be mistaken for it) has exited. Only one trigger may be
+// armed at a time (all current callers need at most one).
+func (f *fakeTmux) armOnExitDelivered(t *testing.T, paneID string, pid int, procStart string, apply func()) {
+	t.Helper()
+	f.mu.Lock()
+	f.exitTrig = &exitTrigger{paneID: paneID, pid: pid, procStart: procStart, apply: apply}
+	f.mu.Unlock()
+}
+
+// waitGone blocks until pid (checked by pid AND start time) has exited.
+func waitGone(pid int, procStart string) {
+	for {
+		if procs, err := procx.Scan("/proc"); err == nil && !procs.Alive(pid, procStart) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 type fakeWindow struct {
@@ -116,12 +175,26 @@ func flag(args []string, name string) string {
 	return ""
 }
 
+// Run locks, does the actual command handling in runLocked, unlocks, and
+// only THEN — never while holding f.mu — blocks on any exitTrigger
+// runLocked found due (see exitTrigger's doc for why this must be
+// synchronous with the call that delivered its pane's Enter, not an
+// independently-timed goroutine).
 func (f *fakeTmux) Run(_ context.Context, cmd string) ([]string, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	out, err, trig := f.runLocked(cmd)
+	f.mu.Unlock()
+	if trig != nil {
+		waitGone(trig.pid, trig.procStart)
+		trig.apply()
+	}
+	return out, err
+}
+
+func (f *fakeTmux) runLocked(cmd string) (out []string, err error, trig *exitTrigger) {
 	a := splitArgs(cmd)
 	if len(a) == 0 {
-		return nil, fmt.Errorf("empty command")
+		return nil, fmt.Errorf("empty command"), nil
 	}
 	switch a[0] {
 	case "list-sessions":
@@ -129,31 +202,33 @@ func (f *fakeTmux) Run(_ context.Context, cmd string) ([]string, error) {
 		for name, group := range f.sessions {
 			out = append(out, name+"\t"+group)
 		}
-		return out, nil
+		return out, nil, nil
 	case "new-session":
 		sess := flag(a, "-s")
 		f.sessions[sess] = ""
-		return f.newWindow(sess, flag(a, "-n"), flag(a, "-c"))
+		out, err := f.newWindow(sess, flag(a, "-n"), flag(a, "-c"))
+		return out, err, nil
 	case "new-window":
 		target := strings.TrimSuffix(strings.TrimPrefix(flag(a, "-t"), "="), ":")
 		if _, ok := f.sessions[target]; !ok {
-			return nil, fmt.Errorf("can't find session: %s", target)
+			return nil, fmt.Errorf("can't find session: %s", target), nil
 		}
-		return f.newWindow(target, flag(a, "-n"), flag(a, "-c"))
+		out, err := f.newWindow(target, flag(a, "-n"), flag(a, "-c"))
+		return out, err, nil
 	case "set-option":
 		if w, ok := f.windows[flag(a, "-t")]; ok && a[len(a)-2] == "automatic-rename" {
 			w.autoRename = a[len(a)-1] != "off"
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("set-option: %q", cmd)
+		return nil, fmt.Errorf("set-option: %q", cmd), nil
 	case "show-options":
 		if w, ok := f.windows[flag(a, "-t")]; ok {
 			if w.autoRename {
-				return []string{"on"}, nil
+				return []string{"on"}, nil, nil
 			}
-			return []string{"off"}, nil
+			return []string{"off"}, nil, nil
 		}
-		return nil, fmt.Errorf("show-options: no window %q", flag(a, "-t"))
+		return nil, fmt.Errorf("show-options: no window %q", flag(a, "-t")), nil
 	case "list-panes":
 		format := flag(a, "-F")
 		target := flag(a, "-t")
@@ -175,34 +250,43 @@ func (f *fakeTmux) Run(_ context.Context, cmd string) ([]string, error) {
 			}
 		}
 		if len(out) == 0 && target != "" {
-			return nil, fmt.Errorf("can't find pane: %s", target)
+			return nil, fmt.Errorf("can't find pane: %s", target), nil
 		}
-		return out, nil
+		return out, nil, nil
 	case "send-keys":
 		p, ok := f.panes[flag(a, "-t")]
 		if !ok {
-			return nil, fmt.Errorf("can't find pane: %s", flag(a, "-t"))
+			return nil, fmt.Errorf("can't find pane: %s", flag(a, "-t")), nil
 		}
 		var text strings.Builder
+		deliveredEnter := false
 		for _, k := range a[3:] {
 			if seq, ok := keySeq[k]; ok {
 				text.WriteString(seq)
+				deliveredEnter = deliveredEnter || k == "Enter"
 			} else {
 				text.WriteString(k)
 			}
 		}
-		_, err := io.WriteString(p.stdin, text.String())
-		return nil, err
+		_, werr := io.WriteString(p.stdin, text.String())
+		// See exitTrigger's doc: only now — after Enter has actually been
+		// written to this pane — is the trigger due; Run (the caller) blocks
+		// on it AFTER releasing f.mu, so this never happens while locked.
+		var due *exitTrigger
+		if deliveredEnter && f.exitTrig != nil && f.exitTrig.paneID == p.id {
+			due, f.exitTrig = f.exitTrig, nil
+		}
+		return nil, werr, due
 	case "capture-pane":
 		p, ok := f.panes[flag(a, "-t")]
 		if !ok {
-			return nil, fmt.Errorf("can't find pane: %s", flag(a, "-t"))
+			return nil, fmt.Errorf("can't find pane: %s", flag(a, "-t")), nil
 		}
-		return p.out.lines(), nil
+		return p.out.lines(), nil, nil
 	case "kill-window":
 		w, ok := f.windows[flag(a, "-t")]
 		if !ok {
-			return nil, fmt.Errorf("can't find window: %s", flag(a, "-t"))
+			return nil, fmt.Errorf("can't find window: %s", flag(a, "-t")), nil
 		}
 		for id, p := range f.panes {
 			if p.windowID == w.id {
@@ -212,9 +296,9 @@ func (f *fakeTmux) Run(_ context.Context, cmd string) ([]string, error) {
 			}
 		}
 		delete(f.windows, w.id)
-		return nil, nil
+		return nil, nil, nil
 	}
-	return nil, fmt.Errorf("fakeTmux: unsupported command %q", cmd)
+	return nil, fmt.Errorf("fakeTmux: unsupported command %q", cmd), nil
 }
 
 // keySeq maps the tmux key NAMES tmuxx.SendKeys passes bare to the bytes
