@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -152,5 +153,60 @@ func TestRunJobMarksTheJournalOnEarlyFailure(t *testing.T) {
 				t.Errorf("the reason never reached log.txt:\n%s", logged.String())
 			}
 		})
+	}
+}
+
+// TestRunJobRoutesPostDialSaveFailureThroughFailEarly covers the wave A
+// re-review minor: RunJob's post-dial j.Save() (RunnerPID/Finished/Outcome
+// reset, before any step runs) is an early return exactly like the two
+// cases in TestRunJobMarksTheJournalOnEarlyFailure above, so it too must go
+// through failEarly rather than a bare `return err` — otherwise the
+// journal is left looking in-progress and `follow` hangs forever (finding
+// A2). j.Dir is made read-only only AFTER the setup Save above succeeds,
+// so job.Save's internal os.CreateTemp fails on exactly RunJob's first
+// internal save attempt (the post-dial one), not the setup write; that
+// same unwritable directory also makes failEarly's own recovery Save fail
+// (swallowed, logged, not returned) — a case failEarly already tolerates —
+// so this test checks the FAILED-before-any-step-ran banner in the log
+// rather than the on-disk journal, which this specific failure mode can
+// never actually persist.
+func TestRunJobRoutesPostDialSaveFailureThroughFailEarly(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: directory permission bits do not gate writes")
+	}
+	src := newHost(t, "laptop.example", "alice", nil)
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	cwd := src.paths.Home + "/x"
+	seedSession(t, src, cwd)
+	o := baseOptions()
+	o.State = "idle"
+	p, err := Preflight(context.Background(), o, src.ep, dst.ep, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := job.New(src.paths.DataDir, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.Plan, _ = p.ToJSON()
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(j.Dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(j.Dir, 0o700) // let TempDir cleanup remove it either way
+
+	factory := func(context.Context, Options) (remote.Endpoint, remote.Endpoint, func(), error) {
+		return src.ep, dst.ep, func() {}, nil
+	}
+	var logged strings.Builder
+	logf := func(f string, v ...any) { fmt.Fprintf(&logged, f+"\n", v...) }
+	err = RunJob(context.Background(), src.paths.DataDir, sid, factory, logf)
+	if err == nil || !strings.Contains(err.Error(), "save journal") {
+		t.Fatalf("RunJob err = %v, want the post-dial save failure", err)
+	}
+	if !strings.Contains(logged.String(), "FAILED before any step ran") {
+		t.Errorf("post-dial save failure was not routed through failEarly:\n%s", logged.String())
 	}
 }

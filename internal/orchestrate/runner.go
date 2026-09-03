@@ -56,7 +56,11 @@ func RunJob(ctx context.Context, dataDir, jobID string, factory EndpointFactory,
 	j.RunnerPID = os.Getpid()
 	j.Finished, j.Outcome = false, ""
 	if err := j.Save(); err != nil {
-		return err
+		// Wave A re-review (minor): this is still an early return before any
+		// step ran, so it must leave the journal FINISHED and failed like
+		// every other early return in this function (finding A2) — a bare
+		// `return err` here left it looking in-progress instead.
+		return failEarly(err)
 	}
 	logf("runner %d: job %s (%s -> %s), continuing at %s", os.Getpid(), jobID, p.SourceInfo.Hostname, p.DestInfo.Hostname, firstIncomplete(j))
 	runErr := job.Run(ctx, j, Steps(p, j, src, dst, logf), logf)
