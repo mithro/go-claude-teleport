@@ -471,6 +471,116 @@ func TestFastForwardedEntryNotRecordedAsInstalledUnlessAlreadyOurs(t *testing.T)
 	}
 }
 
+// TestFastForwardedEntryStaysInstalledWhenItIsAlreadyOurs is the positive
+// half of ruling R-P3-23h: the id filter protects entries this job did NOT
+// place, and must not cost it the ones it did. A first install places the
+// transcript (recording its id in Plan.InstalledIDs); the destination copy
+// is then cut back to a prefix — the shape a crash partway through this
+// job's own write leaves behind — so the retry's diff classifies the very
+// same entry as an ff-candidate. The retry fast-forwards it in place, and
+// because the id was already recorded it must STILL be recorded
+// afterwards: abandon has to be able to delete what this job installed.
+func TestFastForwardedEntryStaysInstalledWhenItIsAlreadyOurs(t *testing.T) {
+	src := newHost(t, "laptop.example", "alice", nil)
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	cwd := filepath.Join(src.paths.Home, "x")
+	seedSession(t, src, cwd)
+	o := baseOptions()
+	o.State = "idle"
+	p, err := Preflight(context.Background(), o, src.ep, dst.ep, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &runner{p: p, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	if err := r.runPreflight(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.runTransfer(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.runInstall(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := r.manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcriptID, transcriptDst := -1, ""
+	for _, e := range m.Entries {
+		if e.Category == session.CatSession && strings.HasSuffix(e.Dst, sid+".jsonl") {
+			transcriptID, transcriptDst = e.ID, e.Dst
+		}
+	}
+	if transcriptID < 0 {
+		t.Fatal("no transcript entry in the manifest")
+	}
+	if !containsID(r.p.InstalledIDs, transcriptID) {
+		t.Fatalf("InstalledIDs = %v: the first install must record the transcript it placed (id %d)", r.p.InstalledIDs, transcriptID)
+	}
+	full, err := os.ReadFile(transcriptDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nl := strings.IndexByte(string(full), '\n')
+	if nl < 0 {
+		t.Fatalf("transcript has no newline to cut back to: %q", full)
+	}
+	// This job's own placement, half-written: the destination now holds a
+	// strict prefix of what it installed a moment ago.
+	if err := os.WriteFile(transcriptDst, full[:nl+1], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A retry re-runs the transfer step first (install consumes the
+	// staged copy), Verify included: that is what re-diffs against
+	// reality and persists the statuses the source's send stream is
+	// driven from — exactly what job.Run does on a resumed job.
+	if done, err := r.verifyTransfer(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if done {
+		t.Fatal("test setup: the retry's transfer verify sees nothing to do")
+	}
+	if err := r.runTransfer(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	st, err := transfer.Diff(context.Background(), m, job.StagingDir(dst.paths.DataDir, sid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[transcriptID] != transfer.FFCandidate {
+		t.Fatalf("transcript status = %q, want ff-candidate (test setup problem, not the ruling under test)", st[transcriptID])
+	}
+
+	if err := r.runInstall(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(transcriptDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(full) {
+		t.Fatalf("the retry did not fast-forward the transcript back to the full content: %d bytes, want %d", len(got), len(full))
+	}
+	if !containsID(r.p.InstalledIDs, transcriptID) {
+		t.Errorf("InstalledIDs = %v: fast-forwarding THIS job's own earlier placement (id %d) must keep it recorded", r.p.InstalledIDs, transcriptID)
+	}
+	if n := countID(r.p.InstalledIDs, transcriptID); n != 1 {
+		t.Errorf("InstalledIDs = %v: id %d recorded %d times, want exactly once", r.p.InstalledIDs, transcriptID, n)
+	}
+}
+
+func containsID(ids []int, want int) bool { return countID(ids, want) > 0 }
+
+func countID(ids []int, want int) int {
+	n := 0
+	for _, id := range ids {
+		if id == want {
+			n++
+		}
+	}
+	return n
+}
+
 // TestRunInstallPersistsPartialInstalledIDsBeforeFailing is ruling
 // R-P3-23j: transfer.Install returns its accumulated InstallReport
 // alongside an error at every failure point (it never discards what it
