@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/sshx/sshtest"
 	"github.com/mithro/go-claude-teleport/test/fakeclaude/harness"
 )
@@ -22,19 +24,27 @@ import (
 // -o flags the client needs (key file, accept-new).
 func remoteHost(t *testing.T, remoteEnv []string) (string, []string, string) {
 	t.Helper()
+	return remoteHostExec(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		f := strings.Fields(cmd)
+		if len(f) < 3 || f[1] != "remote" {
+			io.WriteString(stderr, "unexpected: "+cmd)
+			return 127
+		}
+		return Main(f[1:], stdin, stdout, stderr, remoteEnv)
+	})
+}
+
+// remoteHostExec is remoteHost with the far side's exec handler supplied
+// by the caller — for a peer that must answer differently from this
+// binary (a mismatched version, say).
+func remoteHostExec(t *testing.T, exec func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int) (string, []string, string) {
+	t.Helper()
 	localHome := filepath.Join(t.TempDir(), "home", "alice")
 	os.MkdirAll(filepath.Join(localHome, ".ssh"), 0o700)
 	keyPath, signer := sshtest.WriteKeyFile(t, filepath.Join(localHome, ".ssh"), "id_ed25519", "")
 	srv := sshtest.New(t, sshtest.Options{
 		Authorized: []ssh.PublicKey{signer.PublicKey()},
-		Exec: func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
-			f := strings.Fields(cmd)
-			if len(f) < 3 || f[1] != "remote" {
-				io.WriteString(stderr, "unexpected: "+cmd)
-				return 127
-			}
-			return Main(f[1:], stdin, stdout, stderr, remoteEnv)
-		},
+		Exec:       exec,
 	})
 	host, port, _ := net.SplitHostPort(srv.Addr)
 	target := "bob@" + host + ":" + port
@@ -398,5 +408,58 @@ func TestInspectHostLeavesNoThrowawayJobDirBehind(t *testing.T) {
 	}
 	if len(remoteLeftovers) != 0 {
 		t.Errorf("remote throwaway job dir(s) left behind: %v", remoteLeftovers)
+	}
+}
+
+// otherVersionEndpoint is a peer running a DIFFERENT claude-teleport
+// release: everything else answers normally, Hello reports another
+// version.
+type otherVersionEndpoint struct {
+	remote.Endpoint
+	version string
+}
+
+func (e *otherVersionEndpoint) Hello(ctx context.Context) (remote.HostInfo, error) {
+	hi, err := e.Endpoint.Hello(ctx)
+	hi.Version = e.version
+	return hi, err
+}
+
+// TestCompareConfigRemoteRefusesAVersionMismatch pins the compare-config
+// half of R-P3-28c: preflight refuses a peer running a different
+// claude-teleport (exit 4, spec §5) because the wire shapes differ, but
+// compare-config dialled the same peer and happily rendered a drift table
+// built from inventories the two versions do not agree on. It must apply
+// the same gate — exit 4, and never a spurious drift row.
+func TestCompareConfigRemoteRefusesAVersionMismatch(t *testing.T) {
+	remoteEnv, _ := testEnv(t)
+	target, opts, localHome := remoteHostExec(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		p, err := envPaths(remoteEnv)
+		if err != nil {
+			io.WriteString(stderr, err.Error())
+			return 1
+		}
+		lopts, closeProbe := serverLocalOptions(context.Background(), remoteEnv, func(string, ...any) {})
+		defer closeProbe()
+		ep := &otherVersionEndpoint{Endpoint: remote.NewLocal(p, "claude-teleport", lopts), version: "0.0.0-other"}
+		if err := remote.Serve(context.Background(), stdin, stdout, ep); err != nil {
+			io.WriteString(stderr, err.Error())
+			return 1
+		}
+		return 0
+	})
+	writeSettings(t, filepath.Join(localHome, ".claude"), `{}`)
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PWD=" + localHome, "PATH=/usr/bin:/bin"}
+
+	var out, errOut bytes.Buffer
+	code := Main(append([]string{"compare-config", target}, opts...), strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitUnreachable {
+		t.Fatalf("version mismatch = exit %d, want %d\nstdout: %s\nstderr: %s", code, ExitUnreachable, out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "0.0.0-other") {
+		t.Errorf("the failure must name both versions:\n%s", errOut.String())
+	}
+	if strings.Contains(out.String(), "differences") || strings.Contains(out.String(), "block") {
+		t.Errorf("no drift table may be rendered for a mismatched peer:\n%s", out.String())
 	}
 }
