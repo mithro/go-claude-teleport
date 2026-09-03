@@ -14,6 +14,7 @@ import (
 
 	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/job"
+	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
@@ -295,5 +296,57 @@ func TestAnnotateManifestSkipsWorktreeDirs(t *testing.T) {
 	}
 	if !m.Entries[1].Deferred {
 		t.Error("the dirty worktree file is git-attach's to place, so it stays deferred")
+	}
+}
+
+// poisonedSource is a source endpoint whose manifest a hostile (or merely
+// buggy) peer has tampered with after BuildManifest computed it — the one
+// thing the destination can never rule out.
+type poisonedSource struct {
+	remote.Endpoint
+	poison func(*transfer.Manifest)
+}
+
+func (s poisonedSource) BuildManifest(ctx context.Context, jobID string, id session.ID, srcHost, dstHost string, files []session.FileEntry, pm session.PathMap) (*transfer.Manifest, error) {
+	m, err := s.Endpoint.BuildManifest(ctx, jobID, id, srcHost, dstHost, files, pm)
+	if err == nil {
+		s.poison(m)
+	}
+	return m, err
+}
+
+// TestPreflightSurfacesDestinationRefusalAsRefused is ruling R-P3-B1f N8:
+// when the DESTINATION refuses a manifest entry outright (here an entry
+// whose category is not one of the four the spec names, aimed at
+// ~/.bash_profile), preflight must report it as a refusal — exit 3,
+// naming the entry and the reason — not as an internal error and not as a
+// content collision.
+func TestPreflightSurfacesDestinationRefusalAsRefused(t *testing.T) {
+	src := newHost(t, "laptop.example", "alice", nil)
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	cwd := filepath.Join(src.paths.Home, "x")
+	seedSession(t, src, cwd)
+	victim := filepath.Join(dst.paths.Home, ".bash_profile")
+
+	o := baseOptions()
+	o.State = "idle"
+	poisoned := poisonedSource{Endpoint: src.ep, poison: func(m *transfer.Manifest) {
+		m.Entries = append(m.Entries, transfer.Entry{
+			ID: len(m.Entries), Category: "junk", Dst: victim, Mode: 0o600, SHA256: "0",
+		})
+	}}
+	_, err := Preflight(context.Background(), o, poisoned, dst.ep, sid)
+	var re *RefusedError
+	if !errors.As(err, &re) {
+		t.Fatalf("err = %v (%T), want a *RefusedError", err, err)
+	}
+	if !containsStr(re.Reason, victim) || !containsStr(re.Reason, "category") {
+		t.Errorf("refusal must name the entry and the reason: %s", re.Reason)
+	}
+	// internal/cli maps a *RefusedError straight to exit 3 (root.go's
+	// Exit(ExitRefused, ...) on the preflight error), so being this error
+	// type IS the exit code.
+	if _, err := os.Lstat(victim); !os.IsNotExist(err) {
+		t.Errorf("%s was created (err %v)", victim, err)
 	}
 }
