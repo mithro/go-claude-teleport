@@ -20,11 +20,26 @@ type InstallReport struct {
 	IndexMerged, HistoryAdded             int
 	ProjectEntryAdded                     bool
 	MemoryCopied, MemoryDiffers           []string
-	// InstalledIDs is the manifest ids this call actually placed at Dst
-	// (the StagedSame and FFCandidate cases below) — never a PresentSame
-	// entry, which was already there before this call touched anything.
+	// InstalledIDs is the manifest ids this call placed at Dst from
+	// scratch (the StagedSame case below) — never a PresentSame entry,
+	// which was already there before this call touched anything.
 	// abandon --delete-destination-files (ruling R-P3-23a) is the reader.
-	InstalledIDs []int
+	InstalledIDs []int `json:"InstalledIDs"` // ruling R-P3-23m: exact Go name, no wire change
+	// FastForwardedIDs is populated for every FFCandidate entry this call
+	// extended — NOT necessarily an id THIS job created (ruling
+	// R-P3-23h): an ff-candidate is, by definition, an entry that
+	// ALREADY existed on the destination (a prefix of the incoming file
+	// — from an earlier, unrelated teleport of this session, or from
+	// Claude itself running there) before install ever touched anything.
+	// Once install has extended it, its hash matches the manifest, so
+	// Uninstall's hash check no longer distinguishes "this job's own
+	// content" from "someone else's file that happens to now match".
+	// The caller (orchestrate's runInstall) must fold an id from here
+	// into Plan.InstalledIDs ONLY when the id was already there before
+	// this call — i.e. this job's own earlier (partial) placement being
+	// re-extended on a retry, never a destination file this job is
+	// meeting for the first time.
+	FastForwardedIDs []int
 }
 
 type InstallExtras struct {
@@ -237,7 +252,7 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			}
 			rep.FastForwarded++
 			installed[e.Dst] = true
-			rep.InstalledIDs = append(rep.InstalledIDs, e.ID)
+			rep.FastForwardedIDs = append(rep.FastForwardedIDs, e.ID)
 		default:
 			return rep, fmt.Errorf("install %s: status %s — refusing (nothing after this entry was touched)", e.Dst, st[e.ID])
 		}
@@ -249,6 +264,10 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			if err := placeEntry(stagingDir, e); err != nil {
 				return rep, err
 			}
+			// Memory files (CLAUDE.md etc.) are the user's own documents,
+			// not manifest entries abandon ever deletes: MemoryCopied is
+			// reported for visibility only and deliberately never folds
+			// into InstalledIDs (accepted per review, folded minor 1).
 			rep.MemoryCopied = append(rep.MemoryCopied, e.Dst)
 		case PresentSame:
 			dropStaged(stagingDir, e)

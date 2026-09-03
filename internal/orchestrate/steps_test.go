@@ -357,3 +357,196 @@ func TestInstallVerifyRequiresMergePhaseNotJustFilePlacement(t *testing.T) {
 		t.Fatal("install.Verify reported done with every file placed but the sessions-index merge never having reached the destination")
 	}
 }
+
+// TestFastForwardedEntryNotRecordedAsInstalledUnlessAlreadyOurs is ruling
+// R-P3-23h: an FFCandidate entry by definition already existed on the
+// destination (here: a stale prefix left by an EARLIER, unrelated
+// teleport of this same session) — Uninstall's hash check no longer
+// protects it once install has fast-forwarded it to match the manifest,
+// so InstalledIDs must never gain it unless the id was already there
+// (this job's own earlier partial placement being extended on a retry).
+//
+// Two runners (the same lower-level pattern as the rest of this file, not
+// a subprocess or a full RunJob — deliberately never reaching the "start"
+// step, whose pty-resume would append to the destination's transcript and
+// so change the very bytes this test compares) drive the same session to
+// two different destinations: the first (fresh) is stopped right after
+// "transfer" — its STAGED bytes are the real, path-rewritten content this
+// session ever produces for this destination pairing, before anything is
+// installed. A one-line prefix of those bytes is pre-seeded on the SECOND
+// destination — a stale leftover from an EARLIER, unrelated teleport of
+// this session — before that job's own preflight/transfer/install run,
+// so its manifest-diff classifies the transcript ff-candidate and install
+// extends it in place.
+func TestFastForwardedEntryNotRecordedAsInstalledUnlessAlreadyOurs(t *testing.T) {
+	src := newHost(t, "laptop.example", "alice", nil)
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	cwd := filepath.Join(src.paths.Home, "x")
+	seedSession(t, src, cwd)
+	o := baseOptions()
+	o.State = "idle"
+
+	// Pass 1: preflight+transfer only (never install) against the SAME
+	// destination the real job below will use, purely to learn the real,
+	// path-rewritten bytes this session produces for THIS destination
+	// pairing (rewriting embeds the destination's own home path, so
+	// bytes captured for any OTHER destination would never match).
+	p1, err := Preflight(context.Background(), o, src.ep, dst.ep, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1 := &runner{p: p1, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	if err := r1.runPreflight(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r1.runTransfer(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m1, err := r1.manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcriptID, transcriptDst := -1, ""
+	for _, e := range m1.Entries {
+		if e.Category == session.CatSession && strings.HasSuffix(e.Dst, sid+".jsonl") {
+			transcriptID, transcriptDst = e.ID, e.Dst
+		}
+	}
+	if transcriptID < 0 {
+		t.Fatal("no transcript entry in the manifest")
+	}
+	staging := job.StagingDir(dst.paths.DataDir, sid)
+	full, err := os.ReadFile(transfer.StagedPath(staging, transcriptID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nl := strings.IndexByte(string(full), '\n')
+	if nl < 0 {
+		t.Fatalf("transcript has no newline to prefix on: %q", full)
+	}
+	prefix := full[:nl+1]
+
+	// Simulate a stale leftover from an EARLIER, unrelated teleport of
+	// this session: the destination already has a PREFIX of the real
+	// content, before the job under test (pass 2) has done anything.
+	// Pass 1's staged (full, correct) copy is left in place, so pass 2's
+	// manifest-diff — even at preflight, before its own transfer runs —
+	// sees a verified staged copy to ff-prefix-check the seeded prefix
+	// against.
+	if err := os.MkdirAll(filepath.Dir(transcriptDst), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(transcriptDst, prefix, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pass 2: the real job under test, fresh Plan/runner, same physical
+	// destination.
+	p2, err := Preflight(context.Background(), o, src.ep, dst.ep, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2 := &runner{p: p2, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	if err := r2.runPreflight(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r2.runTransfer(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r2.runInstall(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(transcriptDst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(full) {
+		t.Fatalf("transcript was not fast-forwarded to the full content (test setup problem, not the ruling under test): got %d bytes, want %d", len(got), len(full))
+	}
+	for _, id := range r2.p.InstalledIDs {
+		if id == transcriptID {
+			t.Fatalf("InstalledIDs = %v: a fast-forwarded entry that pre-existed from an unrelated earlier teleport must never be recorded as installed by THIS job", r2.p.InstalledIDs)
+		}
+	}
+}
+
+// TestRunInstallPersistsPartialInstalledIDsBeforeFailing is ruling
+// R-P3-23j: transfer.Install returns its accumulated InstallReport
+// alongside an error at every failure point (it never discards what it
+// already placed), so runInstall must fold and persist that partial
+// InstalledIDs BEFORE returning the error — otherwise a job that fails
+// partway through install would make its already-placed files
+// undeletable by abandon even though they really are this job's own.
+// The manifest's LAST entry is corrupted (pre-seeded with content that
+// does not match, forcing Install's default: case) so every entry before
+// it in iteration order is placed successfully first.
+func TestRunInstallPersistsPartialInstalledIDsBeforeFailing(t *testing.T) {
+	src := newHost(t, "laptop.example", "alice", nil)
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	cwd := filepath.Join(src.paths.Home, "x")
+	seedSession(t, src, cwd)
+	// A plain untracked file (ModeNotRepo copies the whole cwd as plain
+	// files): a THIRD manifest entry so the corrupted one below is not
+	// the only regular file — at least one other entry must legitimately
+	// succeed before Install reaches (and fails on) the corrupted one.
+	if err := os.WriteFile(filepath.Join(cwd, "keep.txt"), []byte("kept\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	o := baseOptions()
+	o.State = "idle"
+	p, err := Preflight(context.Background(), o, src.ep, dst.ep, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := &job.Journal{ID: sid}
+	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	if err := r.runPreflight(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.runTransfer(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := r.manifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corrupt *transfer.Entry
+	for i := range m.Entries {
+		if strings.HasSuffix(m.Entries[i].Dst, "keep.txt") {
+			corrupt = &m.Entries[i]
+			break
+		}
+	}
+	if corrupt == nil {
+		t.Fatal("test setup: no keep.txt entry in the manifest")
+	}
+	if err := os.MkdirAll(filepath.Dir(corrupt.Dst), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(corrupt.Dst, []byte("pre-existing content that matches nothing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.runInstall(context.Background()); err == nil {
+		t.Fatal("expected runInstall to fail on the corrupted entry")
+	}
+	if len(r.p.InstalledIDs) == 0 {
+		t.Fatal("a partially-succeeded install must still fold and persist whatever it DID place, even though it then failed")
+	}
+	for _, id := range r.p.InstalledIDs {
+		if id == corrupt.ID {
+			t.Errorf("the corrupted (failed) entry itself must not be in InstalledIDs: %v", r.p.InstalledIDs)
+		}
+	}
+	// The journal (not just the in-memory Plan) must carry the partial
+	// InstalledIDs too — persist() marshals r.p into r.j.Plan.
+	jp, err := PlanFromJournal(r.j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jp.InstalledIDs) != len(r.p.InstalledIDs) {
+		t.Errorf("journal Plan.InstalledIDs = %v, want %v", jp.InstalledIDs, r.p.InstalledIDs)
+	}
+}

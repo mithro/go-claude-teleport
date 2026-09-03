@@ -258,6 +258,36 @@ func mustEntry(m *transfer.Manifest, id int) transfer.Entry {
 // deferred lists manifest ids that git-attach applies itself.
 func (r *runner) deferred() map[int]bool { return deferredEntries(r.p) }
 
+// foldInstalledIDs unions rep's fresh placements into Plan.InstalledIDs —
+// immutably (an id already present is never removed) and never
+// recomputed from Statuses (R-P3-23a). rep.InstalledIDs (StagedSame:
+// genuinely new at Dst) is always folded in. rep.FastForwardedIDs
+// (FFCandidate: Dst already held SOME content before this call — by
+// definition, since Diff only classifies ff-candidate when a prefix is
+// already there) is folded in ONLY when the id is already recorded: that
+// is this job's own earlier, partial placement being extended on a
+// retry. An id not already recorded is a destination file this job is
+// meeting for the first time — possibly a stale leftover from an
+// earlier, unrelated teleport of the same session, or from Claude
+// itself running there — and must never be treated as something this
+// job installed (ruling R-P3-23h; Uninstall's hash check can no longer
+// tell the two apart once install has extended it to match).
+func (r *runner) foldInstalledIDs(rep *transfer.InstallReport) {
+	seen := make(map[int]bool, len(r.p.InstalledIDs))
+	for _, id := range r.p.InstalledIDs {
+		seen[id] = true
+	}
+	for _, id := range rep.InstalledIDs {
+		if !seen[id] {
+			r.p.InstalledIDs = append(r.p.InstalledIDs, id)
+			seen[id] = true
+		}
+	}
+	// rep.FastForwardedIDs is deliberately not folded in here: an id
+	// already in `seen` needs no action (it is already recorded), and one
+	// that isn't must never be added — see the doc comment above.
+}
+
 func (r *runner) installManifest() (*transfer.Manifest, error) {
 	m, err := r.manifest()
 	if err != nil {
@@ -348,6 +378,25 @@ func (r *runner) runInstall(ctx context.Context) error {
 		}
 	}
 	rep, err := r.dst.Install(ctx, im, r.p.JobID)
+	// R-P3-23j: fold whatever rep DOES carry — even a partial one from a
+	// call that then failed on a later entry (transfer.Install returns
+	// its accumulated rep alongside the error at every failure point) —
+	// into Plan.InstalledIDs and persist BEFORE returning the error, so a
+	// partially-succeeded install's placements are not silently lost:
+	// abandon must still be able to delete what actually landed even
+	// though this attempt overall failed. (Over the wire, a remote
+	// Install error carries no partial result — the protocol's Response
+	// is Result XOR Error — so rep is nil there; guarded below.)
+	if rep != nil {
+		r.foldInstalledIDs(rep)
+		if perr := r.persist(ctx); perr != nil {
+			if err == nil {
+				err = perr
+			} else {
+				r.logf("install: also failed to persist partial InstalledIDs: %v", perr)
+			}
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -356,26 +405,7 @@ func (r *runner) runInstall(ctx context.Context) error {
 	for _, m := range rep.MemoryDiffers {
 		r.logf("install: memory file differs on the destination and was left alone: %s", m)
 	}
-	// R-P3-23a: record which ids this (or an earlier, partial) attempt
-	// actually placed, immutably — Statuses gets overwritten by every
-	// later manifest-diff (capture/verifyTransfer/runTransfer), so it can
-	// no longer answer "what did this job install" once the job finishes;
-	// InstalledIDs is the durable record abandon reads instead. Union with
-	// whatever a prior attempt already recorded (never drop an id), since
-	// a retried install only reports THIS attempt's newly-placed entries —
-	// anything already PresentSame from an earlier attempt is correctly
-	// absent from rep.InstalledIDs this time and must not be lost.
-	seen := make(map[int]bool, len(r.p.InstalledIDs))
-	for _, id := range r.p.InstalledIDs {
-		seen[id] = true
-	}
-	for _, id := range rep.InstalledIDs {
-		if !seen[id] {
-			r.p.InstalledIDs = append(r.p.InstalledIDs, id)
-			seen[id] = true
-		}
-	}
-	return r.persist(ctx)
+	return nil
 }
 
 // ---- 6 git-attach -------------------------------------------------------
