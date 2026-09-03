@@ -95,7 +95,7 @@ claude-teleport inspect [<session>] [--host <host>] [--json]
 claude-teleport list [--host <host>] [--json]
 claude-teleport compare-config <host> [--session <session>]
 claude-teleport doctor [<host>]
-claude-teleport placeholder --resume <sid> [--saved-output F] [--now] [--teleported-to H]
+claude-teleport placeholder --resume <sid> [--saved-output F] [--now] [--teleported-to H] [--teleported-at TS]
 claude-teleport version
 ```
 
@@ -134,6 +134,10 @@ With `--from`, selection runs on the remote machine with the same rules.
 | `--log FILE` | additional log destination |
 | `--json` | machine-readable output for `status`, `list`, `inspect`, `compare-config` |
 | `-v` / `-q` | log level |
+
+`--via`/`-o` aren't only for a teleport: `list --host`, `doctor <host>`,
+`inspect --host` and `compare-config` all dial their target the same way
+and accept the same `--via`/`-o` flags.
 
 ### Exit codes
 
@@ -181,9 +185,12 @@ By default the session's cwd (and everything under it) lands at the same
 absolute path on the destination. To put it somewhere else:
 
 - `--dest-path DIR` — the session's own cwd only, on the destination.
-- `--map SRC=DST` — any other absolute path prefix, repeatable; applied
-  before the automatic `$HOME`-to-`$HOME` rewrite, so a `--map` can
-  override it for a subtree.
+- `--map SRC=DST` — any other absolute path prefix, repeatable.
+
+`--map` entries and the automatic `$HOME`-to-`$HOME` rewrite are combined
+and applied longest-prefix-first, regardless of flag order — so a `--map`
+for a subtree of `$HOME` always wins over the whole-`$HOME` rewrite for the
+paths it covers.
 
 `inspect --host` and `--dry-run` print the resulting map (`Paths` section)
 before anything moves.
@@ -350,9 +357,10 @@ throwaway job id that never touches this session's own journal.
 
 ## Requirements
 
-- Linux on both machines (macOS may work on the local side; untested);
-  tmux ≥ 3.3 where tmux is used, but tmux is optional — `--no-tmux`/`--state
-  idle` needs none.
+- Linux on both machines — `/proc` is read directly (process tables, freeze/
+  thaw, registry liveness), so this is a hard requirement, not a portability
+  gap; tmux ≥ 3.3 where tmux is used, but tmux is optional — `--no-tmux`/
+  `--state idle` needs none.
 - ssh reachable with keys (agent or `~/.ssh/id_*`), host keys accepted into
   `known_hosts` (or `-o StrictHostKeyChecking=accept-new`). `ProxyJump` is
   honoured; `ProxyCommand` is not — use `--via`.
