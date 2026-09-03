@@ -98,11 +98,7 @@ func (a *app) teleport(ctx context.Context, o orchestrate.Options, dryRun bool) 
 		return a.fail(err)
 	}
 	jobID := string(sess.ID)
-	// !-mode (spec §6.3, BangMode): only internal/cli reads $CLAUDE_PID —
-	// running inside the very session being moved. A match requires both
-	// the pid AND the live registry entry for that same session, so a
-	// stale/unrelated CLAUDE_PID can never trip it.
-	if pid, _ := strconv.Atoi(a.env["CLAUDE_PID"]); pid != 0 && sess.Registry != nil && sess.Registry.PID == pid {
+	if bangMode(a.env, sess.Registry) {
 		if o.Direction != "to" {
 			closeFn()
 			fmt.Fprintln(a.stderr, "usage: running inside the session being moved (!-mode) only works with --to")
@@ -156,6 +152,28 @@ func (a *app) teleport(ctx context.Context, o orchestrate.Options, dryRun bool) 
 	}
 	closeFn() // the detached runner re-dials for itself
 	return a.spawnAndFollow(ctx, j, o.BangMode)
+}
+
+// bangMode reports whether this invocation runs INSIDE the session being
+// moved (spec §6.3, Options.BangMode). Only internal/cli reads $CLAUDE_PID,
+// and a match requires both the pid AND the session's own live registry
+// entry naming it, so a stale or unrelated CLAUDE_PID can never trip it.
+func bangMode(env map[string]string, reg *session.Registry) bool {
+	pid, err := strconv.Atoi(env["CLAUDE_PID"])
+	return err == nil && pid != 0 && reg != nil && reg.PID == pid
+}
+
+// continueBang derives !-mode for `continue` exactly as runTeleport does
+// (finding A3): the job must have been started in !-mode AND this process
+// must again be the session's own Claude. Without it the foreground
+// follows to Finished, the source Claude never returns to its prompt and
+// step thaw+exit burns the whole exit timeout with both Claudes alive.
+func (a *app) continueBang(j *job.Journal) bool {
+	p, err := orchestrate.PlanFromJournal(j)
+	if err != nil || p.Session == nil || !p.Options.BangMode {
+		return false
+	}
+	return bangMode(a.env, p.Session.Registry)
 }
 
 func stateWord(j *job.Journal) string {
@@ -431,7 +449,7 @@ func newContinueCmd(a *app) *cobra.Command {
 			if j.Outcome == "abandoned" {
 				return usageErr(fmt.Errorf("job %s was abandoned; start a new teleport", id.Short()))
 			}
-			return exitErr(a.continueJob(cmd.Context(), j, false))
+			return exitErr(a.continueJob(cmd.Context(), j, a.continueBang(j)))
 		},
 	}
 }

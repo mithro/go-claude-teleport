@@ -12,6 +12,7 @@ import (
 
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/orchestrate"
+	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
@@ -276,5 +277,111 @@ func TestBangModeIgnoresAReplacedRunsThawExitStatus(t *testing.T) {
 	}
 	if elapsed < time.Second {
 		t.Errorf("!-mode follow returned after %s — it trusted the replaced run's thaw+exit status\n%s", elapsed, out.String())
+	}
+}
+
+// TestBangModeGate covers spec §6.3's !-mode gate (finding A5): only a
+// $CLAUDE_PID that names the very Claude the session's live registry entry
+// names may turn it on.
+func TestBangModeGate(t *testing.T) {
+	reg := &session.Registry{SessionID: fixtureSID, PID: 4242}
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		reg  *session.Registry
+		want bool
+	}{
+		{"inside the session", map[string]string{"CLAUDE_PID": "4242"}, reg, true},
+		{"no CLAUDE_PID", map[string]string{}, reg, false},
+		{"empty CLAUDE_PID", map[string]string{"CLAUDE_PID": ""}, reg, false},
+		{"unparsable CLAUDE_PID", map[string]string{"CLAUDE_PID": "not-a-pid"}, reg, false},
+		{"another Claude's pid", map[string]string{"CLAUDE_PID": "4243"}, reg, false},
+		{"session has no live registry entry", map[string]string{"CLAUDE_PID": "4242"}, nil, false},
+	} {
+		if got := bangMode(tc.env, tc.reg); got != tc.want {
+			t.Errorf("%s: bangMode = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestContinueDerivesBangMode pins A3: `! claude-teleport continue` ran
+// with bang=false, so the foreground followed the job to Finished — the
+// source Claude therefore never went idle, waitSourceIdle burned the whole
+// exit timeout and step thaw+exit failed with BOTH Claudes alive. continue
+// must derive !-mode from $CLAUDE_PID and the stored plan exactly as
+// runTeleport does.
+func TestContinueDerivesBangMode(t *testing.T) {
+	a, out := fixtureApp(t)
+	a.env["CLAUDE_PID"] = "4242"
+	j := unfinishedJob(t, a, fixtureSID)
+	p := &orchestrate.Plan{
+		Options:    orchestrate.Options{Direction: "to", Target: "big-storage.example", BangMode: true},
+		Session:    &session.Session{ID: session.ID(fixtureSID), Registry: &session.Registry{SessionID: fixtureSID, PID: 4242}},
+		DestInfo:   remote.HostInfo{Hostname: "big-storage.example"},
+		SourceInfo: remote.HostInfo{Hostname: "laptop.example"}, TargetState: "running",
+	}
+	raw, err := p.ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.Plan = raw
+	j.Steps = []job.StepState{{Name: "start", Status: job.Done, Attempts: 1}}
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A runner that reaches thaw+exit and then keeps going (the source
+	// Claude's own /exit is what ends it) without ever finishing the job.
+	dir := t.TempDir()
+	at9 := *j
+	at9.Steps = []job.StepState{{Name: "start", Status: job.Done, Attempts: 1}, {Name: "thaw+exit", Status: job.Running, Attempts: 1}}
+	at9.Finished, at9.Outcome = false, ""
+	rawJ, err := json.MarshalIndent(at9, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	at9Path := filepath.Join(dir, "at-thaw-exit.json")
+	if err := os.WriteFile(at9Path, rawJ, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "runner.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncp "+at9Path+" \"$2\"/job.json\nsleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a.selfExe = script
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := newContinueCmd(a)
+	cmd.SetContext(ctx)
+	start := time.Now()
+	err = cmd.RunE(cmd, []string{fixtureSID})
+	if err != nil {
+		t.Fatalf("continue = %v after %s (it followed to Finished instead of returning at thaw+exit)\n%s", err, time.Since(start), out.String())
+	}
+	if !strings.Contains(out.String(), "this Claude will now exit") {
+		t.Errorf("!-mode continue must hand the terminal back:\n%s", out.String())
+	}
+}
+
+// TestBangFollowTailsTheLogOnFailure covers the last !-mode path finding
+// A5 lists: in !-mode nothing streamed the log, so a failure has to carry
+// its own tail out to stderr.
+func TestBangFollowTailsTheLogOnFailure(t *testing.T) {
+	a, out := fixtureApp(t)
+	j := unfinishedJob(t, a, fixtureSID)
+	j.Steps = []job.StepState{{Name: "transfer", Status: job.Failed, Error: "tar stream: EOF"}}
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(j.LogPath(), []byte("step transfer: starting (attempt 1)\ntar stream: EOF\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code := a.follow(context.Background(), j, true, stepState(j, "thaw+exit"))
+	if code != ExitFailed {
+		t.Fatalf("follow = %d, want %d\n%s", code, ExitFailed, out.String())
+	}
+	if !strings.Contains(out.String(), "tar stream: EOF") {
+		t.Errorf("!-mode failure must tail log.txt:\n%s", out.String())
 	}
 }

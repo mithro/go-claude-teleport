@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/job"
+	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
@@ -659,4 +661,64 @@ func TestRunInstallPersistsPartialInstalledIDsBeforeFailing(t *testing.T) {
 	if len(jp.InstalledIDs) != len(r.p.InstalledIDs) {
 		t.Errorf("journal Plan.InstalledIDs = %v, want %v", jp.InstalledIDs, r.p.InstalledIDs)
 	}
+}
+
+// statusEndpoint answers ClaudeStatus from a scripted list (the last entry
+// repeats) and panics on anything else — waitSourceIdle must consult
+// nothing but the registry.
+type statusEndpoint struct {
+	remote.Endpoint
+	statuses []string
+	calls    int
+}
+
+func (s *statusEndpoint) ClaudeStatus(context.Context, session.ID) (*session.Registry, bool, error) {
+	st := s.statuses[min(s.calls, len(s.statuses)-1)]
+	s.calls++
+	if st == "gone" {
+		return nil, false, nil
+	}
+	return &session.Registry{SessionID: sid, PID: 4242, Status: st}, true, nil
+}
+
+// TestWaitSourceIdle covers the !-mode wait finding A5 lists: in !-mode
+// the foreground exits as soon as thaw+exit starts, so the source Claude
+// needs a moment to record the command's result and return to its prompt
+// before /exit is typed at it.
+func TestWaitSourceIdle(t *testing.T) {
+	newRunner := func(statuses []string, timeout time.Duration) *runner {
+		return &runner{
+			p: &Plan{Session: &session.Session{ID: sid, Registry: &session.Registry{SessionID: string(sid), PID: 4242}},
+				Options: Options{ExitTimeout: timeout, BangMode: true}},
+			src:  &statusEndpoint{statuses: statuses},
+			logf: t.Logf,
+		}
+	}
+	t.Run("returns once the source is idle", func(t *testing.T) {
+		r := newRunner([]string{"busy", "busy", "idle"}, 5*time.Second)
+		if err := r.waitSourceIdle(context.Background()); err != nil {
+			t.Fatalf("waitSourceIdle = %v", err)
+		}
+	})
+	t.Run("returns when the source is gone", func(t *testing.T) {
+		r := newRunner([]string{"gone"}, 5*time.Second)
+		if err := r.waitSourceIdle(context.Background()); err != nil {
+			t.Fatalf("waitSourceIdle = %v", err)
+		}
+	})
+	t.Run("gives up after the exit timeout", func(t *testing.T) {
+		r := newRunner([]string{"busy"}, 300*time.Millisecond)
+		err := r.waitSourceIdle(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "did not return to the prompt") {
+			t.Fatalf("waitSourceIdle = %v, want the exit-timeout failure", err)
+		}
+	})
+	t.Run("honours a cancelled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		r := newRunner([]string{"busy"}, time.Minute)
+		if err := r.waitSourceIdle(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("waitSourceIdle = %v, want context.Canceled", err)
+		}
+	})
 }
