@@ -87,8 +87,8 @@ func newThawExitRunner(t *testing.T) (r *runner, src *host, ref *session.TmuxRef
 // legitimate end state ("the pane left with Claude"), not an error.
 func TestRunThawExitCompletesWhenSourcePaneLeavesWithClaude(t *testing.T) {
 	t.Run("tmux server unavailable (exec claude took the whole server with it)", func(t *testing.T) {
-		r, src, _, reg := newThawExitRunner(t)
-		src.tmux.runWhenPIDExits(t, reg.PID, func() {
+		r, src, ref, reg := newThawExitRunner(t)
+		src.tmux.armOnExitDelivered(t, ref.PaneID, reg.PID, reg.ProcStart, func() {
 			src.tmux.mu.Lock()
 			src.tmux.gone = true
 			src.tmux.mu.Unlock()
@@ -99,7 +99,7 @@ func TestRunThawExitCompletesWhenSourcePaneLeavesWithClaude(t *testing.T) {
 	})
 	t.Run("pane not-found (window closed, session/server still up)", func(t *testing.T) {
 		r, src, ref, reg := newThawExitRunner(t)
-		src.tmux.runWhenPIDExits(t, reg.PID, func() {
+		src.tmux.armOnExitDelivered(t, ref.PaneID, reg.PID, reg.ProcStart, func() {
 			src.ep.KillWindow(context.Background(), ref)
 		})
 		if err := r.runThawExit(context.Background()); err != nil {
