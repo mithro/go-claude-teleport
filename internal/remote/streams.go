@@ -20,6 +20,11 @@ type planView struct {
 	Statuses map[int]transfer.Status `json:"statuses"`
 	Git      *gitx.Plan              `json:"git"`
 	Extras   *transfer.InstallExtras `json:"extras"`
+	// DestOwnedIDs are entries the destination's own live Claude owns
+	// (ruling R-P3-TRUST-1 item 3): this host must not offer them, however
+	// stale-looking the statuses are. Sending a transcript a live Claude
+	// is appending to is what dead-ended the first real teleport.
+	DestOwnedIDs []int `json:"dest_owned_ids"`
 }
 
 func (l *Local) planView(jobID string) (*planView, error) {
@@ -111,7 +116,7 @@ func (l *Local) runStream(ctx context.Context, kind StreamKind, jobID, streamID 
 		if err != nil {
 			return err
 		}
-		need := transfer.Need(m, v.Statuses)
+		need := dropIDs(transfer.Need(m, v.Statuses), v.DestOwnedIDs)
 		return transfer.Send(ctx, m, need, w, func(e transfer.Entry, n int64) { l.opts.Logf("send %s (%d bytes)", e.Src, n) })
 	case kind == StreamTar && dir == "recv":
 		m, err := transfer.Load(filepath.Join(jobDir, "manifest.json"))
@@ -155,6 +160,24 @@ func (l *Local) runStream(ctx context.Context, kind StreamKind, jobID, streamID 
 		return copyFileTo(filepath.Join(jobDir, "log.txt"), w)
 	}
 	return &Error{Code: "usage", Message: fmt.Sprintf("unsupported stream %s %s", kind, streamID)}
+}
+
+// dropIDs removes drop from ids (small lists; order preserved).
+func dropIDs(ids, drop []int) []int {
+	if len(drop) == 0 {
+		return ids
+	}
+	skip := make(map[int]bool, len(drop))
+	for _, id := range drop {
+		skip[id] = true
+	}
+	out := ids[:0:0]
+	for _, id := range ids {
+		if !skip[id] {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func copyFileTo(path string, w io.Writer) error {

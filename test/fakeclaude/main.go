@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -139,6 +140,28 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if printMode {
 		f.entrypoint = "sdk-cli"
 	}
+	// FAKECLAUDE_TRUST_PROMPT=1 reproduces Claude Code's first-run trust
+	// dialog (spec §12 addition for ruling R-P3-TRUST-1): the dialog is
+	// drawn BEFORE any registry entry exists — which is exactly why a
+	// destination stuck on it looks, to the confirm step, like a Claude
+	// that never resumed — and it is answered by moving the selection down
+	// to "Yes, I trust this folder" and pressing Enter. Enter without Down
+	// selects "No, exit", so that is an exit.
+	in := bufio.NewReader(stdin)
+	if os.Getenv("FAKECLAUDE_TRUST_PROMPT") == "1" && !printMode {
+		fmt.Fprintln(stdout, "╭──────────────────────────────────────────╮")
+		fmt.Fprintln(stdout, "│ Quick safety check                       │")
+		fmt.Fprintln(stdout, "│ Is this a project you created or one you │")
+		fmt.Fprintln(stdout, "│ trust?                                   │")
+		fmt.Fprintln(stdout, "│  ❯ No, exit                              │")
+		fmt.Fprintln(stdout, "│    Yes, I trust this folder              │")
+		fmt.Fprintln(stdout, "╰──────────────────────────────────────────╯")
+		if !awaitTrustAnswer(in) {
+			fmt.Fprintln(stdout, "No, exit")
+			return 1
+		}
+		fmt.Fprintln(stdout, "Yes, I trust this folder")
+	}
 	f.procStart, _ = procx.StartTime("/proc", f.pid)
 	f.startedAt = nowMS()
 	f.tmux = tmuxRef()
@@ -171,7 +194,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	f.writeRegistry("idle")
 	fmt.Fprintf(stdout, "fakeclaude %s session %s in %s\n", f.version, f.sid, f.cwd)
-	sc := bufio.NewScanner(stdin)
+	sc := bufio.NewScanner(in)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
@@ -186,6 +209,26 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	os.Remove(f.registry)
 	return 0
+}
+
+// awaitTrustAnswer reads the pane's keystrokes until Enter (or CR) and
+// reports whether Down was pressed first — the "Yes, I trust this folder"
+// answer. tmux send-keys Down emits the terminal's cursor-down sequence
+// (\x1b[B, or \x1bOB in application cursor mode), and a pane in cooked
+// mode delivers the whole line at once, so both arrive here as bytes
+// rather than key names. EOF means the pane went away: not an answer.
+func awaitTrustAnswer(in *bufio.Reader) bool {
+	var seen []byte
+	for {
+		b, err := in.ReadByte()
+		if err != nil {
+			return false
+		}
+		if b == '\n' || b == '\r' {
+			return bytes.Contains(seen, []byte("\x1b[B")) || bytes.Contains(seen, []byte("\x1bOB"))
+		}
+		seen = append(seen, b)
+	}
 }
 
 // tmuxRef asks tmux for "<session>:@<win>.%<pane>" when running inside tmux.

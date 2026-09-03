@@ -831,3 +831,104 @@ func installDirs(t *testing.T, dst *host, jobID string, dirs ...string) {
 		}
 	}
 }
+
+// liveDestEndpoint is a destination whose Claude is alive in the job's own
+// pane; everything else is the real Local underneath.
+type liveDestEndpoint struct {
+	remote.Endpoint
+	reg *session.Registry
+}
+
+func (d *liveDestEndpoint) ClaudeStatus(context.Context, session.ID) (*session.Registry, bool, error) {
+	return d.reg, true, nil
+}
+
+// TestContinueTreatsALiveDestSessionAsDestinationOwned is ruling
+// R-P3-TRUST-1 item 3. Once the destination's Claude is alive in the pane
+// THIS job opened, the session files on the destination belong to it: it
+// has been appending resume records to that transcript. A `continue` must
+// therefore never re-capture, re-transfer or re-install them — which is
+// how the first real teleport dead-ended, re-sending a transcript the
+// destination Claude had grown and then (correctly, safely) having the
+// install refuse the divergence for ever.
+func TestContinueTreatsALiveDestSessionAsDestinationOwned(t *testing.T) {
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	jobID := sid
+	ref := &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}
+	transcript := filepath.Join(dst.paths.ProjectDir("/home/bob/proj"), sid+".jsonl")
+	m := &transfer.Manifest{Version: 1, JobID: jobID, SessionID: jobID, Entries: []transfer.Entry{
+		{ID: 0, Category: session.CatSession, Mode: 0o600, Size: 10, Dst: transcript, FFAllowed: true},
+	}}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	if err := m.Save(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plan{
+		JobID: jobID, ManifestPath: manifestPath, DestRef: ref,
+		// A source pane exists, so the capture step has work to do until
+		// the destination owns the session files.
+		Session: &session.Session{ID: session.ID(sid), State: session.StateIdle,
+			Tmux: &session.TmuxRef{SocketPath: "/s", Session: "main", WindowID: "@2", PaneID: "%2"}},
+		Git: &gitx.Plan{Mode: gitx.ModeNotRepo}, Extras: &transfer.InstallExtras{},
+		CaptureEntryID: -1,
+	}
+	j := &job.Journal{ID: jobID}
+	j.Step("transfer").Attempts = 1 // an ff-candidate's Pending is only trustworthy after a pump
+
+	// Baseline: with nothing alive on the destination the transcript is
+	// simply missing, so every one of these steps has work to do.
+	cold := &runner{p: p, j: j, src: dst.ep, dst: dst.ep, logf: t.Logf}
+	for _, c := range []struct {
+		name   string
+		verify func(context.Context) (bool, error)
+	}{{"capture", cold.verifyCapture}, {"transfer", cold.verifyTransfer}, {"install", cold.verifyInstall}} {
+		done, err := c.verify(context.Background())
+		if err != nil {
+			t.Fatalf("%s.Verify: %v", c.name, err)
+		}
+		if done {
+			t.Fatalf("%s.Verify = done with the transcript absent on the destination", c.name)
+		}
+	}
+
+	// Now the destination's Claude is alive in OUR pane.
+	live := &liveDestEndpoint{Endpoint: dst.ep, reg: &session.Registry{SessionID: sid, PID: 4242, Status: "idle", Tmux: "work:@1.%7"}}
+	r := &runner{p: p, j: j, src: dst.ep, dst: live, logf: t.Logf}
+	owned, err := r.destOwnsSession(context.Background())
+	if err != nil || !owned {
+		t.Fatalf("destOwnsSession = %v %v, want true", owned, err)
+	}
+	for _, c := range []struct {
+		name   string
+		verify func(context.Context) (bool, error)
+	}{{"capture", r.verifyCapture}, {"transfer", r.verifyTransfer}, {"install", r.verifyInstall}} {
+		done, err := c.verify(context.Background())
+		if err != nil {
+			t.Fatalf("%s.Verify: %v", c.name, err)
+		}
+		if !done {
+			t.Errorf("%s.Verify = not done, but the destination owns the session files", c.name)
+		}
+	}
+	// And nothing session-shaped may reach install or the tar stream.
+	im, err := r.installManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(im.Entries) != 0 {
+		t.Errorf("install manifest still carries %d entry/entries: %+v", len(im.Entries), im.Entries)
+	}
+	ids, err := r.destOwnedIDs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != 0 {
+		t.Errorf("destOwnedIDs = %v, want the session entry's id", ids)
+	}
+	// A destination whose Claude runs in some OTHER pane is not ours.
+	elsewhere := &liveDestEndpoint{Endpoint: dst.ep, reg: &session.Registry{SessionID: sid, PID: 4242, Status: "idle", Tmux: "other:@9.%9"}}
+	r2 := &runner{p: p, j: j, src: dst.ep, dst: elsewhere, logf: t.Logf}
+	if owned, err := r2.destOwnsSession(context.Background()); err != nil || owned {
+		t.Errorf("destOwnsSession = %v %v for a session alive in another pane, want false", owned, err)
+	}
+}
