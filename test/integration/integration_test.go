@@ -20,6 +20,13 @@ import (
 // the source only exits (and its pane only shows the placeholder) once
 // dest is confirmed resumed.
 func TestRunningSessionTeleportsToRunningOnDest(t *testing.T) {
+	// I3: dump docker compose logs + job dirs on failure, before TestMain's
+	// suite-wide `down -v` tears everything down.
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t)
+		}
+	})
 	reset(t)
 	trustJump(t, "source", "alice")
 	ensureTmuxServer(t, "dest", "alice")
@@ -36,9 +43,17 @@ func TestRunningSessionTeleportsToRunningOnDest(t *testing.T) {
 	if !strings.Contains(reg, `"tmux":"main:`) {
 		t.Errorf("dest registry tmux field: %s", reg)
 	}
-	panes := sh(t, "dest", "alice", "tmux list-panes -a -F '#{session_name} #{window_name} #{pane_current_command}'")
-	if !strings.Contains(panes, "claude") {
-		t.Errorf("dest panes:\n%s", panes)
+	// #{pane_current_command} specifically, not a substring match against
+	// the whole list-panes line: the WINDOW is always named "claude"
+	// (startInTmux/OpenWindow), so a plain strings.Contains(panes, "claude")
+	// would pass even if the pane's actual foreground process were bash or
+	// sh — it proves nothing about whether claude is really running there.
+	// Targeting the one pane by ref and asserting the command column's
+	// exact value (not "claude-teleport", which also contains "claude")
+	// is the only check that discriminates a live claude from a stuck
+	// shell or a leftover placeholder.
+	if cmd := strings.TrimSpace(sh(t, "dest", "alice", "tmux list-panes -t main:claude -F '#{pane_current_command}'")); cmd != "claude" {
+		t.Errorf("dest pane should be running claude, got pane_current_command=%q", cmd)
 	}
 	if registry(t, "source", "alice", sid) != "" {
 		t.Error("source claude still registered: it must exit only after dest is confirmed")
@@ -64,6 +79,13 @@ func TestRunningSessionTeleportsToRunningOnDest(t *testing.T) {
 // (FAKECLAUDE_RUN_CHILD, mirroring Claude Code's `!` bash mode) SIGSTOPs
 // the parent for the duration of the transfer and SIGCONTs it afterwards.
 func TestBangModeStopsParentDuringTransfer(t *testing.T) {
+	// I3: dump docker compose logs + job dirs on failure, before TestMain's
+	// suite-wide `down -v` tears everything down.
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t)
+		}
+	})
 	reset(t)
 	trustJump(t, "source", "alice")
 	ensureTmuxServer(t, "dest", "alice")
@@ -122,6 +144,13 @@ func TestBangModeStopsParentDuringTransfer(t *testing.T) {
 // scenario 3: kill the detached internal-runner mid-transfer, then
 // `continue`; the job completes without the source being left stuck.
 func TestKilledRunnerThenContinueCompletes(t *testing.T) {
+	// I3: dump docker compose logs + job dirs on failure, before TestMain's
+	// suite-wide `down -v` tears everything down.
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t)
+		}
+	})
 	reset(t)
 	trustJump(t, "source", "alice")
 	ensureTmuxServer(t, "dest", "alice")
@@ -159,6 +188,19 @@ func TestKilledRunnerThenContinueCompletes(t *testing.T) {
 	}
 	sh(t, "dest", "alice", "test -f /home/alice/proj/big.bin")
 	sh(t, "dest", "alice", "test -f "+transcriptPath("/home/alice", "/home/alice/proj", sid))
+	// Destination-side end state, not just file presence: --state idle
+	// means the destination's "shape" step /exit's the claude that "start"
+	// just confirmed and (having created the window itself) kills it —
+	// verified empirically against this exact harness (only the
+	// ensureTmuxServer "_keepalive" placeholder session survives) and
+	// matching TestE2EIdleNoTmuxDestination's own dest check
+	// (internal/orchestrate/e2e_test.go). So the correct destination-side
+	// assertion for an idle target is that the registry is gone, not that
+	// it settles to a live "idle" status (that only happens for
+	// --state running/suspended, see scenario 1).
+	if reg := registry(t, "dest", "alice", sid); reg != "" {
+		t.Errorf("dest claude should have exited for the idle target state, registry: %s", reg)
+	}
 }
 
 // scenario 4: a network drop mid-transfer (pausing jump's sshd, which
@@ -166,6 +208,13 @@ func TestKilledRunnerThenContinueCompletes(t *testing.T) {
 // loudly with a continuable journal; reconnecting and `continue` finishes
 // the job.
 func TestNetworkDropThenContinueCompletes(t *testing.T) {
+	// I3: dump docker compose logs + job dirs on failure, before TestMain's
+	// suite-wide `down -v` tears everything down.
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t)
+		}
+	})
 	reset(t)
 	trustJump(t, "source", "alice")
 	ensureTmuxServer(t, "dest", "alice")
@@ -223,6 +272,12 @@ func TestNetworkDropThenContinueCompletes(t *testing.T) {
 		t.Fatalf("continue: %d\n%s", code, out)
 	}
 	sh(t, "dest", "alice", "test -f "+transcriptPath("/home/alice", "/home/alice/proj", sid))
+	// Destination-side end state (see the identical comment in
+	// TestKilledRunnerThenContinueCompletes): --state idle correctly ends
+	// with no live claude on dest, verified empirically.
+	if reg := registry(t, "dest", "alice", sid); reg != "" {
+		t.Errorf("dest claude should have exited for the idle target state, registry: %s", reg)
+	}
 }
 
 // scenario 5: dest is not logged in (FAKECLAUDE_FAIL=not-logged-in);
@@ -230,6 +285,13 @@ func TestNetworkDropThenContinueCompletes(t *testing.T) {
 // left intact/resumable (registry entry present, pane still running
 // claude, not the placeholder).
 func TestNotLoggedInDestFailsSourceResumable(t *testing.T) {
+	// I3: dump docker compose logs + job dirs on failure, before TestMain's
+	// suite-wide `down -v` tears everything down.
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t)
+		}
+	})
 	reset(t)
 	trustJump(t, "source", "alice")
 	sid := newSID(t)
@@ -270,6 +332,13 @@ func TestNotLoggedInDestFailsSourceResumable(t *testing.T) {
 // scenario 6: a suspended source teleports to a suspended (idle process,
 // placeholder pane) state on dest, confirmed resumable there.
 func TestSuspendedSourceEndsSuspendedOnDest(t *testing.T) {
+	// I3: dump docker compose logs + job dirs on failure, before TestMain's
+	// suite-wide `down -v` tears everything down.
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t)
+		}
+	})
 	reset(t)
 	trustJump(t, "source", "alice")
 	ensureTmuxServer(t, "dest", "alice")
@@ -289,11 +358,29 @@ func TestSuspendedSourceEndsSuspendedOnDest(t *testing.T) {
 		t.Errorf("dest pane should run the placeholder (claude-teleport placeholder), got %q", panes)
 	}
 	sh(t, "dest", "alice", "test -f "+transcriptPath("/home/alice", "/home/alice/proj", sid))
+	// The source side also ends as a placeholder pane: thaw+exit (step 9)
+	// always exits the source claude and types the (non-"--now", i.e.
+	// suspended/needs-Enter) placeholder once the source was confirmed
+	// running, regardless of the destination's target state — the same
+	// mechanism scenario 1 checks for its --state running case.
+	if pane := sh(t, "source", "alice", "tmux capture-pane -p -t main:claude"); !strings.Contains(pane, "teleported to dest") || !strings.Contains(pane, sid[:8]) {
+		t.Errorf("source pane should show the placeholder banner for %s:\n%s", sid, pane)
+	}
+	if cmd := strings.TrimSpace(sh(t, "source", "alice", "tmux list-panes -t main:claude -F '#{pane_current_command}'")); cmd != "claude-teleport" {
+		t.Errorf("source pane should be running the placeholder, got pane_current_command=%q", cmd)
+	}
 }
 
 // scenario 7: teleporting a session back to its original host (--from)
 // fast-forwards the transcript record-wise.
 func TestTeleportBackFastForwardsTranscript(t *testing.T) {
+	// I3: dump docker compose logs + job dirs on failure, before TestMain's
+	// suite-wide `down -v` tears everything down.
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t)
+		}
+	})
 	reset(t)
 	trustJump(t, "source", "alice")
 	sid := newSID(t)
@@ -310,5 +397,21 @@ func TestTeleportBackFastForwardsTranscript(t *testing.T) {
 	}
 	if tr := sh(t, "source", "alice", "cat "+transcriptPath("/home/alice", "/home/alice/proj", sid)); !strings.Contains(tr, "second thought") {
 		t.Errorf("source transcript not fast-forwarded:\n%s", tr)
+	}
+	// Destination-side end state for this hop: the actual destination is
+	// SOURCE (--from dest teleports back onto here). --state idle again
+	// means no live claude on the receiving end (see the identical
+	// comment in TestKilledRunnerThenContinueCompletes); "start" opens a
+	// NEW window to resume+reshape (tmux allows duplicate window names,
+	// and CreatedWindow is set whenever start had to call OpenWindow, even
+	// though a "main:claude" window already existed from the first
+	// teleport's placeholder), and "shape" kills that new window since it
+	// created it — leaving the ORIGINAL placeholder window from the first
+	// teleport untouched. Verified empirically against this exact harness.
+	if reg := registry(t, "source", "alice", sid); reg != "" {
+		t.Errorf("source claude should have exited after the back-teleport (idle target state), registry: %s", reg)
+	}
+	if cmd := strings.TrimSpace(sh(t, "source", "alice", "tmux list-panes -t main:claude -F '#{pane_current_command}'")); cmd != "claude-teleport" {
+		t.Errorf("source pane should still be the (first-teleport) placeholder, got pane_current_command=%q", cmd)
 	}
 }

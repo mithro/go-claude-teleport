@@ -140,7 +140,42 @@ func reset(t testing.TB) {
 	t.Helper()
 	for _, svc := range []string{"source", "jump", "dest"} {
 		for _, u := range []string{"alice", "bob"} {
-			shCode(t, svc, u, "tmux kill-server 2>/dev/null || true; rm -rf ~/.claude ~/.claude.json ~/.local/share/claude-teleport ~/proj* ~/repo*; mkdir -p ~/.claude")
+			shCode(t, svc, u, "tmux kill-server || true; rm -rf ~/.claude ~/.claude.json ~/.local/share/claude-teleport ~/proj* ~/repo*; mkdir -p ~/.claude")
+		}
+	}
+}
+
+// dumpDiagnostics logs docker compose's own logs (last 300 lines) and every
+// job directory's contents (log.txt, capture.txt, job.json) on source and
+// dest, for both users, BEFORE TestMain's suite-wide `down -v` tears
+// everything down — so a CI failure is debuggable without a re-run.
+// Callers register it via t.Cleanup, guarded on t.Failed(), as the first
+// statement in each test (so it still fires if an early helper like
+// reset/trustJump itself calls t.Fatalf).
+func dumpDiagnostics(t testing.TB) {
+	t.Helper()
+	logs, err := exec.Command("docker", composeArgs("logs", "--no-color")...).CombinedOutput()
+	if err != nil {
+		t.Logf("=== docker compose logs: %v ===", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(logs), "\n"), "\n")
+	if len(lines) > 300 {
+		lines = lines[len(lines)-300:]
+	}
+	t.Logf("=== docker compose logs (last %d lines) ===\n%s", len(lines), strings.Join(lines, "\n"))
+	for _, svc := range []string{"source", "dest"} {
+		for _, u := range []string{"alice", "bob"} {
+			// Never 2>/dev/null: a missing/empty jobs dir is tolerated by
+			// `|| true` around the fallible commands, and any stderr they
+			// do produce is merged in (2>&1, not discarded) so it shows up
+			// in the dump rather than being silently dropped.
+			out, _ := shCode(t, svc, u, `d=~/.local/share/claude-teleport/jobs; `+
+				`[ -d "$d" ] || { echo "(no $d)"; exit 0; }; `+
+				`for j in "$d"/*/; do echo "--- $j ---"; `+
+				`for f in log.txt capture.txt job.json; do echo "-- $f --"; cat "$j$f" 2>&1 || true; done; done`)
+			if strings.TrimSpace(out) != "" {
+				t.Logf("=== job dirs on %s/%s ===\n%s", svc, u, out)
+			}
 		}
 	}
 }
@@ -188,7 +223,11 @@ func startInTmux(t testing.TB, svc, user, cwd, sid, group string, extraEnv strin
 // registry returns the registry JSON for sid on svc, or "".
 func registry(t testing.TB, svc, user, sid string) string {
 	t.Helper()
-	out, _ := shCode(t, svc, user, "grep -l '\"sessionId\":\""+sid+"\"' ~/.claude/sessions/*.json 2>/dev/null | head -1 | xargs -r cat")
+	// grep -s (--no-messages), not `2>/dev/null`: it tells grep itself not
+	// to emit the "no such file" message when ~/.claude/sessions/*.json
+	// doesn't glob-expand (no sessions yet), rather than discarding a
+	// stream grep might otherwise write real output to.
+	out, _ := shCode(t, svc, user, "grep -ls '\"sessionId\":\""+sid+"\"' ~/.claude/sessions/*.json | head -1 | xargs -r cat")
 	return strings.TrimSpace(out)
 }
 
