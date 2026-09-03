@@ -11067,22 +11067,23 @@ Everything below is new relative to `2026-08-27-claude-teleport-00-interfaces.md
 - `StartTestServer(t) (socketPath, socketDir string)` under build tag `tmuxlive`
 
 **internal/remote**
-- `Endpoint` gains: `GitFiles`, `GitSourceFacts`, `BuildManifest`, `SessionExtras`, `TmuxSessions`, `KillWindow`, `ClaudeStatus`, `ListSessions`, `Cleanup`, `DeleteInstalled` (signatures in Tasks 13, 16, 23)
+- `Endpoint` gains: `GitFiles`, `GitSourceFacts`, `BuildManifest`, `SessionExtras`, `TmuxSessions`, `KillWindow`, `ClaudeStatus`, `ListSessions`, `Cleanup`, `DeleteInstalled`, `RemoveJob` (signatures in Tasks 13, 16, 23; `RemoveJob` removes `jobs/<id>/` entirely — the wire dispatch handler refuses any id not prefixed `inspect-`, ruling R-P3-23i)
 - `SessionSummary` struct
 - `LocalOptions.TmuxSocketDir string`, `LocalOptions.Sleep func(time.Duration)`
 - `FailureMarkers`, `HasFailureMarker`
 - `PipeStream(fn func(r io.Reader, w io.Writer) error) io.ReadWriteCloser`
 - Stream ids carry a direction: `send:<n>` / `recv:<n>`; `tar`/`pack` receive into `staging/<job>/`, `pack` lands at `staging/<job>/objects.pack`
 - `Local.ManifestDiff` and `Local.BuildManifest` persist `jobs/<job>/manifest.json`; `Local.Install` reads `InstallExtras` from `jobs/<job>/extras.json` exactly as Plan 02 wrote it (the orchestrator calls Plan 02's `PutInstallExtras` first); `planView` serves the streams only
-- Ops added to the protocol: `git-files`, `git-source-facts`, `tmux-sessions`, `tmux-kill`, `claude-status`, `build-manifest`, `session-extras`, `cleanup`, `list-sessions`, `delete-installed` (Plan 02's existing ops, incl. `shape-state` and `claude-pty-resume`, keep their names, `dispatch` entries and `Client` methods)
+- Ops added to the protocol: `git-files`, `git-source-facts`, `tmux-sessions`, `tmux-kill`, `claude-status`, `build-manifest`, `session-extras`, `cleanup`, `list-sessions`, `delete-installed`, `remove-job` (Plan 02's existing ops, incl. `shape-state` and `claude-pty-resume`, keep their names, `dispatch` entries and `Client` methods)
 - Dependency added: `github.com/creack/pty` (RunPtyResume only)
 
-**internal/transfer (no additions)**
+**internal/transfer**
 - Plan 02's `Build` already takes `Size` from the bytes it hashes and `Mode`/`ModTime` from `os.Stat` when the `FileEntry` leaves them zero, which is what the capture entry (`runCapture`, built on the driver and hashed by `BuildManifest` on the source) relies on.
+- `InstallReport.InstalledIDs []int` (`json:"InstalledIDs"`, ruling R-P3-23a: ids `Install` placed at `Dst` from scratch) and `InstallReport.FastForwardedIDs []int` (ruling R-P3-23h: ids `Install` fast-forwarded — folded into `Plan.InstalledIDs`, below, only when already recorded there)
 
 **internal/orchestrate**
 - `Options.Target string`, `Options.Via []string`, `Options.SSHOptions map[string]string`, `Options.LocalDest *session.Paths` (tests)
-- `Plan` JSON tags (`options`, `statuses`, `git`, `extras`, … — `remote.planView` depends on them) and fields `JobID`, `SourceFacts`, `Files`, `Statuses`, `Extras`, `CaptureEntryID`, `DestCwd`, `DestCapture`, `DestRef`, `CreatedSession`, `CreatedWindow`, `DestRegistry`, `StartedAt`
+- `Plan` JSON tags (`options`, `statuses`, `git`, `extras`, … — `remote.planView` depends on them) and fields `JobID`, `SourceFacts`, `Files`, `Statuses`, `InstalledIDs` (`json:"installed_ids"`, ruling R-P3-23a — the durable record of what THIS job installed; `Statuses` is overwritten by later manifest-diffs and cannot answer that once a job finishes), `Extras`, `CaptureEntryID`, `DestCwd`, `DestCapture`, `DestRef`, `CreatedSession`, `CreatedWindow`, `DestRegistry`, `StartedAt`
 - `(*Plan).ToJSON()`, `PlanFromJournal(j)`, `RefusedError`, `UnreachableError`, `PlaceholderArgv`, `SuspendArgv`, `StepNames`, `EndpointFactory`, `RunJob`, `ExitCode`, `FailedStep`
 
 **test/fakeclaude**
