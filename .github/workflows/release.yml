@@ -15,7 +15,13 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Deliberately NOT pull_request: the version job pushes a tag and the
+  # release job cuts a GitHub Release, so running this on a PR publishes
+  # a release from unmerged code.
 
+# Least privilege by default: only the publish job below raises this, and only
+# for itself. The build jobs run Docker and clone third-party sources, so they
+# should never hold a token that can write to Pages.
 permissions:
   contents: read
 
@@ -83,7 +89,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        include:
+          # `arch` is the Debian name (used by nfpm and in the .deb filename);
+          # `goarch`/`goarm` are what the Go toolchain wants.
+          - {arch: amd64, goarch: amd64, goarm: ""}
+          - {arch: arm64, goarch: arm64, goarm: ""}
+          - {arch: armhf, goarch: arm, goarm: "7"}
+          - {arch: riscv64, goarch: riscv64, goarm: ""}
     env:
       TAG: ${{ needs.version.outputs.tag }}
       DEBVER: ${{ needs.version.outputs.deb }}
@@ -96,7 +108,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+          GOARM=${{ matrix.goarm }} \
             go build -trimpath \
               -ldflags "-s -w -X ${GO_MODULE}/internal/version.Version=${TAG}" \
               -o dist/claude-teleport ./cmd/claude-teleport
@@ -120,6 +133,20 @@ jobs:
         with:
           name: dist-${{ matrix.arch }}
           path: dist/
+
+      # The static binary is suite-independent, so the same .deb is published
+      # for every suite rather than rebuilt per suite.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-trixie-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debs-sid-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
 
   release:
     needs: [version, build]
@@ -155,84 +182,22 @@ jobs:
           fi
 
   apt:
-    needs: [version, build]
-    runs-on: ubuntu-latest
+    # Scoped to this job alone. A job calling a reusable workflow sets the
+    # maximum permissions available to it, so the elevated Pages scopes stay
+    # here rather than applying to the whole workflow.
     permissions:
+      contents: read
       pages: write
       id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
-    env:
-      TAG: ${{ needs.version.outputs.tag }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: dist-*
-          merge-multiple: true
-          path: dist/
-      - name: Assemble apt repo
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dpkg-dev apt-utils
-          mkdir -p apt-repo
-          cp dist/*.deb apt-repo/
-          cd apt-repo
-          dpkg-scanpackages --multiversion . > Packages
-          gzip -k Packages
-          cat > Release <<EOF
-          Origin: mithro-go-claude-teleport
-          Label: mithro-go-claude-teleport
-          Suite: stable
-          Codename: trixie
-          Architectures: amd64 arm64
-          Components: main
-          Description: go-claude-teleport ${TAG} — move Claude Code sessions between machines
-          EOF
-          apt-ftparchive release . >> Release
-      - name: Sign repo
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-        if: env.GPG_PRIVATE_KEY != ''
-        run: |
-          set -euo pipefail
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          cd apt-repo
-          gpg --batch --yes --armor --detach-sign --output Release.gpg Release
-          gpg --batch --yes --armor --clearsign --output InRelease Release
-          gpg --batch --yes --armor --export > go-claude-teleport.gpg
-      - name: Index page
-        run: |
-          cat > apt-repo/index.html <<HTMLEOF
-          <!DOCTYPE html>
-          <html><head><meta charset="utf-8"><title>mithro go-claude-teleport apt repository</title></head>
-          <body>
-          <h1>mithro go-claude-teleport apt repository</h1>
-          <p><a href="https://github.com/mithro/go-claude-teleport">go-claude-teleport</a>
-          — move an in-progress Claude Code session (transcript, git worktree,
-          tmux window) to another machine over ssh.
-          Current release: <b>${TAG}</b> (amd64, arm64). Every push to
-          <code>main</code> publishes a new release here and on
-          <a href="https://github.com/mithro/go-claude-teleport/releases">GitHub Releases</a>.</p>
-          <h2>Setup</h2>
-          <pre>
-          curl -fsSL https://mith.ro/go-claude-teleport/go-claude-teleport.gpg \\
-            | sudo tee /etc/apt/keyrings/mithro-go-claude-teleport.gpg > /dev/null
-          echo "deb [signed-by=/etc/apt/keyrings/mithro-go-claude-teleport.gpg] https://mith.ro/go-claude-teleport/ ./" \\
-            | sudo tee /etc/apt/sources.list.d/mithro-go-claude-teleport.list
-          sudo apt update
-          sudo apt install claude-teleport
-          </pre>
-          <p>Files: <a href="Packages">Packages</a> · <a href="Release">Release</a> ·
-          <a href="InRelease">InRelease</a> · <a href="go-claude-teleport.gpg">signing key</a></p>
-          </body></html>
-          HTMLEOF
-          sed -i 's/^          //' apt-repo/index.html
-          ls -l apt-repo/
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: apt-repo/
-      - id: deploy
-        uses: actions/deploy-pages@v4
+    # Build on PRs to validate, but never publish from one.
+    if: github.event_name != 'pull_request'
+    needs: build
+    uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
+    with:
+      suites: "trixie sid"
+      architectures: "amd64 arm64 armhf riscv64"
+      origin: go-claude-teleport
+      description: "Teleport Claude Code sessions between machines"
+      keyring-name: go-claude-teleport.gpg
+    secrets:
+      gpg-private-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
