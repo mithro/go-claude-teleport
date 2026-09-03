@@ -83,6 +83,13 @@ type Plan struct {
 	CreatedWindow  bool                    `json:"created_window"`
 	DestRegistry   *session.Registry       `json:"dest_registry"`
 	StartedAt      time.Time               `json:"started_at"`
+	// RecordedSrc/RecordedDst say whether each host has already appended
+	// this job's history row (spec §6 step 10). The row is appended, not
+	// merged, and the record step re-runs whenever anything after those
+	// calls fails, so without these a resumed job grew a duplicate row on
+	// every pass (finding A8).
+	RecordedSrc bool `json:"recorded_src"`
+	RecordedDst bool `json:"recorded_dst"`
 }
 
 func (p *Plan) ToJSON() (json.RawMessage, error) { return json.Marshal(p) }

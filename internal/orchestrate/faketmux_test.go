@@ -292,12 +292,17 @@ func (f *fakeTmux) describe(w *fakeWindow, p *fakePane, format string) string {
 	return ""
 }
 
-// killAll ends every pane process (test cleanup).
+// killAll ends every pane process (test cleanup) and REAPS it: each pane
+// is a real forked process group, and returning before Wait leaves a
+// zombie per pane for the rest of the test binary's life — visible to
+// every later procx.Scan in this same binary, which is exactly the
+// process table these tests reason about.
 func (f *fakeTmux) killAll() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, p := range f.panes {
 		syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 		p.stdin.Close()
+		p.cmd.Wait()
 	}
 }

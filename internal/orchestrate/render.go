@@ -64,8 +64,15 @@ func (p *Plan) renderTmux(w io.Writer) {
 // wholly Absent entry and an FFCandidate (present but stale, needs a
 // forward delta) require bytes to be sent, so both count toward "to send";
 // FFCandidate is also broken out on its own for visibility.
+//
+// PresentDifferent is counted too: it is a blocking collision without
+// --force (Preflight refuses before this ever renders), so a plan that
+// gets here holding one is a --force run about to REPLACE a destination
+// file whose content diverged. That is the single most consequential
+// thing a plan can say, and it was the one status the summary dropped
+// entirely — the entry vanished from every count.
 func (p *Plan) renderFileSummary(w io.Writer) {
-	var toSend, same, ff, staged int
+	var toSend, same, ff, staged, replaced int
 	for _, st := range p.Statuses {
 		switch st {
 		case transfer.Absent, transfer.StagedMismatch:
@@ -73,6 +80,9 @@ func (p *Plan) renderFileSummary(w io.Writer) {
 		case transfer.FFCandidate:
 			toSend++
 			ff++
+		case transfer.PresentDifferent:
+			toSend++
+			replaced++
 		case transfer.PresentSame:
 			same++
 		case transfer.StagedSame:
@@ -80,6 +90,9 @@ func (p *Plan) renderFileSummary(w io.Writer) {
 		}
 	}
 	fmt.Fprintf(w, "Files      %d to send, %d already present, %d fast-forward, %d already staged\n", toSend, same, ff, staged)
+	if replaced > 0 {
+		fmt.Fprintf(w, "  %d destination file(s) diverged and are REPLACED (--force)\n", replaced)
+	}
 }
 
 func (p *Plan) renderGit(w io.Writer) {

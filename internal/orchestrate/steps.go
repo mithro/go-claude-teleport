@@ -717,11 +717,28 @@ func (r *runner) verifyRecord(ctx context.Context) (bool, error) {
 func (r *runner) runRecord(ctx context.Context) error {
 	rec := job.HistoryRecord{At: time.Now().UTC(), SessionID: string(r.id()), Direction: r.p.Options.Direction,
 		From: r.p.SourceInfo.Hostname, To: r.p.DestInfo.Hostname, Outcome: "success", Note: "end state " + r.p.TargetState}
-	if err := r.src.Record(ctx, r.p.JobID, rec); err != nil {
-		return err
+	// A history row is appended, never merged, so each side is recorded
+	// at most once per job (the R-P3-23l pattern abandon already uses):
+	// this step re-runs whenever anything after the Record calls fails —
+	// its own Cleanup, or the runner dying between them — and each pass
+	// used to add another "success" row (finding A8).
+	if !r.p.RecordedSrc {
+		if err := r.src.Record(ctx, r.p.JobID, rec); err != nil {
+			return err
+		}
+		r.p.RecordedSrc = true
+		if err := r.persist(ctx); err != nil {
+			return err
+		}
 	}
-	if err := r.dst.Record(ctx, r.p.JobID, rec); err != nil {
-		return err
+	if !r.p.RecordedDst {
+		if err := r.dst.Record(ctx, r.p.JobID, rec); err != nil {
+			return err
+		}
+		r.p.RecordedDst = true
+		if err := r.persist(ctx); err != nil {
+			return err
+		}
 	}
 	if err := r.dst.Cleanup(ctx, r.p.JobID); err != nil {
 		return err

@@ -759,3 +759,41 @@ func TestInstallVerifySkipsDeferredEntries(t *testing.T) {
 		t.Error("verifyInstall must not wait for a Deferred entry to read PresentSame — it never can")
 	}
 }
+
+// TestRecordStepAppendsOneHistoryRowPerRun pins finding A8: the record
+// step re-runs whenever anything after its Record calls fails (its own
+// Cleanup, say) or the runner dies between them, and each pass appended
+// another "success" row to both hosts' history.jsonl — the same duplicate
+// abandon already guards against with R-P3-23l.
+func TestRecordStepAppendsOneHistoryRowPerRun(t *testing.T) {
+	src := newHost(t, "laptop.example", "alice", nil)
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	p := &Plan{
+		JobID:      sid,
+		Session:    &session.Session{ID: sid},
+		Options:    Options{Direction: "to"},
+		SourceInfo: remote.HostInfo{Hostname: "laptop.example"},
+		DestInfo:   remote.HostInfo{Hostname: "big-storage.example"},
+		Extras:     &transfer.InstallExtras{},
+		Git:        &gitx.Plan{Mode: gitx.ModeNotRepo},
+	}
+	j, err := job.New(src.paths.DataDir, string(sid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, logf: t.Logf}
+	for i := 0; i < 3; i++ {
+		if err := r.runRecord(context.Background()); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+	for _, h := range []*host{src, dst} {
+		raw, err := os.ReadFile(filepath.Join(job.Dir(h.paths.DataDir, string(sid)), "history.jsonl"))
+		if err != nil {
+			t.Fatalf("%s: %v", h.name, err)
+		}
+		if n := strings.Count(strings.TrimRight(string(raw), "\n"), "\n") + 1; n != 1 {
+			t.Errorf("%s recorded %d history rows for one job, want 1:\n%s", h.name, n, raw)
+		}
+	}
+}

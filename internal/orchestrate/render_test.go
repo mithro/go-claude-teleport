@@ -134,3 +134,27 @@ func TestRenderCaveatsIncludeIgnoredGated(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderCountsForceReplacedFiles pins the file-summary half of the
+// task-19 carry: PresentDifferent was the one status the summary dropped
+// on the floor, so a --force plan (the only way one reaches Render — a
+// collision refuses preflight otherwise) showed the diverged destination
+// file in no count at all.
+func TestRenderCountsForceReplacedFiles(t *testing.T) {
+	p := basePlan()
+	p.Options.Force = true
+	p.Statuses = map[int]transfer.Status{
+		1: transfer.Absent,
+		2: transfer.PresentSame,
+		3: transfer.PresentDifferent,
+		4: transfer.PresentDifferent,
+	}
+	var buf bytes.Buffer
+	p.Render(&buf)
+	out := buf.String()
+	for _, want := range []string{"3 to send", "1 already present", "2 destination file(s) diverged and are REPLACED (--force)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("render lacks %q:\n%s", want, out)
+		}
+	}
+}
