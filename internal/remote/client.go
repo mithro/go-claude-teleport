@@ -71,19 +71,72 @@ func (s sshConn) Read(b []byte) (int, error)  { return s.p.Stdout.Read(b) }
 func (s sshConn) Write(b []byte) (int, error) { return s.p.Stdin.Write(b) }
 func (s sshConn) Close() error                { s.p.Stdin.Close(); return s.p.Close() }
 
-// NewClient runs `<exe> remote serve` over ssh and performs hello.
+// remoteBinFallbacks lists the well-known install locations checked, in
+// order, when `command -v` does not find the remote binary on the ssh
+// session's PATH. HK-2 (real-world bug): `claude-teleport remote serve`
+// exec'd through the target's NON-interactive login shell failed with
+// "zsh:1: command not found: claude-teleport" — Hello then saw nothing but
+// "connection closed: EOF" — because the native installer places the
+// binary under $HOME/.local/bin, which a non-interactive shell's PATH often
+// lacks (only the interactive rc file adds it, and ssh exec always runs
+// `<login-shell> -c <command>` non-interactively, whichever shell that is).
+var remoteBinFallbacks = []string{"$HOME/.local/bin", "$HOME/bin", "/usr/local/bin", "/usr/bin"}
+
+// remoteCommand builds the ssh exec payload that starts exe with argv on
+// the far side. It always runs through `/bin/sh -c`, never the account's
+// own login shell directly: that is what makes the fallback logic
+// predictable POSIX syntax no matter which shell the account actually uses
+// (zsh, bash, dash, ...) — the whole point, since the login shell choice is
+// exactly what caused HK-2. It tries `command -v exe` first (the ordinary
+// case), then each of remoteBinFallbacks in turn; if none exist it prints
+// ONE line naming exe and every location tried to stderr and exits 127, so
+// a missing install surfaces as that message (NewClient below turns it into
+// the returned error) instead of a bare "connection closed: EOF".
+func remoteCommand(exe string, argv []string) string {
+	rest := sshx.Quote(argv)
+	exeQ := sshx.Quote([]string{exe})
+	var b strings.Builder
+	fmt.Fprintf(&b, "if command -v %s >/dev/null; then exec %s %s; fi; ", exeQ, exeQ, rest)
+	var tried []string
+	for _, dir := range remoteBinFallbacks {
+		cand := dir + "/" + exe
+		tried = append(tried, cand)
+		fmt.Fprintf(&b, `if [ -x "%s" ]; then exec "%s" %s; fi; `, cand, cand, rest)
+	}
+	fmt.Fprintf(&b, `echo "claude-teleport: %s not found on PATH or in %s" 1>&2; exit 127`, exe, strings.Join(tried, ", "))
+	return "/bin/sh -c " + sshx.Quote([]string{b.String()})
+}
+
+// NewClient runs `<exe> remote serve` over ssh (via remoteCommand's PATH
+// fallback, HK-2) and performs hello.
 func NewClient(ctx context.Context, ssh *sshx.Client, remoteExe string, logf func(string, ...any)) (*Client, error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	p, err := ssh.Start(ctx, sshx.Quote([]string{remoteExe, "remote", "serve"}))
+	p, err := ssh.Start(ctx, remoteCommand(remoteExe, []string{"remote", "serve"}))
 	if err != nil {
 		return nil, fmt.Errorf("start remote helper on %s: %w", ssh, err)
 	}
+	// Captured (not just logged) so a failure to even start the remote
+	// helper — the HK-2 "binary not found anywhere" case chief among them —
+	// can surface its one explanatory stderr line as the actual returned
+	// error below, rather than leaving the caller to infer a PATH problem
+	// from readLoop's bare "connection closed: EOF". stderrDone is closed
+	// once the pipe reports EOF, which p.Close() below forces; waiting on
+	// it (only on the error path) avoids a race between reading the buffer
+	// and the scanner goroutine still filling it in.
+	var stderrMu sync.Mutex
+	var stderrLines []string
+	stderrDone := make(chan struct{})
 	go func() {
+		defer close(stderrDone)
 		sc := bufio.NewScanner(p.Stderr)
 		for sc.Scan() {
-			logf("remote %s: %s", ssh, sc.Text())
+			line := sc.Text()
+			logf("remote %s: %s", ssh, line)
+			stderrMu.Lock()
+			stderrLines = append(stderrLines, line)
+			stderrMu.Unlock()
 		}
 	}()
 	openStream := func(ctx context.Context, kind StreamKind, jobID, streamID string) (io.ReadWriteCloser, error) {
@@ -97,7 +150,7 @@ func NewClient(ctx context.Context, ssh *sshx.Client, remoteExe string, logf fun
 		if err != nil {
 			return nil, fmt.Errorf("open stream %s/%s on %s: %w", kind, streamID, ssh, err)
 		}
-		sp, err := ssh.Start(ctx, sshx.Quote([]string{remoteExe, "remote", "stream", string(kind), jobID, streamID}))
+		sp, err := ssh.Start(ctx, remoteCommand(remoteExe, []string{"remote", "stream", string(kind), jobID, streamID}))
 		if err != nil {
 			return nil, fmt.Errorf("open stream %s/%s on %s: %w", kind, streamID, ssh, err)
 		}
@@ -122,6 +175,18 @@ func NewClient(ctx context.Context, ssh *sshx.Client, remoteExe string, logf fun
 	c, err := NewClientConn(ctx, sshConn{p}, openStream, logf)
 	if err != nil {
 		p.Close()
+		<-stderrDone
+		stderrMu.Lock()
+		tail := strings.Join(stderrLines, "; ")
+		stderrMu.Unlock()
+		if tail != "" {
+			// The remote helper never started (HK-2's not-found case, or
+			// any other early stderr): that one line explains the failure
+			// far better than err's own text (readLoop's generic
+			// "connection closed: EOF"), so it replaces it here rather
+			// than being appended alongside it.
+			return nil, fmt.Errorf("start remote helper on %s: %s", ssh, tail)
+		}
 		return nil, err
 	}
 	c.wait = p.Wait
