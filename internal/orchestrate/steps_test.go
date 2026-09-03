@@ -722,3 +722,40 @@ func TestWaitSourceIdle(t *testing.T) {
 		}
 	})
 }
+
+// TestInstallVerifySkipsDeferredEntries pins finding A7: the pane capture
+// is a Deferred entry (annotateManifest marks it so), and a Deferred entry
+// is classified by staging state alone — it can never read back
+// PresentSame. verifyInstall demanded PresentSame of every non-git,
+// non-memory entry, so install (and, through Pending's own re-diff, the
+// transfer before it) was re-run on every single continue of a job that
+// had already installed everything.
+func TestInstallVerifySkipsDeferredEntries(t *testing.T) {
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	jobID := sid
+	staging := job.StagingDir(dst.paths.DataDir, jobID)
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	capture := "pane contents\n"
+	if err := os.WriteFile(filepath.Join(staging, "0"), []byte(capture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &transfer.Manifest{Version: 1, JobID: jobID, Entries: []transfer.Entry{{
+		ID: 0, Category: session.CatCapture, Deferred: true, Mode: 0o600, Size: int64(len(capture)),
+		Dst: filepath.Join(job.Dir(dst.paths.DataDir, jobID), "capture.txt"),
+	}}}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	if err := m.Save(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plan{JobID: jobID, ManifestPath: manifestPath, Git: &gitx.Plan{Mode: gitx.ModeNotRepo}, Extras: &transfer.InstallExtras{}}
+	r := &runner{p: p, j: &job.Journal{ID: jobID}, src: dst.ep, dst: dst.ep, logf: t.Logf}
+	done, err := r.verifyInstall(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !done {
+		t.Error("verifyInstall must not wait for a Deferred entry to read PresentSame — it never can")
+	}
+}

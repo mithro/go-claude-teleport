@@ -320,7 +320,11 @@ func (r *runner) verifyInstall(ctx context.Context) (bool, error) {
 		memory[e.ID] = true
 	}
 	for _, e := range m.Entries {
-		if d[e.ID] || memory[e.ID] {
+		// A Deferred entry (the pane capture, and existing-main's dirty
+		// index/worktree files) is classified by staging state alone and
+		// can never read back PresentSame — demanding it re-ran install,
+		// and with it the transfer, on every continue (finding A7).
+		if d[e.ID] || memory[e.ID] || e.Deferred {
 			continue
 		}
 		if st[e.ID] != transfer.PresentSame {
