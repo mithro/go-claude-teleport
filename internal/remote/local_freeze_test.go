@@ -2,6 +2,7 @@ package remote
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -86,5 +87,55 @@ func TestThawNoRefIsStillANoop(t *testing.T) {
 	l := NewLocal(testPaths(t), "x", LocalOptions{ProcRoot: t.TempDir(), Sleep: func(time.Duration) {}})
 	if err := l.Thaw(context.Background(), 5150, nil); err != nil {
 		t.Fatalf("Thaw(nil ref): %v", err)
+	}
+}
+
+// TestThawLeavesAForeignPaneAlone pins the pane_pid check: the ref must
+// name the pane whose terminal the stopped job actually lost, or `fg`
+// would be typed at somebody else's shell. Matching the holder's comm
+// against a hardcoded shell list could not tell the two apart.
+func TestThawLeavesAForeignPaneAlone(t *testing.T) {
+	p := testPaths(t)
+	proc := t.TempDir()
+	writeProcStat(t, proc, 100, 1, 100, 100, "bash")
+	writeProcStat(t, proc, 5150, 100, 5150, 100, "node")
+
+	f := &tmuxx.Fake{Default: []string{}, Replies: map[string][]string{
+		// %7 is a different pane: its own process is pid 999, not the 100
+		// that holds pid 5150's terminal.
+		`list-panes -t "%7" -F "#{pane_pid}"`: {"999"},
+	}}
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: fakeDialer(f), Sleep: func(time.Duration) {
+		t.Error("must not poll: nothing was typed")
+	}})
+	ref := &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}
+	if err := l.Thaw(context.Background(), 5150, ref); err != nil {
+		t.Fatalf("Thaw: %v", err)
+	}
+	for _, c := range f.Calls {
+		if strings.HasPrefix(c, "send-keys ") {
+			t.Errorf("typed %q into a pane that does not hold the terminal", c)
+		}
+	}
+}
+
+// TestThawForegroundPollHonoursContext keeps a cancelled job from sitting
+// out the whole foregroundTimeout: the poll must return as soon as the
+// context is done.
+func TestThawForegroundPollHonoursContext(t *testing.T) {
+	p := testPaths(t)
+	proc := t.TempDir()
+	writeProcStat(t, proc, 100, 1, 100, 100, "bash")
+	writeProcStat(t, proc, 5150, 100, 5150, 100, "node") // never regains the terminal
+
+	f := &tmuxx.Fake{Default: []string{}, Replies: map[string][]string{
+		`list-panes -t "%7" -F "#{pane_pid}"`: {"100"},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: fakeDialer(f), Sleep: func(time.Duration) { cancel() }})
+	ref := &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}
+	err := l.Thaw(ctx, 5150, ref)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Thaw = %v, want context.Canceled", err)
 	}
 }

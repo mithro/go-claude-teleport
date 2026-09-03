@@ -274,3 +274,26 @@ func waitForeground(t *testing.T, pid, want int) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestFreezerWarningsSurfaceOnTheSuccessPath pins that a freeze which had
+// to degrade to signalling the bare pid says so somewhere a caller can log
+// it. `sleep 60` started without Setpgid shares this test binary's process
+// group, which is also the freeze owner's — groupToSignal refuses that
+// group, so the helper warns and stops the leader alone. Until now the
+// warning was only ever rendered when the helper ALSO failed.
+func TestFreezerWarningsSurfaceOnTheSuccessPath(t *testing.T) {
+	pid, st := startSleep(t)
+	self, _ := os.Executable()
+	f, err := Freeze(self, pid, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, pid, 'T')
+	if err := f.Thaw(); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, pid, 'S')
+	if w := f.Warnings(); !strings.Contains(w, "signalling the pid alone") {
+		t.Errorf("Warnings() = %q, want the degrade-to-bare-pid notice", w)
+	}
+}

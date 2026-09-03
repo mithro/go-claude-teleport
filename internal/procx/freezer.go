@@ -130,6 +130,18 @@ func Freeze(selfExe string, pid int, startTime string) (*Freezer, error) {
 	return &Freezer{cmd: cmd, control: w, stderr: stderr, pid: pid}, nil
 }
 
+// Warnings returns whatever the helper wrote to its stderr — in practice
+// the "signalling the pid alone" notices from groupToSignal, which say the
+// freeze covered only the leader instead of the whole process group and is
+// therefore weaker than spec §6.1 intends. Before this, those reached a
+// human only when the helper ALSO failed, which is exactly the case where
+// they matter least.
+//
+// Call it after Thaw: os/exec fills the buffer from a goroutine that is
+// only guaranteed to be finished once cmd.Wait (inside Thaw) has returned,
+// so reading earlier both races and can miss the tail.
+func (f *Freezer) Warnings() string { return strings.TrimSpace(f.stderr.String()) }
+
 // Thaw writes "thaw\n", closes the pipe and waits for the helper to exit.
 // It is idempotent: a repeat call is a no-op that returns the first call's
 // result, so callers can freely pair an explicit Thaw with a deferred one.

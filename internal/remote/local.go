@@ -248,6 +248,14 @@ func (l *Local) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {
 		if err := f.Thaw(); err != nil {
 			return err
 		}
+		// The helper's own notices — "signalling the pid alone" when the
+		// process group could not safely be signalled — are only complete
+		// once Thaw has waited for it, and used to be rendered solely when
+		// the helper ALSO failed. A freeze that covered less than spec
+		// §6.1 intends belongs in log.txt on the success path too.
+		if w := f.Warnings(); w != "" {
+			l.opts.Logf("thaw: the freezer for pid %d reported: %s", pid, w)
+		}
 	}
 	return l.restoreForeground(ctx, pid, ref)
 }
@@ -288,26 +296,36 @@ func (l *Local) restoreForeground(ctx context.Context, pid int, ref *session.Tmu
 	if err != nil || fg <= 0 || fg == pgid {
 		return nil
 	}
-	procs, err := l.procs()
-	if err != nil {
-		return err
-	}
-	holder, ok := procs.Get(fg)
-	if !ok || !tmuxx.IsShell(holder.Comm) {
-		l.opts.Logf("thaw: pid %d is not the foreground of its terminal (group %d, held by %q) and cannot be restored", pid, fg, holder.Comm)
-		return nil
-	}
-	l.opts.Logf("thaw: the pane shell (pid %d) took the terminal back while pid %d was stopped; typing fg", fg, pid)
 	t, err := l.dial(ctx, ref.SocketPath)
 	if err != nil {
 		return err
 	}
 	defer t.Close()
+	// The process tmux started in this pane leads its own process group,
+	// so that group is what the pty's foreground reverts to when a
+	// job-control shell takes the terminal back. Comparing fg against it
+	// beats matching the holder's comm against a hardcoded shell list on
+	// two counts: it works for any shell (or any other job-control
+	// program) a pane may run, and it proves that ref actually names the
+	// pane whose terminal this is — a ref pointing somewhere else can no
+	// longer have `fg` typed into it.
+	panePID, err := tmuxx.PanePID(ctx, t, ref.PaneID)
+	if err != nil {
+		return err
+	}
+	if fg != panePID {
+		l.opts.Logf("thaw: pid %d is not the foreground of its terminal (group %d), and pane %s's own process is pid %d, so this pane's shell is not what holds it; leaving it alone", pid, fg, ref.PaneID, panePID)
+		return nil
+	}
+	l.opts.Logf("thaw: the pane process (pid %d) took the terminal back while pid %d was stopped; typing fg", fg, pid)
 	if err := tmuxx.TypeCommand(ctx, t, ref.PaneID, []string{"fg"}); err != nil {
 		return err
 	}
 	deadline := time.Now().Add(foregroundTimeout)
 	for {
+		if err := ctx.Err(); err != nil {
+			return err // a cancelled job must not sit out the whole timeout
+		}
 		if fg, err := procx.ForegroundGroup(l.opts.ProcRoot, pid); err != nil || fg == pgid {
 			return nil // restored, or the process is gone
 		}
