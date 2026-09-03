@@ -143,7 +143,16 @@ func clientConfig(r Resolved, o Options) (*ssh.ClientConfig, func(), error) {
 	if timeout == 0 {
 		timeout = 15 * time.Second
 	}
-	return &ssh.ClientConfig{User: r.User, Auth: methods, HostKeyCallback: cb, Timeout: timeout}, cleanup, nil
+	conf := &ssh.ClientConfig{User: r.User, Auth: methods, HostKeyCallback: cb, Timeout: timeout}
+	// HK-1: prefer whatever host-key algorithm(s) known_hosts already has
+	// for this hop over x/crypto/ssh's fixed default order — see
+	// hostKeyAlgorithms' doc comment. hopAddr(r) is exactly the address
+	// string Dial passes to ssh.NewClientConn below, so the lookup and the
+	// eventual hostKeyCallback invocation agree on what "this host" means.
+	if algos := hostKeyAlgorithms(o.KnownHostsFile, hopAddr(r)); len(algos) > 0 {
+		conf.HostKeyAlgorithms = algos
+	}
+	return conf, cleanup, nil
 }
 
 // Dial connects through the jump chain; each hop's hostname is resolved by

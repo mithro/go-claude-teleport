@@ -157,6 +157,36 @@ func TestLocalHelloClaudeVersion(t *testing.T) {
 	})
 }
 
+// TestLocalHelloFindsClaudeUnderHomeLocalBinWhenPATHLacksIt is HK-3's
+// regression test for the real-world bug: `doctor ten64` reported "FAIL
+// remote claude" because the remote Local.Hello resolves `claude` on the
+// ssh session's NON-interactive PATH, and Claude Code's native installer
+// puts it under $HOME/.local/bin — interactive-shell PATH only. A claude
+// installed ONLY there, with PATH deliberately excluding it, must still be
+// found (and its resolved path reported).
+func TestLocalHelloFindsClaudeUnderHomeLocalBinWhenPATHLacksIt(t *testing.T) {
+	p := testPaths(t)
+	localBin := filepath.Join(p.Home, ".local", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\necho '2.1.999 (Claude Code)'\nexit 0\n"
+	claudePath := filepath.Join(localBin, "claude")
+	if err := os.WriteFile(claudePath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", "/usr/bin:/bin") // deliberately excludes localBin
+
+	l := NewLocal(p, "self", LocalOptions{Logf: t.Logf})
+	info, err := l.Hello(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.HasClaude || info.ClaudePath != claudePath || info.ClaudeVersion != "2.1.999 (Claude Code)" || info.ClaudeVersionErr != "" {
+		t.Errorf("Hello = %+v, want HasClaude with ClaudePath %q and the version reported", info, claudePath)
+	}
+}
+
 func TestLocalManifestDiffStreamInstall(t *testing.T) {
 	p := testPaths(t)
 	l := NewLocal(p, "self", LocalOptions{Logf: t.Logf})

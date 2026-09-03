@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -19,18 +20,29 @@ import (
 	"github.com/mithro/go-claude-teleport/test/fakeclaude/harness"
 )
 
+// remoteSubcommandRE recovers the ["remote","serve"] or
+// ["remote","stream",kind,jobID,streamID] argv embedded in a
+// remote.NewClient exec payload. Since HK-2, that payload is no longer the
+// bare "claude-teleport remote serve" line: it is client.remoteCommand's
+// PATH-fallback /bin/sh script, which repeats `exec <bin> remote serve` (or
+// `... remote stream ...`) verbatim in every branch it tries — the first
+// occurrence names the intended op. Every value these tests pass (uuids,
+// stream kinds, "kind:n" ids) is an sshx.Quote "safe word", so it always
+// appears unquoted here.
+var remoteSubcommandRE = regexp.MustCompile(`\bremote (serve|stream \S+ \S+ \S+)\b`)
+
 // remoteHost starts an sshtest server whose exec handler runs THIS cli's
 // `remote serve` in-process with remoteEnv, and returns "host:port" + the
 // -o flags the client needs (key file, accept-new).
 func remoteHost(t *testing.T, remoteEnv []string) (string, []string, string) {
 	t.Helper()
 	return remoteHostExec(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
-		f := strings.Fields(cmd)
-		if len(f) < 3 || f[1] != "remote" {
+		m := remoteSubcommandRE.FindString(cmd)
+		if m == "" {
 			io.WriteString(stderr, "unexpected: "+cmd)
 			return 127
 		}
-		return Main(f[1:], stdin, stdout, stderr, remoteEnv)
+		return Main(strings.Fields(m), stdin, stdout, stderr, remoteEnv)
 	})
 }
 

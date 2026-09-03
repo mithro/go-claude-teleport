@@ -8,10 +8,14 @@ import (
 	"io"
 	"net"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -106,6 +110,65 @@ func TestClientProtocolMismatchIsUsageError(t *testing.T) {
 	}
 }
 
+// TestNewClientErrorPreservesUnderlyingErrorTypeThroughNoisyStderr is the
+// regression test for review finding R-1: NewClient's stderr-replacement
+// path used to build a brand-new error from the captured stderr text
+// alone, discarding the underlying error entirely — so a genuine *Error
+// (e.g. Hello's protocol-mismatch usage error) reaching the client
+// alongside ANY stderr noise (an rc-file banner, a stray warning, ...) lost
+// its type, and remotecfg.go's `errors.As(err, &pe)` check — which reads
+// pe.Code to pick an exit code — could never see it, and its own message
+// text was discarded too. The wrapped error must survive both ways.
+func TestNewClientErrorPreservesUnderlyingErrorTypeThroughNoisyStderr(t *testing.T) {
+	home := t.TempDir()
+	os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
+	_, signer := sshtest.WriteKeyFile(t, filepath.Join(home, ".ssh"), "id_ed25519", "")
+	exec := func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		// Noise unrelated to the real failure — stands in for anything a
+		// remote shell might write to stderr before the protocol takes
+		// over (a warning, a banner, ...), which must never mask the real
+		// error the wire protocol goes on to report.
+		io.WriteString(stderr, "sh: warning: setlocale: LC_ALL: cannot change locale\n")
+		ep := stubEndpoint{hello: func() (HostInfo, error) {
+			return HostInfo{Protocol: version.Protocol + 1, Version: "v9.9"}, nil
+		}}
+		if err := Serve(context.Background(), stdin, stdout, ep); err != nil {
+			io.WriteString(stderr, err.Error())
+			return 1
+		}
+		return 0
+	}
+	srv := sshtest.New(t, sshtest.Options{Authorized: []ssh.PublicKey{signer.PublicKey()}, Exec: exec})
+	host, portStr, err := net.SplitHostPort(srv.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+	os.WriteFile(kh, []byte(sshtest.KnownHostsLine("["+host+"]:"+portStr, srv.HostKey)), 0o600)
+	sc, err := sshx.Dial(context.Background(), sshx.Resolved{Target: sshx.Target{User: "bob", Host: host, Port: port}, HostName: host}, nil, nil,
+		sshx.Options{KnownHostsFile: kh, Home: home, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sc.Close() })
+
+	_, err = NewClient(context.Background(), sc, "claude-teleport", t.Logf)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	var pe *Error
+	if !errors.As(err, &pe) || pe.Code != "usage" {
+		t.Fatalf("err = %v, want it to unwrap (errors.As) to a *remote.Error{Code:\"usage\"} despite the stderr noise", err)
+	}
+	if !strings.Contains(err.Error(), "protocol mismatch") {
+		t.Errorf("err = %v, want the protocol-mismatch message text preserved too", err)
+	}
+}
+
 // newSSHTestClient wires a Client to a fresh Local ("dest") through an
 // in-process sshd whose exec handler runs `<exe> remote serve` and
 // `<exe> remote stream ...` in-process — the same harness
@@ -130,16 +193,26 @@ func newSSHTestClientOpts(t *testing.T, tweak func(*LocalOptions)) (*Client, *Lo
 	}
 	dest := NewLocal(destPaths, "claude-teleport", destOpts)
 	exec := func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
-		args := strings.Fields(cmd)
+		// cmd is now client.remoteCommand's PATH-fallback wrapper (HK-2),
+		// not the bare "claude-teleport remote serve"/"... stream ..." line
+		// — recover the intended argv rather than requiring an exact token
+		// count. remoteSubcommand's own real-shell correctness is covered
+		// separately (TestNewClient*PATH* below); this fixture only needs
+		// to know WHICH op to dispatch to, same as it always has.
+		args, ok := remoteSubcommand(cmd)
+		if !ok {
+			io.WriteString(stderr, "unexpected command "+cmd)
+			return 127
+		}
 		switch {
-		case len(args) == 3 && args[1] == "remote" && args[2] == "serve":
+		case len(args) == 2 && args[0] == "remote" && args[1] == "serve":
 			if err := Serve(context.Background(), stdin, stdout, dest); err != nil {
 				io.WriteString(stderr, err.Error())
 				return 1
 			}
 			return 0
-		case len(args) == 6 && args[1] == "remote" && args[2] == "stream":
-			if err := ServeStream(context.Background(), StreamKind(args[3]), args[4], args[5], stdin, stdout, dest); err != nil {
+		case len(args) == 5 && args[0] == "remote" && args[1] == "stream":
+			if err := ServeStream(context.Background(), StreamKind(args[2]), args[3], args[4], stdin, stdout, dest); err != nil {
 				io.WriteString(stderr, err.Error())
 				return 1
 			}
@@ -172,6 +245,196 @@ func newSSHTestClientOpts(t *testing.T, tweak func(*LocalOptions)) (*Client, *Lo
 	}
 	t.Cleanup(func() { c.Close() })
 	return c, dest, destPaths
+}
+
+// remoteSubcommandRE recovers the ["remote","serve"] or
+// ["remote","stream",kind,jobID,streamID] argv embedded in a
+// client.remoteCommand payload (HK-2): the wrapper script repeats
+// `exec <bin> remote serve` (or `... remote stream ...`) verbatim in every
+// branch it tries, so the first occurrence names the intended op — every
+// value these tests ever pass (uuids, stream kinds, "kind:n" ids) is a
+// sshx.Quote "safe word", so it always appears unquoted here.
+var remoteSubcommandRE = regexp.MustCompile(`\bremote (serve|stream \S+ \S+ \S+)\b`)
+
+func remoteSubcommand(cmd string) ([]string, bool) {
+	m := remoteSubcommandRE.FindString(cmd)
+	if m == "" {
+		return nil, false
+	}
+	return strings.Fields(m), true
+}
+
+// buildTestRemoteExe builds the real cmd/claude-teleport binary, so the
+// HK-2 PATH-fallback test below installs and runs the genuine article —
+// proving client.remoteCommand's generated /bin/sh script is correct
+// against a real POSIX shell and a real binary, not a Go-level stand-in
+// for either. It has one caller; no cross-test memoization is attempted
+// (a cached path under an earlier test's t.TempDir() would dangle once
+// that test's cleanup ran).
+func buildTestRemoteExe(t *testing.T) string {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "claude-teleport")
+	cmd := osexec.Command("go", "build", "-o", out, "github.com/mithro/go-claude-teleport/cmd/claude-teleport")
+	if o, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build claude-teleport: %v\n%s", err, o)
+	}
+	return out
+}
+
+// realLoginShellExec is a sshtest.Options.Exec that runs cmd through a REAL
+// /bin/sh -c with env, standing in for whatever login shell a real sshd
+// would hand the command to: client.remoteCommand (HK-2) always targets
+// /bin/sh itself precisely so it does not matter which shell that is, and
+// this fixture exercises that real interpreter rather than a Go-level
+// simulation of one.
+//
+// stdin is wired via StdinPipe + a detached copy goroutine rather than
+// assigning the ssh.Channel reader straight to Cmd.Stdin: os/exec's
+// automatic io.Reader-Stdin mode makes Cmd.Wait (and so Run) block until
+// that copy goroutine's own Read returns, and an ssh.Channel never does
+// that on its own — nothing closes the CLIENT's write side until it gets a
+// response, which for the "binary not found" script (it never reads stdin
+// at all, exec'ing straight to `echo ...; exit 127`) is a real deadlock:
+// Run never returns, so this Exec call — and the whole ssh exec request —
+// never completes. Managing the copy ourselves lets Wait return the moment
+// the child actually exits, matching what a real sshd session does.
+func realLoginShellExec(env []string) func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		c := osexec.Command("/bin/sh", "-c", cmd)
+		c.Stdout, c.Stderr = stdout, stderr
+		c.Env = env
+		inPipe, err := c.StdinPipe()
+		if err != nil {
+			io.WriteString(stderr, err.Error())
+			return 1
+		}
+		if err := c.Start(); err != nil {
+			io.WriteString(stderr, err.Error())
+			return 1
+		}
+		go func() { io.Copy(inPipe, stdin); inPipe.Close() }()
+		if err := c.Wait(); err != nil {
+			var ee *osexec.ExitError
+			if errors.As(err, &ee) {
+				return ee.ExitCode()
+			}
+			io.WriteString(stderr, err.Error())
+			return 1
+		}
+		return 0
+	}
+}
+
+// dialOverRealShellFixture wires an sshx.Client to a fresh in-process sshd
+// whose exec handler is realLoginShellExec(remoteEnv) — a real /bin/sh, not
+// the Go-level Serve/ServeStream dispatch newSSHTestClientOpts uses.
+func dialOverRealShellFixture(t *testing.T, remoteEnv []string) *sshx.Client {
+	t.Helper()
+	home := t.TempDir()
+	os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
+	_, signer := sshtest.WriteKeyFile(t, filepath.Join(home, ".ssh"), "id_ed25519", "")
+	srv := sshtest.New(t, sshtest.Options{
+		Authorized: []ssh.PublicKey{signer.PublicKey()},
+		Exec:       realLoginShellExec(remoteEnv),
+	})
+	host, portStr, err := net.SplitHostPort(srv.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+	os.WriteFile(kh, []byte(sshtest.KnownHostsLine("["+host+"]:"+portStr, srv.HostKey)), 0o600)
+	sc, err := sshx.Dial(context.Background(), sshx.Resolved{Target: sshx.Target{User: "bob", Host: host, Port: port}, HostName: host}, nil, nil,
+		sshx.Options{KnownHostsFile: kh, Home: home, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sc.Close() })
+	return sc
+}
+
+// TestNewClientFindsRemoteExeUnderHomeLocalBinWhenPATHLacksIt is HK-2's
+// regression test for the real-world bug: `claude-teleport remote serve`
+// exec'd through the user's NON-interactive login shell failed with
+// "zsh:1: command not found: claude-teleport" (and Hello then saw only
+// "connection closed: EOF") because the native installer puts the binary
+// under $HOME/.local/bin, which many shells only add to PATH for
+// interactive sessions. A real claude-teleport is installed ONLY there —
+// PATH here deliberately excludes it, mirroring that non-interactive
+// shell — and NewClient must still find it and complete Hello.
+func TestNewClientFindsRemoteExeUnderHomeLocalBinWhenPATHLacksIt(t *testing.T) {
+	built := buildTestRemoteExe(t)
+	remoteHome := t.TempDir()
+	localBin := filepath.Join(remoteHome, ".local", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(built)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localBin, "claude-teleport"), data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	noTmux := filepath.Join(t.TempDir(), "no-tmux-here")
+	remoteEnv := []string{"HOME=" + remoteHome, "PATH=/usr/bin:/bin", "TMUX_TMPDIR=" + noTmux}
+
+	sc := dialOverRealShellFixture(t, remoteEnv)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := NewClient(ctx, sc, "claude-teleport", t.Logf)
+	if err != nil {
+		t.Fatalf("NewClient must fall back to $HOME/.local/bin when PATH lacks claude-teleport: %v", err)
+	}
+	defer c.Close()
+	if c.Info().Hostname == "" {
+		t.Errorf("Hello over the PATH-fallback path returned an empty HostInfo: %+v", c.Info())
+	}
+}
+
+// TestNewClientReportsClearErrorWhenRemoteExeIsNowhere is HK-2's negative
+// case: no claude-teleport anywhere the fallback looks. NewClient must fail
+// with a message naming the binary and that it was not found LEADING the
+// message, never a bare "connection closed: EOF" up front the way the bug
+// report actually saw it (which gave no hint the problem was PATH-related
+// at all). readLoop's underlying error text is still chained on afterward
+// via %w (R-1: errors.As must keep working, see
+// TestNewClientErrorPreservesUnderlyingErrorTypeThroughNoisyStderr) — the
+// fix is that it no longer REPLACES the explanation, not that it disappears.
+func TestNewClientReportsClearErrorWhenRemoteExeIsNowhere(t *testing.T) {
+	// Hermetic: swap the two absolute fallbacks (the real /usr/local/bin,
+	// /usr/bin — outside this test's control, and a real claude-teleport
+	// COULD theoretically live there) for fresh, guaranteed-empty temp
+	// dirs, so "not found" can never depend on the test machine's actual
+	// filesystem. The $HOME-based fallbacks are already hermetic (remoteHome
+	// below is a fresh t.TempDir()).
+	origFallbacks := remoteBinFallbacks
+	remoteBinFallbacks = []string{"$HOME/.local/bin", "$HOME/bin", filepath.Join(t.TempDir(), "usr-local-bin"), filepath.Join(t.TempDir(), "usr-bin")}
+	t.Cleanup(func() { remoteBinFallbacks = origFallbacks })
+
+	remoteHome := t.TempDir()
+	noTmux := filepath.Join(t.TempDir(), "no-tmux-here")
+	remoteEnv := []string{"HOME=" + remoteHome, "PATH=/usr/bin:/bin", "TMUX_TMPDIR=" + noTmux}
+
+	sc := dialOverRealShellFixture(t, remoteEnv)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := NewClient(ctx, sc, "claude-teleport", t.Logf)
+	if err == nil {
+		t.Fatal("want an error naming the missing binary and the paths tried")
+	}
+	msg := err.Error()
+	for _, want := range []string{"claude-teleport", "not found", ".local/bin"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("err = %v, missing %q", err, want)
+		}
+	}
+	if i, j := strings.Index(msg, "not found"), strings.Index(msg, "connection closed"); i < 0 || (j >= 0 && j < i) {
+		t.Errorf("err = %v: the clear explanation must lead, not follow, any bare connection-closed text", err)
+	}
 }
 
 func TestClientTransferOverSSHTest(t *testing.T) {
