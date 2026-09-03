@@ -215,13 +215,24 @@ func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string)
 	return transfer.Install(ctx, m, st, l.stagingDir(jobID), l.paths, extra)
 }
 
-func (l *Local) Freeze(ctx context.Context, pid int, startTime string) error {
+// Freeze SIGSTOPs pid through a freezer helper that outlives this process.
+//
+// ref is the pane pid runs in (nil when it is not in tmux): the helper is
+// given it so that, if this process dies, its own SIGCONT on pipe EOF can
+// be followed by the same foreground restore Thaw would have done —
+// otherwise the pane's shell keeps the pty and the resumed Claude re-stops
+// on SIGTTIN (ruling R-P3-F1).
+func (l *Local) Freeze(ctx context.Context, pid int, startTime string, ref *session.TmuxRef) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, ok := l.freezers[pid]; ok {
 		return nil
 	}
-	f, err := procx.Freeze(l.selfExe, pid, startTime)
+	var pane procx.PaneRef
+	if ref != nil {
+		pane = procx.PaneRef{SocketPath: ref.SocketPath, PaneID: ref.PaneID}
+	}
+	f, err := procx.Freeze(l.selfExe, pid, startTime, pane)
 	if err != nil {
 		return err
 	}
@@ -260,34 +271,18 @@ func (l *Local) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {
 	return l.restoreForeground(ctx, pid, ref)
 }
 
-// foregroundPoll bounds the wait for the shell to hand the pty back.
-const (
-	foregroundPoll    = 100 * time.Millisecond
-	foregroundTimeout = 10 * time.Second
-)
-
-// restoreForeground gives the thawed job the pty back.
-//
-// An interactive shell is a job-control shell: when its foreground job
-// stops — by SIGSTOP from the freezer just as much as by ^Z — it takes the
-// terminal back for itself and prints "[1]+ Stopped". SIGCONT resumes the
-// job's execution but not its claim on the terminal, so its next read gets
-// SIGTTIN and stops it again: the thawed Claude is left in state T for
-// good, and everything typed at the pane afterwards (the "/exit" of spec
-// §6.3, or a user's own keystrokes) lands on the shell instead. Only a
-// process whose controlling terminal this is may tcsetpgrp it back, which
-// rules out the freezer, the runner and the remote helper alike — so the
-// one process that can fix it is the shell itself, and the way to ask is
-// its own `fg`.
-//
-// Nothing is typed unless the pty's foreground really has moved to a
-// process group led by a shell: with job control off (or with Claude as
-// the pane's own command) the job never lost the terminal and there is
-// nothing to restore.
+// restoreForeground gives the thawed job the pty back by asking the pane's
+// own shell to `fg` it — see tmuxx.RestoreForeground, which is the single
+// implementation of that dance, shared with the freezer helper's
+// owner-died path (ruling R-P3-F1). Local's part is the dialling, the
+// injected /proc root, sleep and logger, and turning the "never came back"
+// case into a remote Error.
 func (l *Local) restoreForeground(ctx context.Context, pid int, ref *session.TmuxRef) error {
 	if ref == nil || l.opts.Tmux == nil {
 		return nil
 	}
+	// Dialling is the expensive part, so keep the cheap /proc checks that
+	// prove there is anything to restore ahead of it.
 	pgid, err := procx.ProcGroup(l.opts.ProcRoot, pid)
 	if err != nil {
 		return nil // the target is gone: nothing to foreground
@@ -301,39 +296,15 @@ func (l *Local) restoreForeground(ctx context.Context, pid int, ref *session.Tmu
 		return err
 	}
 	defer t.Close()
-	// The process tmux started in this pane leads its own process group,
-	// so that group is what the pty's foreground reverts to when a
-	// job-control shell takes the terminal back. Comparing fg against it
-	// beats matching the holder's comm against a hardcoded shell list on
-	// two counts: it works for any shell (or any other job-control
-	// program) a pane may run, and it proves that ref actually names the
-	// pane whose terminal this is — a ref pointing somewhere else can no
-	// longer have `fg` typed into it.
-	panePID, err := tmuxx.PanePID(ctx, t, ref.PaneID)
-	if err != nil {
-		return err
+	err = tmuxx.RestoreForeground(ctx, t, ref.PaneID, pid, tmuxx.ForegroundOptions{
+		ProcRoot: l.opts.ProcRoot,
+		Logf:     func(format string, args ...any) { l.opts.Logf("thaw: "+format, args...) },
+		Sleep:    l.opts.Sleep,
+	})
+	if errors.Is(err, tmuxx.ErrNotRestored) {
+		return &Error{Code: "conflict", Message: fmt.Sprintf("thawed claude (pid %d) did not get its terminal back within %s", pid, tmuxx.ForegroundTimeout)}
 	}
-	if fg != panePID {
-		l.opts.Logf("thaw: pid %d is not the foreground of its terminal (group %d), and pane %s's own process is pid %d, so this pane's shell is not what holds it; leaving it alone", pid, fg, ref.PaneID, panePID)
-		return nil
-	}
-	l.opts.Logf("thaw: the pane process (pid %d) took the terminal back while pid %d was stopped; typing fg", fg, pid)
-	if err := tmuxx.TypeCommand(ctx, t, ref.PaneID, []string{"fg"}); err != nil {
-		return err
-	}
-	deadline := time.Now().Add(foregroundTimeout)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err // a cancelled job must not sit out the whole timeout
-		}
-		if fg, err := procx.ForegroundGroup(l.opts.ProcRoot, pid); err != nil || fg == pgid {
-			return nil // restored, or the process is gone
-		}
-		if time.Now().After(deadline) {
-			return &Error{Code: "conflict", Message: fmt.Sprintf("thawed claude (pid %d) did not get its terminal back within %s", pid, foregroundTimeout)}
-		}
-		l.opts.Sleep(foregroundPoll)
-	}
+	return err
 }
 
 func (l *Local) JournalGet(ctx context.Context, jobID string) (*job.Journal, bool, error) {

@@ -104,7 +104,10 @@ func (r *runner) runFreeze(ctx context.Context) error {
 		return nil
 	}
 	r.logf("freeze: SIGSTOP pid %d", reg.PID)
-	return r.src.Freeze(ctx, reg.PID, reg.ProcStart)
+	// The pane goes with the freeze: if this runner is killed, the
+	// freezer helper must be able to hand the terminal back itself
+	// (R-P3-F1).
+	return r.src.Freeze(ctx, reg.PID, reg.ProcStart, r.p.Session.Tmux)
 }
 
 // ---- 3 capture ----------------------------------------------------------

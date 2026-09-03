@@ -66,6 +66,29 @@ func ProcGroup(procRoot string, pid int) (int, error) { return statField(procRoo
 // then re-stops on SIGTTIN at its next read (spec §6.1 freeze/thaw).
 func ForegroundGroup(procRoot string, pid int) (int, error) { return statField(procRoot, pid, 8) }
 
+// PaneRef names the tmux pane the frozen job runs in: enough for the
+// helper to hand the job its terminal back on its own (ruling R-P3-F1).
+//
+// It travels to the helper in argv rather than over the fd-3 control pipe:
+// a tmux socket path and a pane id are not secrets (both appear in the
+// tmux server's own argv and in the pane's environment), the helper is
+// re-exec'd by exec.Command anyway, and argv keeps the control pipe doing
+// the one job — thaw-or-EOF — whose semantics the whole design rests on.
+type PaneRef struct {
+	SocketPath string
+	PaneID     string
+}
+
+// Empty reports whether the ref names no pane (the no-tmux case: nothing
+// ever took the terminal away, so there is nothing to restore).
+func (r PaneRef) Empty() bool { return r.SocketPath == "" || r.PaneID == "" }
+
+// RestoreFunc gives a thawed pid its controlling terminal back. procx
+// cannot do this itself — it needs tmux — so the helper's main is handed
+// one (internal/tmuxx.FreezerRestore builds the real one; internal/cli
+// wires it into the internal-freezer subcommand).
+type RestoreFunc func(pid int) error
+
 // Freezer holds a stopped pid; Thaw releases it. If the owning process dies
 // first, the helper releases it on pipe EOF (spec §6.1).
 type Freezer struct {
@@ -94,9 +117,13 @@ func checkStart(pid int, startTime string) error {
 	return nil
 }
 
-// Freeze re-execs selfExe as `internal-freezer <pid> <start>` and waits for
-// its "stopped" acknowledgement.
-func Freeze(selfExe string, pid int, startTime string) (*Freezer, error) {
+// Freeze re-execs selfExe as `internal-freezer <pid> <start> [socket pane]`
+// and waits for its "stopped" acknowledgement.
+//
+// ref is the pane the target runs in, or the zero PaneRef when it is not in
+// tmux. The helper needs it because the owner may die: on pipe EOF nobody
+// else is left to give the SIGCONT'd job its terminal back (R-P3-F1).
+func Freeze(selfExe string, pid int, startTime string, ref PaneRef) (*Freezer, error) {
 	if err := checkStart(pid, startTime); err != nil {
 		return nil, fmt.Errorf("freeze: %w", err)
 	}
@@ -104,7 +131,11 @@ func Freeze(selfExe string, pid int, startTime string) (*Freezer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("freeze: pipe: %w", err)
 	}
-	cmd := exec.Command(selfExe, "internal-freezer", strconv.Itoa(pid), startTime)
+	argv := []string{"internal-freezer", strconv.Itoa(pid), startTime}
+	if !ref.Empty() {
+		argv = append(argv, ref.SocketPath, ref.PaneID)
+	}
+	cmd := exec.Command(selfExe, argv...)
 	cmd.ExtraFiles = []*os.File{r} // fd 3 in the child
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stderr := &bytes.Buffer{}
@@ -162,7 +193,15 @@ func (f *Freezer) Thaw() error {
 // RunFreezerHelper is the helper's main: SIGSTOP, ack on stdout, block on
 // control, SIGCONT on data or EOF. It ignores terminal signals so it cannot
 // die before thawing. The start time is re-checked before every kill.
-func RunFreezerHelper(pid int, startTime string, control *os.File) error {
+//
+// restore (may be nil) runs after the SIGCONT of the EOF path only — the
+// path where the owner died. A job-control shell takes the pty back the
+// moment its foreground job stops, so a bare SIGCONT leaves the target
+// re-stopping on SIGTTIN; on the ordinary "thaw" path the owner does that
+// restore itself (remote.Local.Thaw), and on the EOF path there is nobody
+// else left to do it (ruling R-P3-F1). Its failures are logged, never
+// fatal: the SIGCONT has already happened and is the part that matters.
+func RunFreezerHelper(pid int, startTime string, control *os.File, restore RestoreFunc) error {
 	signal.Ignore(syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGPIPE, syscall.SIGQUIT)
 	if err := checkStart(pid, startTime); err != nil {
 		return fmt.Errorf("freezer: %w", err)
@@ -178,12 +217,24 @@ func RunFreezerHelper(pid int, startTime string, control *os.File) error {
 	}
 	fmt.Fprintln(os.Stdout, "stopped")
 	buf := make([]byte, 16)
-	control.Read(buf) // data ("thaw") or EOF (owner died): either way, thaw
+	// Data ("thaw") or EOF/error (owner died): either way, thaw. Only the
+	// owner-died case also has to restore the foreground, since only there
+	// is the owner not around to do it.
+	n, rerr := control.Read(buf)
+	ownerDied := n == 0 || rerr != nil
 	if err := checkStart(pid, startTime); err != nil {
 		return nil // the target is gone or replaced: nothing to thaw
 	}
 	if err := signalTarget(pid, startTime, syscall.SIGCONT, ownerPgid); err != nil {
 		return fmt.Errorf("freezer: %w", err)
+	}
+	if ownerDied && restore != nil {
+		if err := restore(pid); err != nil {
+			// stderr is the helper's only log, and on this path its
+			// reader (the owner) is dead — hence best-effort, and hence
+			// the restore's own logging goes here too.
+			fmt.Fprintf(os.Stderr, "freezer: restoring pid %d's terminal: %v\n", pid, err)
+		}
 	}
 	return nil
 }

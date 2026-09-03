@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -45,7 +46,7 @@ func waitState(t *testing.T, pid int, want byte) {
 func TestFreezeThaw(t *testing.T) {
 	pid, st := startSleep(t)
 	self, _ := os.Executable()
-	f, err := Freeze(self, pid, st)
+	f, err := Freeze(self, pid, st, PaneRef{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +60,7 @@ func TestFreezeThaw(t *testing.T) {
 func TestThawIsIdempotent(t *testing.T) {
 	pid, st := startSleep(t)
 	self, _ := os.Executable()
-	f, err := Freeze(self, pid, st)
+	f, err := Freeze(self, pid, st, PaneRef{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,10 +77,10 @@ func TestThawIsIdempotent(t *testing.T) {
 func TestFreezeRefusesWrongStartTime(t *testing.T) {
 	pid, _ := startSleep(t)
 	self, _ := os.Executable()
-	if _, err := Freeze(self, pid, "1"); err == nil {
+	if _, err := Freeze(self, pid, "1", PaneRef{}); err == nil {
 		t.Fatal("wrong start time must refuse")
 	}
-	if _, err := Freeze(self, pid, ""); err == nil {
+	if _, err := Freeze(self, pid, "", PaneRef{}); err == nil {
 		t.Fatal("empty start time must refuse")
 	}
 	if s, _ := ProcState("/proc", pid); s == 'T' {
@@ -91,8 +92,24 @@ func TestFreezeRefusesWrongStartTime(t *testing.T) {
 // helper sees pipe EOF and SIGCONTs the target.
 func TestHelperThawsWhenOwnerDies(t *testing.T) {
 	pid, st := startSleep(t)
+	kill := startOwner(t, pid, st, PaneRef{})
+	waitState(t, pid, 'T')
+	kill()
+	waitState(t, pid, 'S')
+}
+
+// startOwner spawns the "freeze-owner" mode of this test binary, which
+// freezes pid (with ref) and then hangs until killed, and waits for its
+// "frozen" announcement. The returned kill function SIGKILLs it: the case
+// with no cleanup path, where only the helper can release the target.
+func startOwner(t *testing.T, pid int, startTime string, ref PaneRef) (kill func()) {
+	t.Helper()
 	self, _ := os.Executable()
-	owner := exec.Command(self, "freeze-owner", strconv.Itoa(pid), st)
+	argv := []string{"freeze-owner", strconv.Itoa(pid), startTime}
+	if !ref.Empty() {
+		argv = append(argv, ref.SocketPath, ref.PaneID)
+	}
+	owner := exec.Command(self, argv...)
 	owner.Stderr = os.Stderr
 	out, err := owner.StdoutPipe()
 	if err != nil {
@@ -101,17 +118,70 @@ func TestHelperThawsWhenOwnerDies(t *testing.T) {
 	if err := owner.Start(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { owner.Process.Kill(); owner.Wait() })
 	line, err := bufio.NewReader(out).ReadString('\n')
 	if err != nil || line != "frozen\n" {
 		owner.Process.Kill()
 		t.Fatalf("owner said %q (%v)", line, err)
 	}
+	return func() {
+		if err := owner.Process.Signal(syscall.SIGKILL); err != nil {
+			t.Fatal(err)
+		}
+		owner.Wait()
+	}
+}
+
+// TestHelperRestoresTheForegroundWhenOwnerDies is R-P3-F1 at the procx
+// level: the pane ref given to Freeze reaches the helper (through its
+// argv), and on the owner-died path the helper runs the restore hook after
+// its SIGCONT. In production that hook is tmuxx.FreezerRestore, which types
+// `fg` into the pane; here it writes the pid it was handed, so the test
+// needs no tmux (internal/tmuxx's tmuxlive test covers the real thing).
+func TestHelperRestoresTheForegroundWhenOwnerDies(t *testing.T) {
+	pid, st := startSleep(t)
+	marker := filepath.Join(t.TempDir(), "restored")
+	kill := startOwner(t, pid, st, PaneRef{SocketPath: marker, PaneID: "%7"})
 	waitState(t, pid, 'T')
-	if err := owner.Process.Signal(syscall.SIGKILL); err != nil {
+	kill()
+	waitState(t, pid, 'S')
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, err := os.ReadFile(marker)
+		if err == nil {
+			if string(got) != strconv.Itoa(pid) {
+				t.Fatalf("restore hook ran for pid %s, want %d", got, pid)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the helper never ran the restore hook after its owner died (%v)", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestOrdinaryThawDoesNotRestore: on the "thaw" path the owner is alive and
+// does the foreground restore itself (remote.Local.Thaw), so the helper
+// must not also type into the pane — two `fg`s would put the shell's next
+// job in the foreground, or land on a pane the owner has already moved on
+// from.
+func TestOrdinaryThawDoesNotRestore(t *testing.T) {
+	pid, st := startSleep(t)
+	self, _ := os.Executable()
+	marker := filepath.Join(t.TempDir(), "restored")
+	f, err := Freeze(self, pid, st, PaneRef{SocketPath: marker, PaneID: "%7"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	owner.Wait()
+	waitState(t, pid, 'T')
+	if err := f.Thaw(); err != nil {
+		t.Fatal(err)
+	}
 	waitState(t, pid, 'S')
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("the helper restored the foreground on the ordinary thaw path; that is the owner's job")
+	}
 }
 
 // startGroup spawns `sh` in its own process group (never this test
@@ -159,7 +229,7 @@ func TestFreezeStopsTheWholeProcessGroup(t *testing.T) {
 		t.Fatalf("child %d process group = %d (%v), want the leader %d", child, pg, err, leader)
 	}
 	self, _ := os.Executable()
-	f, err := Freeze(self, leader, st)
+	f, err := Freeze(self, leader, st, PaneRef{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +311,7 @@ func TestForegroundGroupTracksTheShell(t *testing.T) {
 		t.Fatal(err)
 	}
 	self, _ := os.Executable()
-	f, err := Freeze(self, job, st)
+	f, err := Freeze(self, job, st, PaneRef{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +354,7 @@ func waitForeground(t *testing.T, pid, want int) {
 func TestFreezerWarningsSurfaceOnTheSuccessPath(t *testing.T) {
 	pid, st := startSleep(t)
 	self, _ := os.Executable()
-	f, err := Freeze(self, pid, st)
+	f, err := Freeze(self, pid, st, PaneRef{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -176,7 +176,7 @@ var plan02Ops = map[string]handler{
 		if err != nil {
 			return nil, err
 		}
-		return Empty{}, ep.Freeze(ctx, a.PID, a.StartTime)
+		return Empty{}, ep.Freeze(ctx, a.PID, a.StartTime, a.Ref)
 	},
 	OpThaw: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {
 		a, err := decode[ThawArgs](args)

@@ -55,7 +55,10 @@ type Endpoint interface {
 	RemoveJob(ctx context.Context, jobID string) error
 
 	// processes and panes
-	Freeze(ctx context.Context, pid int, startTime string) error
+	// Freeze SIGSTOPs pid; ref is the pane it runs in (nil when not in
+	// tmux), which the freezer needs to hand the terminal back itself if
+	// the caller dies (R-P3-F1).
+	Freeze(ctx context.Context, pid int, startTime string, ref *session.TmuxRef) error
 	Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error
 	Capture(ctx context.Context, ref *session.TmuxRef, jobID string) error
 	OpenWindow(ctx context.Context, p *tmuxx.Plan) (*session.TmuxRef, error)

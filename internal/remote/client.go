@@ -359,8 +359,8 @@ func (c *Client) GitAttach(ctx context.Context, plan *gitx.Plan, jobID string) e
 	return c.call(ctx, OpGitAttach, GitAttachArgs{Plan: plan, JobID: jobID}, nil)
 }
 
-func (c *Client) Freeze(ctx context.Context, pid int, startTime string) error {
-	return c.call(ctx, OpFreeze, FreezeArgs{PID: pid, StartTime: startTime}, nil)
+func (c *Client) Freeze(ctx context.Context, pid int, startTime string, ref *session.TmuxRef) error {
+	return c.call(ctx, OpFreeze, FreezeArgs{PID: pid, StartTime: startTime, Ref: ref}, nil)
 }
 
 func (c *Client) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {

@@ -128,6 +128,10 @@ type GitAttachArgs struct {
 type FreezeArgs struct {
 	PID       int    `json:"pid"`
 	StartTime string `json:"start_time"`
+	// Ref is the pane the frozen process runs in, when it is in tmux, so
+	// the freezer helper can restore the pane's foreground on its own if
+	// its owner dies (see Local.Freeze).
+	Ref *session.TmuxRef `json:"ref,omitempty"`
 }
 type ThawArgs struct {
 	PID int `json:"pid"`
