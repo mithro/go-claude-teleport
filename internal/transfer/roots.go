@@ -201,3 +201,48 @@ func firstComponentDotted(home, dir string) (bool, error) {
 	}
 	return strings.HasPrefix(first, "."), nil
 }
+
+// ResolveRealPath resolves path's longest existing prefix with
+// EvalSymlinks and rejoins what does not exist yet — where a write to
+// path would REALLY land. Exported for internal/remote, which must apply
+// the same reasoning to the destination paths a git plan names before
+// handing it to gitx.Attach (ruling R-P3-B1f N1).
+func ResolveRealPath(path string) (string, error) { return resolveExisting(path) }
+
+// CheckDestDir applies the destination's Root containment rules to dir —
+// resolved under $HOME, not $HOME itself, outside the config dir and the
+// data dir, no dot-prefixed first path component — and returns a
+// *RefusalError naming dir and the reason when it does not hold.
+func CheckDestDir(p session.Paths, dir string) error {
+	rp, err := resolvePaths(p)
+	if err != nil {
+		return err
+	}
+	res, err := resolveExisting(dir)
+	if err != nil {
+		return Refuse(dir, "resolve: %v", err)
+	}
+	reason, err := rp.rootReason(res)
+	if err != nil {
+		return err
+	}
+	if reason != "" {
+		return Refuse(dir, "%s", reason)
+	}
+	return nil
+}
+
+// JobCreatedRoot reports whether dir is one of the roots THIS job's own
+// install created on this host (jobs/<id>/roots.json), comparing resolved
+// paths.
+func JobCreatedRoot(p session.Paths, jobID, dir string) (bool, error) {
+	recorded, err := loadJobRoots(p.DataDir, jobID)
+	if err != nil {
+		return false, err
+	}
+	res, err := resolveExisting(dir)
+	if err != nil {
+		return false, Refuse(dir, "resolve: %v", err)
+	}
+	return recorded[res], nil
+}

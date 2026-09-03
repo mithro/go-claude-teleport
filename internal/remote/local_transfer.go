@@ -101,10 +101,11 @@ func (l *Local) RemoveJob(ctx context.Context, jobID string) error {
 }
 
 // DeleteInstalled removes the manifest entries named by ids from this
-// host's filesystem when their current content still matches the
-// manifest's hash (transfer.UninstallIDs) — the destination side of
-// `abandon --delete-destination-files`, manifest-bounded exactly like
-// Install/Uninstall.
+// host's filesystem — the destination side of `abandon
+// --delete-destination-files`. The manifest and ids only ever NARROW what
+// goes: the licence to delete anything at all comes from this host's own
+// jobs/<id>/installed.json, written by the Install that placed it, and the
+// content must still match what was placed (ruling R-P3-B1f N3).
 func (l *Local) DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids []int) ([]string, error) {
 	// The job id here names no directory (deletion is bounded by the
 	// manifest's own entries), but a manifest that carries one at all

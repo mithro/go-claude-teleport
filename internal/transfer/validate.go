@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
@@ -23,6 +24,12 @@ type Refusal struct {
 }
 
 func (r Refusal) String() string {
+	if r.ID < 0 {
+		if r.Dst == "" {
+			return "refused: " + r.Reason
+		}
+		return fmt.Sprintf("refused: %s: %s", r.Dst, r.Reason)
+	}
 	return fmt.Sprintf("refused: entry %d %s (category %q): %s", r.ID, r.Dst, r.Category, r.Reason)
 }
 
@@ -40,6 +47,12 @@ func (e *RefusalError) Error() string {
 		fmt.Fprintf(&b, "\n  %s", r)
 	}
 	return b.String()
+}
+
+// Refuse builds a refusal for something that is not a manifest entry — a
+// destination path a git plan named, say. dst may be empty.
+func Refuse(dst, format string, a ...any) *RefusalError {
+	return &RefusalError{Refusals: []Refusal{{ID: -1, Dst: dst, Reason: fmt.Sprintf(format, a...)}}}
 }
 
 // IsRefusal reports whether err is (or wraps) a RefusalError — the one
@@ -99,17 +112,39 @@ type validator struct {
 	captureDst               string
 	captureErr               error
 
-	recorded map[string]bool   // roots.json: roots THIS job created
+	recorded map[string]bool   // roots.json: RESOLVED roots THIS job created
+	pending  map[string]bool   // resolved roots this pass will claim (N5)
 	rootRes  map[string]string // declared root -> resolved path
 	rootBad  map[string]string // declared root -> refusal reason ("" = fine)
+
+	// claimedCwds is Munge(cwd) for every destination cwd the manifest's
+	// OWN session entries claim: a CatSession Dst under
+	// <ConfigDir>/projects/<munged>/… is the session saying "I ran in the
+	// directory that munges to <munged>". Root.MayPreExist is honoured
+	// only for a root the session claims this way (ruling R-P3-B1f N2).
+	claimedCwds map[string]bool
+
+	// placed accumulates what Install actually wrote, for
+	// jobs/<id>/installed.json — the ONLY thing a later Uninstall/
+	// DeleteInstalled may remove (ruling R-P3-B1f N3).
+	placed []installedRecord
 }
 
 func newValidator(m *Manifest, p session.Paths, mode validatorMode) (*validator, error) {
 	v := &validator{
 		p: p, jobID: m.JobID, roots: m.Roots, mode: mode,
-		recorded: map[string]bool{},
-		rootRes:  map[string]string{},
-		rootBad:  map[string]string{},
+		recorded:    map[string]bool{},
+		pending:     map[string]bool{},
+		rootRes:     map[string]string{},
+		rootBad:     map[string]string{},
+		claimedCwds: manifestClaimedCwds(m, p),
+	}
+	// Every provenance record this validator consults or writes lives
+	// under jobs/<id>/, so a manifest that does not name a usable job is
+	// refused outright: the destination could neither attribute an
+	// install to a job nor, later, justify a deletion by it.
+	if err := job.ValidateID(m.JobID); err != nil {
+		return nil, Refuse("", "manifest job id %q is not usable on this host: %v", m.JobID, err)
 	}
 	var err error
 	if v.home, err = resolveExisting(p.Home); err != nil {
@@ -122,12 +157,39 @@ func newValidator(m *Manifest, p session.Paths, mode validatorMode) (*validator,
 		return nil, fmt.Errorf("resolve data dir %s: %w", p.DataDir, err)
 	}
 	v.captureDst, v.captureErr = canonicalCaptureDst(p.DataDir, m.JobID)
-	if mode != modeUninstall {
-		if v.recorded, err = loadJobRoots(p.DataDir, m.JobID); err != nil {
-			return nil, err
-		}
+	// roots.json is read in every mode: R-P3-B1f applies the Root rules to
+	// Uninstall too, and there the record is what makes this job's own
+	// (by then legitimately non-empty) roots acceptable.
+	if v.recorded, err = loadJobRoots(p.DataDir, m.JobID); err != nil {
+		return nil, err
 	}
 	return v, nil
+}
+
+// manifestClaimedCwds collects Munge(cwd) for every destination cwd the
+// manifest's own CatSession entries claim (see validator.claimedCwds).
+func manifestClaimedCwds(m *Manifest, p session.Paths) map[string]bool {
+	out := map[string]bool{}
+	projects := filepath.Clean(p.ProjectsDir())
+	for _, e := range m.Entries {
+		if e.Category != session.CatSession {
+			continue
+		}
+		dst := filepath.Clean(e.Dst)
+		if !underDir(dst, projects) || dst == projects {
+			continue
+		}
+		rel, err := filepath.Rel(projects, dst)
+		if err != nil {
+			continue
+		}
+		first := rel
+		if i := strings.IndexRune(rel, filepath.Separator); i >= 0 {
+			first = rel[:i]
+		}
+		out[first] = true
+	}
+	return out
 }
 
 func refusalOf(e Entry, format string, a ...any) *RefusalError {
@@ -229,9 +291,6 @@ func (v *validator) checkGit(e Entry, dst string) error {
 		// rule can or should apply to it.
 		return nil
 	}
-	if v.mode == modeUninstall {
-		return nil
-	}
 	root, ok := entryRoot(dst, v.roots)
 	if !ok {
 		return refusalOf(e, "is not under any root this manifest declared")
@@ -254,29 +313,63 @@ func (v *validator) checkGit(e Entry, dst string) error {
 	if err := v.checkSymlinkTarget(e, dst, filepath.Clean(root.Path), "root"); err != nil {
 		return err
 	}
-	// Provenance (item 3). A directory entry is "ensure this directory
-	// exists" — it writes no content, and existing-main's untracked
-	// directories legitimately land inside the destination's own
-	// pre-existing checkout — so it never needs the Root to be this job's.
-	// Everything that carries CONTENT does.
-	if v.recorded[filepath.Clean(root.Path)] || root.MayPreExist {
+	// Provenance (R-P3-B1e item 3, keyed on the RESOLVED root per B1f N4).
+	//
+	// A directory entry is "ensure this directory exists" — it writes no
+	// content, and existing-main's untracked directories legitimately land
+	// inside the destination's own pre-existing checkout — so it never
+	// needs the Root to be this job's. Everything that carries CONTENT
+	// does. Residual, accepted (B1e/B1f N6): a manifest may therefore
+	// create empty directory trees anywhere its declared, rule-passing
+	// Roots reach — inside an existing checkout for existing-main, inside
+	// a root of its own making otherwise. No content, no overwrite, and
+	// Uninstall removes only the directories this job itself created.
+	if v.recorded[resRoot] || v.pending[resRoot] {
 		return nil
 	}
-	_, statErr := os.Lstat(root.Path)
+	fi, statErr := os.Lstat(root.Path)
 	switch {
 	case errors.Is(statErr, os.ErrNotExist):
+		// Claimed only if the WHOLE validation pass succeeds (B1f N5) —
+		// commitClaims writes roots.json, still before any placement.
 		if v.mode == modeInstall {
-			if err := recordJobRoot(v.p.DataDir, v.jobID, v.recorded, root.Path); err != nil {
-				return err
-			}
+			v.pending[resRoot] = true
 		}
 		return nil
 	case statErr != nil:
 		return refusalOf(e, "root %s: %v", root.Path, statErr)
+	case root.MayPreExist:
+		// not-a-repo mode's destination cwd. The bit alone is a SOURCE
+		// claim, so the destination corroborates it (B1f N2): the root
+		// must really be a directory already, and the manifest's own
+		// session entries must place this session's transcript under
+		// projects/<Munge(root)> — i.e. the session it is transporting
+		// says it ran there. Ledgered residual: the destination trusts
+		// the session's declared cwd as the driver's choice.
+		if !fi.IsDir() {
+			return refusalOf(e, "root %s exists and is not a directory", root.Path)
+		}
+		if !v.claimedCwds[session.Munge(filepath.Clean(root.Path))] && !v.claimedCwds[session.Munge(resRoot)] {
+			return refusalOf(e, "root %s may pre-exist only as this session's own destination cwd, and no session file in this manifest claims it", root.Path)
+		}
+		return nil
 	case e.IsDir():
 		return nil
 	}
 	return refusalOf(e, "root %s already exists and was not created by this job", root.Path)
+}
+
+// commitClaims records the roots this pass found absent — after every
+// entry validated, and still before anything is placed (ruling R-P3-B1f
+// N5: a manifest that is refused must leave no claim behind).
+func (v *validator) commitClaims() error {
+	for root := range v.pending {
+		if err := recordJobRoot(v.p.DataDir, v.jobID, v.recorded, root); err != nil {
+			return err
+		}
+		delete(v.pending, root)
+	}
+	return nil
 }
 
 // checkSymlinkTarget is ruling R-P3-B1e item 2a: a manifest symlink may
@@ -362,6 +455,39 @@ func (v *validator) checkPlacement(e Entry) error {
 	return nil
 }
 
+// symlinkBoundary is the DECLARED (unresolved) directory a symlink entry's
+// target must stay inside — the same one check used in pass 1.
+func (v *validator) symlinkBoundary(e Entry) (boundary, what string, ok bool, err error) {
+	switch {
+	case e.Category == session.CatSession:
+		return filepath.Clean(v.p.ConfigDir), "config dir", true, nil
+	case gitRootCategory(e.Category) && !e.Deferred:
+		root, found := entryRoot(filepath.Clean(e.Dst), v.roots)
+		if !found {
+			return "", "", false, refusalOf(e, "is not under any root this manifest declared")
+		}
+		return filepath.Clean(root.Path), "root", true, nil
+	}
+	return "", "", false, nil
+}
+
+// recheckBeforePlacement is the guard Install runs immediately before every
+// single placement. It repeats the two checks whose ANSWER CAN CHANGE while
+// a manifest is being installed, because an earlier entry of the same
+// manifest may have created a symlink since pass 1: where this entry really
+// lands (checkPlacement) and, for a symlink entry, where its target really
+// points (ruling R-P3-B1f N7).
+func (v *validator) recheckBeforePlacement(e Entry) error {
+	if err := v.checkPlacement(e); err != nil {
+		return err
+	}
+	boundary, what, ok, err := v.symlinkBoundary(e)
+	if err != nil || !ok {
+		return err
+	}
+	return v.checkSymlinkTarget(e, filepath.Clean(e.Dst), boundary, what)
+}
+
 // resolvedRoot resolves (and memoizes) one declared root.
 func (v *validator) resolvedRoot(root Root) (string, error) {
 	if res, ok := v.rootRes[root.Path]; ok {
@@ -375,9 +501,50 @@ func (v *validator) resolvedRoot(root Root) (string, error) {
 	return res, nil
 }
 
-// rootReason returns "" if root is a legitimate boundary for
-// CatRepo/CatWorktree content, else why it is not — judged on the REAL
-// path (ruling R-P3-B1e item 2c), memoized per root.
+// resolvedPaths holds the destination's own boundaries, resolved once.
+type resolvedPaths struct{ home, configDir, dataDir string }
+
+func resolvePaths(p session.Paths) (resolvedPaths, error) {
+	var rp resolvedPaths
+	var err error
+	if rp.home, err = resolveExisting(p.Home); err != nil {
+		return rp, fmt.Errorf("resolve home %s: %w", p.Home, err)
+	}
+	if rp.configDir, err = resolveExisting(p.ConfigDir); err != nil {
+		return rp, fmt.Errorf("resolve config dir %s: %w", p.ConfigDir, err)
+	}
+	if rp.dataDir, err = resolveExisting(p.DataDir); err != nil {
+		return rp, fmt.Errorf("resolve data dir %s: %w", p.DataDir, err)
+	}
+	return rp, nil
+}
+
+// rootReason returns "" if the already-resolved res is a legitimate
+// boundary for a destination write this manifest (or a git plan) directs
+// there, else why it is not — judged on the REAL path (ruling R-P3-B1e
+// item 2c).
+func (rp resolvedPaths) rootReason(res string) (string, error) {
+	switch {
+	case !underDir(res, rp.home):
+		return fmt.Sprintf("resolves to %s, which is not under home %s", res, rp.home), nil
+	case res == rp.home:
+		return "is $HOME itself", nil
+	case underDir(res, rp.configDir):
+		return fmt.Sprintf("resolves to %s, inside the config dir %s", res, rp.configDir), nil
+	case underDir(res, rp.dataDir):
+		return fmt.Sprintf("resolves to %s, inside the data dir %s", res, rp.dataDir), nil
+	}
+	dotted, err := firstComponentDotted(rp.home, res)
+	if err != nil {
+		return "", err
+	}
+	if dotted {
+		return fmt.Sprintf("resolves to %s, whose first path component under home is dot-prefixed", res), nil
+	}
+	return "", nil
+}
+
+// rootReason is the same check for one declared Root, memoized.
 func (v *validator) rootReason(root Root) (string, error) {
 	if reason, ok := v.rootBad[root.Path]; ok {
 		return reason, nil
@@ -386,24 +553,9 @@ func (v *validator) rootReason(root Root) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	reason := ""
-	switch {
-	case !underDir(res, v.home):
-		reason = fmt.Sprintf("resolves to %s, which is not under home %s", res, v.home)
-	case res == v.home:
-		reason = "is $HOME itself"
-	case underDir(res, v.configDir):
-		reason = fmt.Sprintf("resolves to %s, inside the config dir %s", res, v.configDir)
-	case underDir(res, v.dataDir):
-		reason = fmt.Sprintf("resolves to %s, inside the data dir %s", res, v.dataDir)
-	default:
-		dotted, derr := firstComponentDotted(v.home, res)
-		if derr != nil {
-			return "", derr
-		}
-		if dotted {
-			reason = fmt.Sprintf("resolves to %s, whose first path component under home is dot-prefixed", res)
-		}
+	reason, err := resolvedPaths{home: v.home, configDir: v.configDir, dataDir: v.dataDir}.rootReason(res)
+	if err != nil {
+		return "", err
 	}
 	v.rootBad[root.Path] = reason
 	return reason, nil

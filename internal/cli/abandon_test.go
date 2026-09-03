@@ -144,9 +144,6 @@ func TestAbandonDeletesInstalledFilesOnRemoteDestination(t *testing.T) {
 	}
 	gone := filepath.Join(dir, "gone.jsonl")
 	kept := filepath.Join(dir, "kept.jsonl")
-	if err := os.WriteFile(gone, []byte("gone\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.WriteFile(kept, []byte("kept\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -155,6 +152,28 @@ func TestAbandonDeletesInstalledFilesOnRemoteDestination(t *testing.T) {
 		{ID: 1, Category: session.CatSession, Dst: gone, Size: 5, Mode: 0o600, SHA256: shaOf("gone\n")},
 		{ID: 2, Category: session.CatSession, Dst: kept, Size: 5, Mode: 0o600, SHA256: shaOf("kept\n")},
 	}}
+
+	// gone.jsonl is placed by a REAL install on the destination, which is
+	// also what writes the destination's own jobs/<id>/installed.json —
+	// the record ruling R-P3-B1f N3 makes the only licence to delete
+	// anything later. kept.jsonl (present-same, never installed by this
+	// job) is deliberately not in it, even though its content matches the
+	// manifest hash too.
+	if err := os.WriteFile(transfer.StagedPath(staging, 1), []byte("gone\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dstPaths := session.Paths{Home: remoteHome, ConfigDir: filepath.Join(remoteHome, ".claude"),
+		GlobalJSON: filepath.Join(remoteHome, ".claude.json"), DataDir: remoteDataDir}
+	st, err := transfer.Diff(context.Background(), m, staging, dstPaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := transfer.Install(context.Background(), m, st, staging, dstPaths, transfer.InstallExtras{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(gone); err != nil {
+		t.Fatalf("test setup: install did not place %s: %v", gone, err)
+	}
 
 	localDataDir := filepath.Join(localHome, ".local", "share", "claude-teleport")
 	j, err := job.New(localDataDir, tsid)

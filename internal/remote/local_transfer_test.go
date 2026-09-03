@@ -37,11 +37,33 @@ func TestLocalDeleteInstalledOnlyNamedIDs(t *testing.T) {
 		t.Fatal(err)
 	}
 	sha := func(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
-	m := &transfer.Manifest{Version: 1, Entries: []transfer.Entry{
+	m := &transfer.Manifest{Version: 1, JobID: sid, SessionID: sid, Entries: []transfer.Entry{
 		{ID: 0, Category: session.CatSession, Dst: dir, Mode: uint32(os.ModeDir | 0o700)},
 		{ID: 1, Category: session.CatSession, Dst: keep, Size: 5, Mode: 0o600, SHA256: sha("keep\n")},
 		{ID: 2, Category: session.CatSession, Dst: gone, Size: 5, Mode: 0o600, SHA256: sha("gone\n")},
 	}}
+	// Both files must have been installed BY THIS JOB for deletion to be
+	// possible at all (ruling R-P3-B1f N3), so the fixture installs them
+	// for real — writing the destination's own jobs/<id>/installed.json —
+	// instead of just dropping matching bytes on disk.
+	staging := job.StagingDir(p.DataDir, sid)
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for id, content := range map[int]string{1: "keep\n", 2: "gone\n"} {
+		if err := os.WriteFile(transfer.StagedPath(staging, id), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(keep); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Install(context.Background(), m, sid); err != nil {
+		t.Fatal(err)
+	}
 	deleted, err := l.DeleteInstalled(context.Background(), m, []int{2})
 	if err != nil {
 		t.Fatal(err)

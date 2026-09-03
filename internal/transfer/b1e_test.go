@@ -270,9 +270,16 @@ func TestInstallAcceptsAPrePopulatedNotARepoRoot(t *testing.T) {
 	writeFile(t, unrelated, existing)
 	content := "package main\n"
 	size, sum := stageFile(t, staging, 0, content)
+	// The session's own transcript, which is what tells the destination
+	// this root really is the cwd the session ran in (ruling R-P3-B1f N2).
+	transcript := `{"type":"user","sessionId":"` + sid + `"}` + "\n"
+	stageFile(t, staging, 1, transcript)
 	m := &Manifest{Version: 1, JobID: pocJobID, SessionID: sid,
-		Roots:   []Root{{Path: root, MayPreExist: true}},
-		Entries: []Entry{{ID: 0, Category: session.CatWorktree, Dst: filepath.Join(root, "main.go"), Size: size, Mode: 0o644, SHA256: sum}},
+		Roots: []Root{{Path: root, MayPreExist: true}},
+		Entries: []Entry{
+			{ID: 0, Category: session.CatWorktree, Dst: filepath.Join(root, "main.go"), Size: size, Mode: 0o644, SHA256: sum},
+			sessionEntryFor(1, p, root, transcript),
+		},
 	}
 	if err := installOrRefuse(t, m, staging, p); err != nil {
 		t.Fatalf("not-a-repo install: %v", err)

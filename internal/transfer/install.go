@@ -111,6 +111,31 @@ func moveFile(src, dst string) error {
 	return os.Remove(src)
 }
 
+// place performs one placement under the destination's own final guards:
+// the entry is re-validated (R-P3-B1f N7), the directories the placement is
+// about to create are noted, the placement happens, and what it wrote is
+// recorded for jobs/<id>/installed.json (N3). fileOnly is the
+// fast-forward/force path, which only ever replaces a regular file.
+func (v *validator) place(stagingDir string, e Entry, fileOnly bool) error {
+	if err := v.recheckBeforePlacement(e); err != nil {
+		return err
+	}
+	parent := filepath.Dir(filepath.Clean(e.Dst))
+	if e.IsDir() && !fileOnly {
+		parent = filepath.Clean(e.Dst) // MkdirAll creates the entry itself too
+	}
+	created := absentAncestors(parent)
+	place := placeEntry
+	if fileOnly {
+		place = placeFile
+	}
+	if err := place(stagingDir, e); err != nil {
+		return err
+	}
+	v.recordPlaced(e, created)
+	return nil
+}
+
 func dropStaged(stagingDir string, e Entry) {
 	base := StagedPath(stagingDir, e.ID)
 	os.Remove(base)
@@ -186,28 +211,43 @@ func checkForceOverwrite(m *Manifest, e Entry, force bool) error {
 	return nil
 }
 
-// Install moves staged entries into place per spec §7.5 and performs the merges.
+// Install moves staged entries into place per spec §7.5 and performs the
+// merges. Whatever it actually places is recorded in
+// jobs/<id>/installed.json before it returns — on the failure paths too —
+// because that record, not the manifest, is what a later Uninstall/
+// DeleteInstalled is allowed to remove (ruling R-P3-B1f N3).
 func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir string, p session.Paths, extra InstallExtras) (*InstallReport, error) {
 	rep := &InstallReport{}
-	// Defense-in-depth destination re-check, before anything is touched.
-	// modeInstall also CLAIMS every root this job finds absent, recording
-	// it in jobs/<id>/roots.json before a single file lands under it, so
-	// this job's own later re-runs (verifyInstall's re-diff, a resumed
-	// job) still recognise the now-populated root as their own while a
-	// root somebody else populated stays refused.
 	v, err := newValidator(m, p, modeInstall)
 	if err != nil {
 		return rep, err
 	}
+	err = install(ctx, m, st, stagingDir, extra, rep, v)
+	if ferr := v.flushInstalled(); ferr != nil && err == nil {
+		err = ferr
+	}
+	return rep, err
+}
+
+func install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir string, extra InstallExtras, rep *InstallReport, v *validator) error {
+	p := v.p
+	// Defense-in-depth destination re-check, before anything is touched.
 	for _, e := range m.Entries {
 		if err := v.check(e); err != nil {
-			return rep, err
+			return err
 		}
 	}
 	for _, e := range extra.Memory {
 		if err := v.check(e); err != nil {
-			return rep, err
+			return err
 		}
+	}
+	// Only now — the whole manifest validated, still before any placement
+	// — are the roots this job found absent claimed in jobs/<id>/roots.json
+	// (ruling R-P3-B1f N5), so a refused manifest leaves no claim behind
+	// while this job's own later re-runs still recognise what it created.
+	if err := v.commitClaims(); err != nil {
+		return err
 	}
 	// Second half of the same destination-side re-check (B1): the plain
 	// file-install path handles exactly one Deferred category, the pane
@@ -218,7 +258,7 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 	// touching anything.
 	for _, e := range append(append([]Entry(nil), m.Entries...), extra.Memory...) {
 		if e.Deferred && e.Category != session.CatCapture {
-			return rep, fmt.Errorf("refusing deferred entry: %s has category %q; only %q entries are installed by this path", e.Dst, e.Category, session.CatCapture)
+			return fmt.Errorf("refusing deferred entry: %s has category %q; only %q entries are installed by this path", e.Dst, e.Category, session.CatCapture)
 		}
 	}
 	memory := map[int]bool{}
@@ -228,25 +268,22 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 		// hand-built Entry that merely resembles one.
 		me, ok := m.ByID(e.ID)
 		if !ok || me.Dst != e.Dst {
-			return rep, fmt.Errorf("install memory %s: id %d is not a manifest entry with this Dst (extra.Memory must be rows of the manifest passed to Install)", e.Dst, e.ID)
+			return fmt.Errorf("install memory %s: id %d is not a manifest entry with this Dst (extra.Memory must be rows of the manifest passed to Install)", e.Dst, e.ID)
 		}
 		memory[e.ID] = true
 	}
 	installed := map[string]bool{}
 	for _, e := range m.Entries {
 		if err := ctx.Err(); err != nil {
-			return rep, err
+			return err
 		}
 		if memory[e.ID] {
 			continue
 		}
 		switch st[e.ID] {
 		case StagedSame:
-			if err := v.checkPlacement(e); err != nil {
-				return rep, err
-			}
-			if err := placeEntry(stagingDir, e); err != nil {
-				return rep, err
+			if err := v.place(stagingDir, e, false); err != nil {
+				return err
 			}
 			rep.Installed++
 			installed[e.Dst] = true
@@ -257,7 +294,7 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 		case FFCandidate:
 			staged := StagedPath(stagingDir, e.ID)
 			if _, err := os.Stat(staged); err != nil {
-				return rep, fmt.Errorf("install %s: ff-candidate but nothing staged: %w", e.Dst, err)
+				return fmt.Errorf("install %s: ff-candidate but nothing staged: %w", e.Dst, err)
 			}
 			// Authoritative re-check immediately before the only permitted
 			// overwrite (controller ruling 1): reuse Task 11's ffPrefixCheck
@@ -265,16 +302,13 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			// for .jsonl transcripts, byte-prefix otherwise.
 			ok, err := ffPrefixCheck(e.Dst, staged)
 			if err != nil {
-				return rep, fmt.Errorf("install %s: prefix check: %w", e.Dst, err)
+				return fmt.Errorf("install %s: prefix check: %w", e.Dst, err)
 			}
 			if !ok {
-				return rep, fmt.Errorf("install %s: existing file is not a prefix of the incoming one (present-different)", e.Dst)
+				return fmt.Errorf("install %s: existing file is not a prefix of the incoming one (present-different)", e.Dst)
 			}
-			if err := v.checkPlacement(e); err != nil {
-				return rep, err
-			}
-			if err := placeFile(stagingDir, e); err != nil {
-				return rep, err
+			if err := v.place(stagingDir, e, true); err != nil {
+				return err
 			}
 			rep.FastForwarded++
 			installed[e.Dst] = true
@@ -287,40 +321,34 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			// session ownership re-derived from Dst itself rather than
 			// trusted from the source-computed FFAllowed flag.
 			if err := checkForceOverwrite(m, e, extra.Force); err != nil {
-				return rep, err
+				return err
 			}
 			staged := StagedPath(stagingDir, e.ID)
 			sum, _, err := HashFile(staged)
 			if err != nil {
-				return rep, fmt.Errorf("install %s: force overwrite: %w", e.Dst, err)
+				return fmt.Errorf("install %s: force overwrite: %w", e.Dst, err)
 			}
 			if sum != e.SHA256 {
-				return rep, fmt.Errorf("install %s: force overwrite: staged copy does not match the manifest hash", e.Dst)
+				return fmt.Errorf("install %s: force overwrite: staged copy does not match the manifest hash", e.Dst)
 			}
 			if err := os.Remove(e.Dst); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return rep, fmt.Errorf("install %s: force overwrite: %w", e.Dst, err)
+				return fmt.Errorf("install %s: force overwrite: %w", e.Dst, err)
 			}
-			if err := v.checkPlacement(e); err != nil {
-				return rep, err
-			}
-			if err := placeFile(stagingDir, e); err != nil {
-				return rep, err
+			if err := v.place(stagingDir, e, true); err != nil {
+				return err
 			}
 			rep.ForceOverwritten++
 			installed[e.Dst] = true
 		default:
-			return rep, fmt.Errorf("install %s: status %s — refusing (nothing after this entry was touched)", e.Dst, st[e.ID])
+			return fmt.Errorf("install %s: status %s — refusing (nothing after this entry was touched)", e.Dst, st[e.ID])
 		}
 	}
 
 	for _, e := range extra.Memory {
 		switch st[e.ID] {
 		case StagedSame:
-			if err := v.checkPlacement(e); err != nil {
-				return rep, err
-			}
-			if err := placeEntry(stagingDir, e); err != nil {
-				return rep, err
+			if err := v.place(stagingDir, e, false); err != nil {
+				return err
 			}
 			// Memory files (CLAUDE.md etc.) are the user's own documents,
 			// not manifest entries abandon ever deletes: MemoryCopied is
@@ -330,7 +358,7 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 		case PresentSame:
 			dropStaged(stagingDir, e)
 		case Absent, StagedMismatch:
-			return rep, fmt.Errorf("install memory %s: status %s (not staged)", e.Dst, st[e.ID])
+			return fmt.Errorf("install memory %s: status %s (not staged)", e.Dst, st[e.ID])
 		default:
 			rep.MemoryDiffers = append(rep.MemoryDiffers, e.Dst)
 			dropStaged(stagingDir, e)
@@ -345,38 +373,49 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			}
 		}
 		if err := session.MergeIndexEntry(p.ProjectDir(extra.ProjectCwd), ie); err != nil {
-			return rep, fmt.Errorf("merge sessions-index: %w", err)
+			return fmt.Errorf("merge sessions-index: %w", err)
 		}
 		rep.IndexMerged = 1
 	}
 	if len(extra.History) > 0 {
 		n, err := session.AppendHistory(p.HistoryFile(), extra.History)
 		if err != nil {
-			return rep, fmt.Errorf("append history: %w", err)
+			return fmt.Errorf("append history: %w", err)
 		}
 		rep.HistoryAdded = n
 	}
 	if extra.ProjectEntry != nil {
 		added, err := session.AddProjectEntry(p.GlobalJSON, extra.ProjectCwd, extra.ProjectEntry)
 		if err != nil {
-			return rep, fmt.Errorf("add project entry: %w", err)
+			return fmt.Errorf("add project entry: %w", err)
 		}
 		rep.ProjectEntryAdded = added
 	}
-	return rep, nil
+	return nil
 }
 
-// Uninstall removes manifest-listed installed files whose current content
-// still matches the manifest (for `abandon --delete-destination-files`), then
-// removes directories the install emptied. Every entry is re-checked against
-// p with the same defense-in-depth validator as Install (modeUninstall: the
-// Root rules are meaningless here — Uninstall only ever removes content
-// some earlier Install call already placed and hash-verifies each one
-// before removing it, and it also legitimately processes existing-main's
-// Deferred dirty entries, whose Root was never this job's), before anything
-// is deleted, so a manifest cannot be used to smuggle a deletion outside
-// the session's own paths.
+// Uninstall removes what THIS job's own Install placed on this host (for
+// `abandon --delete-destination-files`), then removes the directories it
+// created once they are empty.
+//
+// Ruling R-P3-B1f N3: the manifest is a source-supplied wish list, so it
+// can only ever NARROW what is removed — the licence comes from
+// jobs/<id>/installed.json, the record Install wrote as it placed each
+// thing. Content must still match what was placed (hash for a file, target
+// for a symlink), so anything edited since is left alone; a path this job
+// never placed is never touched, whatever the manifest claims about it.
+// Every entry additionally passes the same validator Install ran
+// (modeUninstall: the Root rules apply here too — the job's own roots are
+// recorded in roots.json by then — while nothing is ever claimed).
 func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
+	return uninstall(m, p, nil)
+}
+
+// uninstall is Uninstall with the caller's own exclusions: protected holds
+// destination paths the caller deliberately left out of m (UninstallIDs'
+// unnamed ids), which must not be swept up as "a directory this job
+// created that is now empty" either.
+func uninstall(m *Manifest, p session.Paths, protected map[string]bool) ([]string, error) {
 	v, err := newValidator(m, p, modeUninstall)
 	if err != nil {
 		return nil, err
@@ -386,14 +425,26 @@ func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
 			return nil, err
 		}
 	}
+	installed, err := loadInstalled(p.DataDir, m.JobID)
+	if err != nil {
+		return nil, err
+	}
 	var removed []string
 	var errs []error
 	for _, e := range m.Entries {
+		dst := filepath.Clean(e.Dst)
+		rec, ours := installed[dst]
+		if !ours {
+			continue // this job never placed anything here
+		}
 		switch {
 		case e.IsDir():
 			continue // directories are handled in the pass below
 		case e.IsSymlink():
-			target, err := os.Readlink(e.Dst)
+			if rec.Kind != kindSymlink {
+				continue
+			}
+			target, err := os.Readlink(dst)
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
@@ -401,16 +452,19 @@ func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
 				errs = append(errs, fmt.Errorf("readlink %s: %w", e.Dst, err))
 				continue
 			}
-			if target != e.Symlink {
+			if target != rec.Symlink {
 				continue
 			}
-			if err := os.Remove(e.Dst); err != nil {
+			if err := os.Remove(dst); err != nil {
 				errs = append(errs, fmt.Errorf("remove %s: %w", e.Dst, err))
 				continue
 			}
 			removed = append(removed, e.Dst)
 		default:
-			sum, _, err := HashFile(e.Dst)
+			if rec.Kind != kindFile || rec.SHA256 == "" {
+				continue
+			}
+			sum, _, err := HashFile(dst)
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
@@ -418,10 +472,10 @@ func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
 				errs = append(errs, fmt.Errorf("hash %s: %w", e.Dst, err))
 				continue
 			}
-			if sum != e.SHA256 {
-				continue // differs from the manifest: left in place, not reported
+			if sum != rec.SHA256 {
+				continue // changed since this job installed it: left in place
 			}
-			if err := os.Remove(e.Dst); err != nil {
+			if err := os.Remove(dst); err != nil {
 				errs = append(errs, fmt.Errorf("remove %s: %w", e.Dst, err))
 				continue
 			}
@@ -429,7 +483,7 @@ func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
 		}
 	}
 
-	for _, dir := range impliedDirsDeepestFirst(m) {
+	for _, dir := range createdDirsDeepestFirst(m, installed, protected) {
 		empty, err := dirEmpty(dir)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -455,16 +509,13 @@ func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
 // orchestrate.Plan.InstalledIDs — only files this job itself installed —
 // so a file that merely already existed on the destination with matching
 // content for unrelated reasons is never removed). It reuses Uninstall's
-// containment check (validateDst) and hash verification unchanged.
+// containment check and its installed-record verification unchanged.
 //
-// Ruling M1: a directory entry is a deletion/empty-cleanup candidate ONLY
-// when its own id is in ids — i.e. the job itself created that directory
-// (Install's StagedSame/FFCandidate case, which is exactly what populates
-// InstalledIDs). A pre-existing directory (PresentSame at install time,
-// never in InstalledIDs) must never be removed even if it happens to be
-// empty by the time abandon runs — unlike Uninstall's caller in the
-// "this host is already the destination" path, which legitimately means
-// every manifest dir.
+// Ruling M1 (a pre-existing directory must never be removed even if it is
+// empty by the time abandon runs) no longer depends on which ids the
+// caller passes: Uninstall removes only directories jobs/<id>/installed.
+// json records THIS job as having created (R-P3-B1f N3). ids still narrows
+// the set, as the caller intends.
 func UninstallIDs(m *Manifest, p session.Paths, ids []int) ([]string, error) {
 	want := make(map[int]bool, len(ids))
 	for _, id := range ids {
@@ -476,7 +527,13 @@ func UninstallIDs(m *Manifest, p session.Paths, ids []int) ([]string, error) {
 			sub.Entries = append(sub.Entries, e)
 		}
 	}
-	return Uninstall(sub, p)
+	protected := map[string]bool{}
+	for _, e := range m.Entries {
+		if !want[e.ID] {
+			protected[filepath.Clean(e.Dst)] = true
+		}
+	}
+	return uninstall(sub, p, protected)
 }
 
 func dirEmpty(dir string) (bool, error) {
@@ -487,54 +544,37 @@ func dirEmpty(dir string) (bool, error) {
 	return len(entries) == 0, nil
 }
 
-// impliedDirsDeepestFirst returns every directory the install created,
-// deepest first: each manifest dir entry's Dst (the ones Install explicitly
-// MkdirAll'd), plus every intermediate directory that Install's per-file
-// MkdirAll implicitly created between a manifest dir entry and a file or
-// symlink nested under it (e.g. a "<sid>/subagents/" sidecar tree that has
-// no dir entry of its own, only files under it). A directory that is not
-// itself, or nested under, a manifest dir entry — e.g. a shared "todos/"
-// that this manifest never listed as a directory — is never a candidate,
-// so Uninstall can never remove or even consider a directory the install
-// did not itself establish.
-func impliedDirsDeepestFirst(m *Manifest) []string {
-	var roots []string
-	for _, e := range m.Entries {
-		if e.IsDir() {
-			roots = append(roots, e.Dst)
-		}
-	}
-	rootOf := func(d string) (string, bool) {
-		for _, r := range roots {
-			if d == r || strings.HasPrefix(d, r+string(filepath.Separator)) {
-				return r, true
-			}
-		}
-		return "", false
-	}
-	seen := map[string]bool{}
+// createdDirsDeepestFirst returns the directories THIS job created (as
+// recorded in jobs/<id>/installed.json — manifest directory entries it
+// placed, plus the intermediate directories its per-file MkdirAll had to
+// create) that this manifest is actually about, deepest first.
+//
+// Provenance is the licence (ruling R-P3-B1f N3) and the manifest is the
+// filter: only a recorded directory that is itself, or an ancestor of, one
+// of this (sub)manifest's own entry paths is a candidate. A directory that
+// already existed when Install ran is not in the record at all and can
+// never be removed — which is ruling M1's promise, now enforced by what
+// happened rather than by which ids a caller passed.
+func createdDirsDeepestFirst(m *Manifest, installed map[string]installedRecord, protected map[string]bool) []string {
 	var dirs []string
-	for _, e := range m.Entries {
-		start := e.Dst
-		if !e.IsDir() {
-			start = filepath.Dir(e.Dst)
-		}
-		root, ok := rootOf(start)
-		if !ok {
+	for dir, rec := range installed {
+		if rec.Kind != kindDir || protected[dir] {
 			continue
 		}
-		for d := start; ; d = filepath.Dir(d) {
-			if !seen[d] {
-				seen[d] = true
-				dirs = append(dirs, d)
-			}
-			if d == root {
+		for _, e := range m.Entries {
+			dst := filepath.Clean(e.Dst)
+			if dst == dir || strings.HasPrefix(dst, dir+string(filepath.Separator)) {
+				dirs = append(dirs, dir)
 				break
 			}
 		}
 	}
 	sort.Slice(dirs, func(i, j int) bool {
-		return strings.Count(dirs[i], string(filepath.Separator)) > strings.Count(dirs[j], string(filepath.Separator))
+		di, dj := strings.Count(dirs[i], string(filepath.Separator)), strings.Count(dirs[j], string(filepath.Separator))
+		if di != dj {
+			return di > dj
+		}
+		return dirs[i] < dirs[j]
 	})
 	return dirs
 }
