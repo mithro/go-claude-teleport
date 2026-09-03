@@ -3,18 +3,62 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC: real-claude matrix
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  unit:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: sudo apt-get update && sudo apt-get install -y tmux git
       - run: go vet ./...
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go test -race ./...
+      - run: go test -race -tags tmuxlive ./internal/tmuxx/ ./internal/orchestrate/
       - name: packaging helper tests
         run: python3 -m unittest discover -s packaging -p 'version_test.py' -v
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: test/integration/build.sh
+      - run: go test -tags integration ./test/integration/ -v -timeout 40m
+      - name: container logs on failure
+        if: failure()
+        run: docker compose -f test/integration/docker-compose.yml logs --no-color | tail -n 500
+
+  real-claude:
+    if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    needs: unit
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        claude: ["2.1.247", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: test/integration/build.sh ${{ matrix.claude }}
+      - run: CLAUDE_VERSION=${{ matrix.claude }} go test -tags 'integration realclaude' ./test/integration/ -run TestReal -v -timeout 40m
+      - name: container logs on failure
+        if: failure()
+        run: docker compose -f test/integration/docker-compose.yml -f test/integration/docker-compose.realclaude.yml --profile realclaude logs --no-color | tail -n 500
