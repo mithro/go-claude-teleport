@@ -29,9 +29,10 @@ func HasFailureMarker(text string) (string, bool) {
 	return "", false
 }
 
-// TrustPromptMarkers are substrings of Claude Code's first-run trust
+// TrustPromptMarkers are the phrases of Claude Code's first-run trust
 // dialog ("Quick safety check: Is this a project you created or one you
-// trust? … ❯ No, exit / Yes, I trust this folder"), seen in 2.1.259.
+// trust? … ❯ No, exit / Yes, I trust this folder"), captured verbatim from
+// 2.1.259 in the layer-2 container.
 //
 // It is deliberately NOT a failure marker: a Claude sitting at this dialog
 // resumed fine, it is simply waiting for an answer and writes no registry
@@ -44,15 +45,43 @@ var TrustPromptMarkers = []string{
 	"Yes, I trust this folder",
 }
 
-// HasTrustPrompt returns the first trust-dialog marker found in text.
+// trustNoSelected/trustYesSelected are the dialog's two rendered choices
+// with the selection marker on them, exactly as Claude Code 2.1.259 draws
+// them (U+276F then one space; "❯ No, exit" before an answer, "❯ Yes, I
+// trust this folder" after one Down). Nothing but a real dialog draws
+// these, so either one alone identifies one.
+const (
+	trustNoSelected  = "❯ No, exit"
+	trustYesSelected = "❯ Yes, I trust this folder"
+)
+
+// HasTrustPrompt reports whether text is a trust dialog waiting for an
+// answer, and what identified it.
+//
+// A single phrase is not enough (PR #11 review): a resumed conversation
+// that QUOTES the dialog — a transcript replayed on screen, a user asking
+// what it meant — would otherwise make the confirm step type Down+Enter
+// into a perfectly healthy Claude, or fail a good teleport with the trust
+// advice. So it takes either a rendered selection line, which only the
+// dialog itself draws, or BOTH phrases of the real dialog together.
 func HasTrustPrompt(text string) (string, bool) {
-	for _, m := range TrustPromptMarkers {
-		if strings.Contains(text, m) {
-			return m, true
+	for _, sel := range []string{trustYesSelected, trustNoSelected} {
+		if strings.Contains(text, sel) {
+			return sel, true
 		}
 	}
-	return "", false
+	for _, m := range TrustPromptMarkers {
+		if !strings.Contains(text, m) {
+			return "", false
+		}
+	}
+	return TrustPromptMarkers[0], true
 }
+
+// TrustAnswerSelected reports whether the pane is showing "Yes, I trust
+// this folder" as the SELECTED choice — what a Down keystroke must have
+// achieved before Enter may be pressed (PR #11 review minor 4).
+func TrustAnswerSelected(text string) bool { return strings.Contains(text, trustYesSelected) }
 
 // TrustPromptWaiting opens the ConfirmClaude error raised when the
 // destination is at that dialog and the source carried no accepted trust

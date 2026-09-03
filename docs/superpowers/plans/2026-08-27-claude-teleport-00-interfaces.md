@@ -741,9 +741,10 @@ type InstallExtras struct {
     // ordinary session, and the mapped MAIN repository path when the cwd
     // is a linked git worktree — real Claude Code 2.1.259 keys the entry
     // there, not at the worktree. Install grants it (session.
-    // GrantProjectTrust) before the start step and refuses a TrustCwd that
-    // is not absolute and clean, or that is the destination's own Home,
-    // ConfigDir, DataDir or "/".
+    // GrantProjectTrust) before the start step and refuses a TrustCwd
+    // that is not absolute and clean, that is the destination's own Home,
+    // ConfigDir, DataDir or "/", or that is not a path this manifest
+    // already names (its ProjectCwd or one of its Roots).
     TrustCwd      string `json:"trust_cwd,omitempty"`
     SourceTrusted bool   `json:"source_trusted,omitempty"`
     Memory       []Entry // memory files: copy only if absent

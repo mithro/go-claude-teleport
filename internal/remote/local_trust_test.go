@@ -121,16 +121,29 @@ type trustPane struct {
 	cmds     []string
 	sawDown  bool
 	accepted bool
+	// stuck reproduces a dialog whose selection does NOT move when Down
+	// arrives (a repainted screen, a keystroke that never landed): Enter
+	// would then answer "No, exit" and kill the destination Claude.
+	stuck    bool
 	onAccept func()
 }
 
-const trustDialog = "╭─────────────────────────────────╮\n" +
-	"│ Quick safety check              │\n" +
-	"│ Is this a project you created   │\n" +
-	"│ or one you trust?               │\n" +
-	"│  ❯ No, exit                     │\n" +
-	"│    Yes, I trust this folder     │\n" +
-	"╰─────────────────────────────────╯"
+// trustDialog renders Claude Code 2.1.259's dialog with the selection
+// marker on one of the two choices — the exact spelling captured from the
+// real thing in the layer-2 container ("❯ " then the choice; the other
+// line indented by the same width).
+func trustDialog(yesSelected bool) []string {
+	no, yes := "   No, exit", " ❯ Yes, I trust this folder"
+	if !yesSelected {
+		no, yes = " ❯ No, exit", "   Yes, I trust this folder"
+	}
+	return []string{
+		"Quick safety check: Is this a project you created or one you trust?",
+		"take a moment to review what's in this folder first.",
+		no, yes,
+		"Enter to confirm · Esc to cancel",
+	}
+}
 
 func (p *trustPane) Run(_ context.Context, cmd string) ([]string, error) {
 	p.mu.Lock()
@@ -141,7 +154,7 @@ func (p *trustPane) Run(_ context.Context, cmd string) ([]string, error) {
 		if p.accepted {
 			return []string{"╭─ Welcome to Claude Code ─╮", "> "}, nil
 		}
-		return strings.Split(trustDialog, "\n"), nil
+		return trustDialog(p.sawDown && !p.stuck), nil
 	case strings.HasPrefix(cmd, "send-keys"):
 		switch {
 		case strings.HasSuffix(cmd, " Down"):
@@ -222,5 +235,30 @@ func TestConfirmClaudeFailsWithTrustAdviceWhenTheSourceWasNotTrusted(t *testing.
 	}
 	if got := pane.sent(); len(got) != 0 {
 		t.Errorf("nothing may be typed into the pane without the source's trust; sent %v", got)
+	}
+}
+
+// TestConfirmClaudeDoesNotPressEnterWhenTheSelectionDidNotMove is PR #11
+// review minor 4: the answer is self-validating. Down is only half of it —
+// if the pane still shows "❯ No, exit" afterwards, pressing Enter would
+// answer "No, exit" and kill the destination Claude, so it is not pressed
+// and the failure says which half did not take.
+func TestConfirmClaudeDoesNotPressEnterWhenTheSelectionDidNotMove(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	pane := &trustPane{stuck: true}
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: func(context.Context, string) (tmuxx.Transport, error) { return pane, nil }, Sleep: func(time.Duration) {}, Logf: t.Logf})
+	ref := &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}
+	_, err := l.ConfirmClaude(context.Background(), ref, session.ID(sid), 300*time.Millisecond, true)
+	if err == nil {
+		t.Fatal("ConfirmClaude succeeded with the destination stuck at the trust prompt")
+	}
+	if !strings.Contains(err.Error(), "did not move") {
+		t.Errorf("error %q should say the selection never moved", err)
+	}
+	for _, c := range pane.sent() {
+		if strings.HasSuffix(c, " Enter") {
+			t.Errorf("Enter must not be pressed while \"No, exit\" is selected; sent %v", pane.sent())
+		}
 	}
 }

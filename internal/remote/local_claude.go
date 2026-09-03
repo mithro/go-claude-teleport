@@ -131,6 +131,9 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 	// dialog and no registry entry exists, and a second send after that
 	// could land in a Claude that has meanwhile reached its prompt.
 	answeredTrust := false
+	// trustStuck: the Down keystroke did not move the selection, so Enter
+	// was withheld — reported as the reason this confirm gives up.
+	trustStuck := false
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -189,11 +192,28 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 							return nil, &Error{Code: "internal", Message: err.Error()}
 						}
 						l.opts.Sleep(500 * time.Millisecond)
-						if err := tmuxx.SendKeys(ctx, t, ref.PaneID, "Enter"); err != nil {
+						// Self-validating (PR #11 review): Enter answers
+						// whatever is SELECTED, so it is only pressed once
+						// the pane really shows "Yes, I trust this folder"
+						// selected. If the Down never landed, pressing it
+						// anyway would answer "No, exit" and kill the
+						// destination Claude; the confirm fails instead,
+						// saying which half did not take.
+						screen, err := tmuxx.CaptureScreen(ctx, t, ref.PaneID)
+						if err != nil {
+							return nil, &Error{Code: "internal", Message: err.Error()}
+						}
+						if !TrustAnswerSelected(string(screen)) {
+							trustStuck = true
+							l.opts.Logf("confirm: %s still does not show %q selected after Down; not pressing Enter", tmuxx.RefString(ref), trustYesSelected)
+						} else if err := tmuxx.SendKeys(ctx, t, ref.PaneID, "Enter"); err != nil {
 							return nil, &Error{Code: "internal", Message: err.Error()}
 						}
 					}
 					last = "the destination Claude is answering its trust prompt"
+					if trustStuck {
+						last = fmt.Sprintf("the trust prompt's selection did not move to %q, so it was left unanswered — accept it on %s pane %s and re-run continue", trustYesSelected, l.Hostname, tmuxx.RefString(ref))
+					}
 				}
 			}
 		case wantTmux != "" && reg.Tmux != wantTmux:

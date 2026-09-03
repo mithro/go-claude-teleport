@@ -7,6 +7,7 @@ import (
 	"io"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/gitx"
@@ -170,8 +171,17 @@ func (r *runner) noteDestOwned(ctx context.Context) (map[int]bool, error) {
 	for _, id := range ids {
 		set[id] = true
 	}
-	if len(ids) > 0 && !sameIDs(ids, r.p.DestOwnedIDs) {
-		r.logf("the destination Claude is live in %s: its %d session file(s) are destination-owned and will not be captured, transferred or installed again", tmuxx.RefString(r.p.DestRef), len(ids))
+	// Ownership is a fact about right now, never a latch (PR #11 review):
+	// once the destination Claude has exited, those files are nobody's
+	// live copy again and the ordinary transfer/install must resume — a
+	// stale record here would keep the SOURCE's tar stream refusing to
+	// offer them (runStream subtracts it), dead-ending the transfer.
+	if !sameIDs(ids, r.p.DestOwnedIDs) {
+		if len(ids) > 0 {
+			r.logf("the destination Claude is live in %s: its %d session file(s) are destination-owned and will not be captured, transferred or installed again", tmuxx.RefString(r.p.DestRef), len(ids))
+		} else {
+			r.logf("the destination Claude is no longer live in %s: its %d session file(s) are the source's to transfer again", tmuxx.RefString(r.p.DestRef), len(r.p.DestOwnedIDs))
+		}
 		r.p.DestOwnedIDs = ids
 		if err := r.persist(ctx); err != nil {
 			return nil, err
@@ -647,6 +657,12 @@ func (r *runner) runStart(ctx context.Context) error {
 		r.p.DestRegistry = &session.Registry{SessionID: string(r.id()), Status: "exited"}
 		return r.persist(ctx)
 	}
+	// atTrustPrompt: the pane this job opened is already running the
+	// resumed Claude, stopped at its first-run trust dialog (ruling
+	// R-P3-TRUST-1 item 2). Nothing may be typed over it either way — but
+	// with the source's trust this is not a dead end: ConfirmClaude below
+	// answers the dialog, so start confirms instead of starting again.
+	atTrustPrompt := false
 	if r.p.DestRef != nil {
 		st, err := r.dst.PaneState(ctx, r.p.DestRef)
 		switch {
@@ -655,6 +671,15 @@ func (r *runner) runStart(ctx context.Context) error {
 		case err != nil:
 			return err
 		case !tmuxx.IsShell(st.Command):
+			if _, waiting := remote.HasTrustPrompt(strings.Join(st.Content, "\n")); waiting {
+				if !r.p.sourceTrusted() {
+					return fmt.Errorf("%s on %s pane %s; accept it there, then run claude-teleport continue %s",
+						remote.TrustPromptWaiting, r.p.DestInfo.Hostname, tmuxx.RefString(r.p.DestRef), r.p.JobID)
+				}
+				r.logf("start: %s is already at Claude's trust prompt; confirming (which answers it) rather than typing over it", tmuxx.RefString(r.p.DestRef))
+				atTrustPrompt = true
+				break
+			}
 			return fmt.Errorf("destination pane %s we opened earlier now runs %q; refusing to type over it — wait for that command to finish (or close the pane) and re-run `claude-teleport continue %s`", r.p.DestRef.PaneID, st.Command, r.p.JobID)
 		}
 	}
@@ -674,9 +699,11 @@ func (r *runner) runStart(ctx context.Context) error {
 			return err
 		}
 	}
-	argv := PlaceholderArgv(r.id(), r.captureOnDest(), true, "", "")
-	if err := r.dst.StartClaude(ctx, r.p.DestRef, r.id(), r.p.JobID, argv); err != nil {
-		return err
+	if !atTrustPrompt {
+		argv := PlaceholderArgv(r.id(), r.captureOnDest(), true, "", "")
+		if err := r.dst.StartClaude(ctx, r.p.DestRef, r.id(), r.p.JobID, argv); err != nil {
+			return err
+		}
 	}
 	reg, err := r.dst.ConfirmClaude(ctx, r.p.DestRef, r.id(), r.p.Options.StartTimeout, r.p.sourceTrusted())
 	if err != nil {

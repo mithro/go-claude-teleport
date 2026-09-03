@@ -41,8 +41,21 @@ func TestHasTrustPrompt(t *testing.T) {
 	}{
 		{"╭─ Welcome to Claude Code ─╮\n> ", ""},
 		{"Not logged in · Please run /login", ""},
-		{dialog, "Quick safety check"},
-		{"    Yes, I trust this folder\n", "Yes, I trust this folder"},
+		// The whole dialog: the rendered selection identifies it first.
+		{dialog, trustNoSelected},
+		// Both phrases with no selection on screen (a narrow pane that
+		// wrapped the marker away, say) still identify a dialog.
+		{"Quick safety check: Is this a project you created or one you trust?\n  No, exit\n  Yes, I trust this folder\n", "Quick safety check"},
+		// The rendered selection alone is enough: after Down, real Claude
+		// Code 2.1.259 draws exactly this (verified in the layer-2
+		// container), and the question text may have scrolled.
+		{"   No, exit\n ❯ Yes, I trust this folder\n", trustYesSelected},
+		{" ❯ No, exit\n   Yes, I trust this folder\n", trustNoSelected},
+		// A resumed conversation QUOTING the dialog is not a dialog: one
+		// phrase on its own, with no rendered selection, must never make
+		// the confirm step type Down+Enter into a healthy Claude.
+		{"> remind me what \"Quick safety check\" meant\n", ""},
+		{"assistant: it asks whether you trust the folder — \"Yes, I trust this folder\".\n", ""},
 	}
 	for _, c := range cases {
 		got, ok := HasTrustPrompt(c.text)

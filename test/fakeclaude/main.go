@@ -147,20 +147,26 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// that never resumed — and it is answered by moving the selection down
 	// to "Yes, I trust this folder" and pressing Enter. Enter without Down
 	// selects "No, exit", so that is an exit.
+	//
+	// Like the real thing it REDRAWS when the selection moves, before any
+	// Enter: the tool verifies that "❯ Yes, I trust this folder" is really
+	// selected before it presses Enter (an unmoved selection would make
+	// Enter answer "No, exit" and kill the session). Redrawing needs the
+	// keystroke as it arrives, so the tty goes into raw mode for the
+	// question and is restored immediately after — leaving it raw would
+	// turn the later "/exit" line into a CR the scanner never sees. A
+	// stdin that is not a tty (the unit tests' pipe) needs none of this
+	// and delivers the bytes unbuffered anyway.
 	in := bufio.NewReader(stdin)
 	if os.Getenv("FAKECLAUDE_TRUST_PROMPT") == "1" && !printMode {
-		fmt.Fprintln(stdout, "╭──────────────────────────────────────────╮")
-		fmt.Fprintln(stdout, "│ Quick safety check                       │")
-		fmt.Fprintln(stdout, "│ Is this a project you created or one you │")
-		fmt.Fprintln(stdout, "│ trust?                                   │")
-		fmt.Fprintln(stdout, "│  ❯ No, exit                              │")
-		fmt.Fprintln(stdout, "│    Yes, I trust this folder              │")
-		fmt.Fprintln(stdout, "╰──────────────────────────────────────────╯")
-		if !awaitTrustAnswer(in) {
+		restore := rawMode()
+		drawTrustDialog(stdout, false)
+		answered := awaitTrustAnswer(in, stdout)
+		restore()
+		if !answered {
 			fmt.Fprintln(stdout, "No, exit")
 			return 1
 		}
-		fmt.Fprintln(stdout, "Yes, I trust this folder")
 	}
 	f.procStart, _ = procx.StartTime("/proc", f.pid)
 	f.startedAt = nowMS()
@@ -211,23 +217,67 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// drawTrustDialog renders the dialog with the selection marker on one of
+// the two choices, in the spelling real Claude Code 2.1.259 uses (captured
+// from it: "❯ " then the choice).
+func drawTrustDialog(stdout io.Writer, yesSelected bool) {
+	no, yes := "   No, exit", " ❯ Yes, I trust this folder"
+	if !yesSelected {
+		no, yes = " ❯ No, exit", "   Yes, I trust this folder"
+	}
+	fmt.Fprintln(stdout, "Quick safety check: Is this a project you created or one you trust?")
+	fmt.Fprintln(stdout, "take a moment to review what's in this folder first.")
+	fmt.Fprintln(stdout, no)
+	fmt.Fprintln(stdout, yes)
+	fmt.Fprintln(stdout, "Enter to confirm · Esc to cancel")
+}
+
 // awaitTrustAnswer reads the pane's keystrokes until Enter (or CR) and
 // reports whether Down was pressed first — the "Yes, I trust this folder"
-// answer. tmux send-keys Down emits the terminal's cursor-down sequence
-// (\x1b[B, or \x1bOB in application cursor mode), and a pane in cooked
-// mode delivers the whole line at once, so both arrive here as bytes
-// rather than key names. EOF means the pane went away: not an answer.
-func awaitTrustAnswer(in *bufio.Reader) bool {
+// answer — redrawing the dialog the moment the selection moves. tmux
+// send-keys Down emits the terminal's cursor-down sequence (\x1b[B, or
+// \x1bOB in application cursor mode). EOF means the pane went away: not an
+// answer.
+func awaitTrustAnswer(in *bufio.Reader, stdout io.Writer) bool {
 	var seen []byte
+	down := false
 	for {
 		b, err := in.ReadByte()
 		if err != nil {
 			return false
 		}
 		if b == '\n' || b == '\r' {
-			return bytes.Contains(seen, []byte("\x1b[B")) || bytes.Contains(seen, []byte("\x1bOB"))
+			return down
 		}
 		seen = append(seen, b)
+		if !down && (bytes.HasSuffix(seen, []byte("\x1b[B")) || bytes.HasSuffix(seen, []byte("\x1bOB"))) {
+			down = true
+			drawTrustDialog(stdout, true)
+		}
+	}
+}
+
+// rawMode puts stdin's terminal into raw mode with `stty` and returns the
+// restore func (a no-op when stdin is not a tty, or stty is unavailable —
+// a pipe already delivers bytes as they are written). fakeclaude is a test
+// program, so a subprocess here is fine; the tool itself never execs one.
+func rawMode() func() {
+	get := exec.Command("stty", "-g")
+	get.Stdin = os.Stdin // stty reads the settings of ITS stdin
+	saved, err := get.Output()
+	if err != nil {
+		return func() {}
+	}
+	settings := strings.TrimSpace(string(saved))
+	raw := exec.Command("stty", "raw", "-echo")
+	raw.Stdin = os.Stdin
+	if err := raw.Run(); err != nil {
+		return func() {}
+	}
+	return func() {
+		restore := exec.Command("stty", settings)
+		restore.Stdin = os.Stdin
+		restore.Run()
 	}
 }
 
