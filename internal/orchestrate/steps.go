@@ -174,9 +174,34 @@ func (r *runner) verifyTransfer(ctx context.Context) (bool, error) {
 	if err := r.persist(ctx); err != nil {
 		return false, err
 	}
-	need := transfer.Need(m, r.p.Statuses)
-	r.logf("transfer: %d of %d entries still needed", len(need), len(m.Entries))
-	return len(need) == 0, nil
+	// transfer/diff.go's ff-candidate is ambiguous by design (controller
+	// ruling 1): with no staged copy to check against yet it is assigned
+	// unconditionally, as an OPTIMISTIC placeholder pending the real
+	// prefix check once something is actually staged — the exact same
+	// Status a genuinely staged-and-verified fast-forward gets once
+	// runTransfer has pumped it. Pending can't tell those two apart from
+	// Status alone, so before this job has ever actually attempted the
+	// pump (Attempts == 0, the journal's own record of that), an
+	// ff-candidate must NOT be trusted as "nothing to do" — that would
+	// skip the step's Run entirely and leave staging empty for install to
+	// fail on. Once Attempts > 0 (this pass or an earlier one), an
+	// ff-candidate genuinely does have a staged, prefix-verified copy
+	// (Diff() only reaches that unconditional branch when unstaged), so
+	// Pending is trustworthy again — and runTransfer's own post-pump
+	// check (immediately after Attempts becomes 1) already exercises the
+	// same Pending call this Verify would repeat next time.
+	if r.j.Step("transfer").Attempts == 0 {
+		return false, nil
+	}
+	// Pending, not Need: an ff-candidate (an already-staged fast-forward,
+	// e.g. a re-teleport where the destination already holds an older copy
+	// of this session's own transcript) has nothing left for THIS step to
+	// do — install/git-attach apply it — but Need deliberately keeps
+	// listing it (so a resend after a crash is never skipped), which would
+	// make this step never converge for exactly the fast-forward case.
+	pending := transfer.Pending(m, r.p.Statuses)
+	r.logf("transfer: %d of %d entries still pending", len(pending), len(m.Entries))
+	return len(pending) == 0, nil
 }
 
 func (r *runner) pump(ctx context.Context, kind remote.StreamKind, n string) error {
@@ -215,8 +240,10 @@ func (r *runner) runTransfer(ctx context.Context) error {
 	if r.p.Statuses, err = r.dst.ManifestDiff(ctx, m, r.p.JobID); err != nil {
 		return err
 	}
-	if need := transfer.Need(m, r.p.Statuses); len(need) > 0 {
-		return fmt.Errorf("%d entries still missing on the destination after the transfer (first: %s)", len(need), mustEntry(m, need[0]).Dst)
+	// Pending (see verifyTransfer): a real "still missing" failure, not an
+	// ff-candidate that is correctly staged and simply awaiting install.
+	if pending := transfer.Pending(m, r.p.Statuses); len(pending) > 0 {
+		return fmt.Errorf("%d entries still missing on the destination after the transfer (first: %s)", len(pending), mustEntry(m, pending[0]).Dst)
 	}
 	return r.persist(ctx)
 }
@@ -229,20 +256,7 @@ func mustEntry(m *transfer.Manifest, id int) transfer.Entry {
 // ---- 5 install ----------------------------------------------------------
 
 // deferred lists manifest ids that git-attach applies itself.
-func (r *runner) deferred() map[int]bool {
-	d := map[int]bool{}
-	if r.p.Git != nil && r.p.Git.Mode == gitx.ModeExistingMain {
-		for _, id := range r.p.Git.DirtyEntries {
-			d[id] = true
-		}
-		// gitx.NoEntry (-1) means "no index entry"; manifest ids are
-		// 0-based, so 0 is a real id and must not be treated as absent.
-		if r.p.Git.IndexEntryID >= 0 {
-			d[r.p.Git.IndexEntryID] = true
-		}
-	}
-	return d
-}
+func (r *runner) deferred() map[int]bool { return deferredEntries(r.p) }
 
 func (r *runner) installManifest() (*transfer.Manifest, error) {
 	m, err := r.manifest()

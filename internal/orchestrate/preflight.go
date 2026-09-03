@@ -221,8 +221,16 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 	for _, e := range p.Extras.Memory {
 		memory[e.ID] = true
 	}
+	// Existing-main's dirty index/worktree entries (deferredEntries) are
+	// never installed by the plain file-copy path (steps.go's
+	// installManifest already excludes them) — git-attach applies them
+	// itself, with git's own semantics for a checked-out working tree, so
+	// a raw content mismatch against whatever the destination's OWN
+	// checkout happens to hold (e.g. its .git/index) is not a real
+	// collision and must not refuse the teleport here.
+	deferred := deferredEntries(p)
 	for _, e := range transfer.Blocking(m, p.Statuses, o.Force) {
-		if !memory[e.ID] {
+		if !memory[e.ID] && !deferred[e.ID] {
 			p.Collisions = append(p.Collisions, e)
 		}
 	}
@@ -248,10 +256,28 @@ func (p *Plan) annotateManifest(m *transfer.Manifest, memorySrcs map[string]bool
 		p.Git.DirtyEntries = map[string]int{}
 	}
 	indexSrc := filepath.Join(p.Git.SrcMain, filepath.FromSlash(p.Git.IndexRel))
-	for _, e := range m.Entries {
+	for i := range m.Entries {
+		e := &m.Entries[i]
 		if memorySrcs[e.Src] {
-			p.Extras.Memory = append(p.Extras.Memory, e)
+			p.Extras.Memory = append(p.Extras.Memory, *e)
 			continue
+		}
+		// The pane capture is scratch data private to this job (its path
+		// is <jobID>/capture.txt, and jobID == the session id, so any file
+		// already there can only be a PRIOR attempt's capture of this
+		// SAME session, never another session's) — every attempt writes a
+		// fresh, unrelated snapshot with no fast-forward/append
+		// relationship to the last one, so it is always safe to overwrite
+		// and must never be judged by comparing against whatever the
+		// destination happens to hold there already (Deferred routes
+		// Diff() to a staging-only comparison instead — see the field's
+		// doc comment). Unlike the git-attach entries below, this does
+		// NOT go into p.Git.DirtyEntries: capture.txt has no separate
+		// "attach" step, so installManifest must still place it normally
+		// (Deferred only changes what Diff() compares against, not who
+		// installs it).
+		if e.Category == session.CatCapture {
+			e.Deferred = true
 		}
 		if p.Git.Mode != gitx.ModeExistingMain {
 			continue
@@ -259,10 +285,32 @@ func (p *Plan) annotateManifest(m *transfer.Manifest, memorySrcs map[string]bool
 		switch {
 		case e.Category == session.CatRepo && e.Src == indexSrc:
 			p.Git.IndexEntryID = e.ID
+			e.Deferred = true
 		case e.Category == session.CatWorktree:
 			p.Git.DirtyEntries[e.Dst] = e.ID
+			e.Deferred = true
 		}
 	}
+}
+
+// deferredEntries lists manifest ids that git-attach applies itself
+// (existing-main's dirty index and dirty worktree files) rather than the
+// plain file-install path — shared by Preflight's collision check and
+// (*runner).deferred, so the two never drift apart on what "handled
+// specially, not a raw collision/install" means.
+func deferredEntries(p *Plan) map[int]bool {
+	d := map[int]bool{}
+	if p.Git != nil && p.Git.Mode == gitx.ModeExistingMain {
+		for _, id := range p.Git.DirtyEntries {
+			d[id] = true
+		}
+		// gitx.NoEntry (-1) means "no index entry"; manifest ids are
+		// 0-based, so 0 is a real id and must not be treated as absent.
+		if p.Git.IndexEntryID >= 0 {
+			d[p.Git.IndexEntryID] = true
+		}
+	}
+	return d
 }
 
 // driverDataDir is the local data dir: the source's for --to, the
