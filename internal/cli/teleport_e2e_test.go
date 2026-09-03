@@ -101,45 +101,15 @@ func TestTeleportEndToEndLocalToLocal(t *testing.T) {
 		ExitTimeout: 10 * time.Second, StartTimeout: 20 * time.Second, LocalDest: &dstPaths,
 	}
 	ctx := context.Background()
-	src, dst, closeFn, err := a.endpoints(ctx, o)
-	if err != nil {
-		t.Fatalf("endpoints: %v", err)
-	}
-	sess, err := src.ResolveSession(ctx, o.Selector)
-	if err != nil {
-		closeFn()
-		t.Fatalf("ResolveSession: %v", err)
-	}
-	jobID := string(sess.ID)
-	plan, err := orchestrate.Preflight(ctx, o, src, dst, jobID)
-	if err != nil {
-		closeFn()
-		t.Fatalf("Preflight: %v", err)
-	}
-	j, err := job.New(a.paths.DataDir, jobID)
-	if err != nil {
-		closeFn()
-		t.Fatal(err)
-	}
-	j.SessionID, j.Direction = jobID, o.Direction
-	j.SourceHost, j.DestHost = plan.SourceInfo.Hostname, plan.DestInfo.Hostname
-	j.CreatedAt, j.UpdatedAt = time.Now(), time.Now()
-	if j.Plan, err = plan.ToJSON(); err != nil {
-		closeFn()
-		t.Fatal(err)
-	}
-	if err := j.Save(); err != nil {
-		closeFn()
-		t.Fatal(err)
-	}
-	closeFn()
-
 	var out bytes.Buffer
 	a.stdout, a.stderr = &out, &out
-	code := a.spawnAndFollow(ctx, j, false)
-	if code != ExitOK {
-		t.Fatalf("spawnAndFollow = %d, log:\n%s", code, out.String())
+	// a.teleport is runTeleport's whole body after flag parsing (finding
+	// A16): endpoints, ResolveSession, preflight, the plan render, the
+	// dry-run gate, job.New/Save and the real detached runner.
+	if code := a.teleport(ctx, o, false); code != ExitOK {
+		t.Fatalf("teleport = %d, log:\n%s", code, out.String())
 	}
+	jobID := teleportE2ESID
 
 	// The job journal now records success, and `continue` on a finished
 	// job is a no-op that reports so (spec: `continue` resumes an

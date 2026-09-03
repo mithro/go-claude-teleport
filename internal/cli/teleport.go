@@ -79,6 +79,15 @@ func (a *app) runTeleport(ctx context.Context, f teleportFlags, args []string) i
 		fmt.Fprintln(a.stderr, "usage:", err)
 		return ExitUsage
 	}
+	return a.teleport(ctx, o, f.DryRun)
+}
+
+// teleport is runTeleport's body once the flags are parsed: endpoints,
+// session resolution, !-mode detection, the existing-job branch, preflight,
+// the plan render and the dry-run gate, then the detached runner. Tests
+// drive it directly for the Options no flag can express (LocalDest) instead
+// of duplicating this sequence (finding A16).
+func (a *app) teleport(ctx context.Context, o orchestrate.Options, dryRun bool) int {
 	src, dst, closeFn, err := a.endpoints(ctx, o)
 	if err != nil {
 		return a.fail(err)
@@ -106,7 +115,16 @@ func (a *app) runTeleport(ctx context.Context, f teleportFlags, args []string) i
 		return a.fail(err)
 	} else if ok && j.Outcome != "success" && j.Outcome != "abandoned" {
 		closeFn()
-		fmt.Fprintf(a.stdout, "job %s is %s at step %s; continuing it (use `abandon` to start over)\n", sess.ID.Short(), stateWord(j), firstIncompleteName(j))
+		// --dry-run is evaluated FIRST here (finding A1): continuing the
+		// job spawns a runner that freezes the live Claude and moves it
+		// for real, which is exactly what --dry-run promises never to do.
+		if dryRun {
+			a.renderStoredPlan(j)
+			fmt.Fprintf(a.stdout, "job %s already exists (%s at step %s, destination %s); dry run: nothing was moved. Continue it with: claude-teleport continue %s\n",
+				sess.ID.Short(), stateWord(j), firstIncompleteName(j), storedDest(j), j.ID)
+			return ExitOK
+		}
+		fmt.Fprintf(a.stdout, "job %s is %s at step %s; continuing it to %s (use `abandon` to start over)\n", sess.ID.Short(), stateWord(j), firstIncompleteName(j), storedDest(j))
 		return a.continueJob(ctx, j, o.BangMode)
 	}
 	plan, err := orchestrate.Preflight(ctx, o, src, dst, jobID)
@@ -115,7 +133,7 @@ func (a *app) runTeleport(ctx context.Context, f teleportFlags, args []string) i
 		return a.fail(err)
 	}
 	plan.Render(a.stdout)
-	if f.DryRun {
+	if dryRun {
 		closeFn()
 		fmt.Fprintln(a.stdout, "dry run: nothing was moved")
 		return ExitOK
@@ -145,6 +163,35 @@ func stateWord(j *job.Journal) string {
 		return "failed"
 	}
 	return "in progress"
+}
+
+// storedDest names the destination the STORED job moves the session to —
+// the only one a continue can use. Re-running the teleport with a different
+// --to does not retarget an existing job, so every message about continuing
+// one has to say where it actually goes (finding A15).
+func storedDest(j *job.Journal) string {
+	if j.DestHost != "" {
+		return j.DestHost
+	}
+	if p, err := orchestrate.PlanFromJournal(j); err == nil {
+		if p.DestInfo.Hostname != "" {
+			return p.DestInfo.Hostname
+		}
+		if p.Options.Target != "" {
+			return p.Options.Target
+		}
+	}
+	return "(unrecorded)"
+}
+
+// renderStoredPlan prints the plan a stored job carries, so `--dry-run`
+// over an existing job still shows what the continue would do.
+func (a *app) renderStoredPlan(j *job.Journal) {
+	p, err := orchestrate.PlanFromJournal(j)
+	if err != nil || p.Session == nil {
+		return
+	}
+	p.Render(a.stdout)
 }
 
 func firstIncompleteName(j *job.Journal) string {

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/job"
+	"github.com/mithro/go-claude-teleport/internal/orchestrate"
+	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
 func TestTeleportUsageErrors(t *testing.T) {
@@ -97,5 +99,99 @@ func TestSpawnAndFollowClearsAStaleFailedOutcome(t *testing.T) {
 	if code := a.spawnAndFollow(context.Background(), j, false); code != ExitOK {
 		t.Fatalf("spawnAndFollow = %d after %s (the stale failed outcome was reported instead of the new run's)\n%s",
 			code, time.Since(start), out.String())
+	}
+}
+
+// fixtureSID is the idle session in ../session/testdata/config (its
+// registry pid is not alive on this machine, so it resolves as idle).
+const fixtureSID = "3f9c2b7e-5a14-4d8e-9b21-7c0e5d6a8f13"
+
+// fixtureApp is an app whose local endpoint reads the read-only session
+// fixture and whose data dir (jobs, journals) is a fresh temp dir.
+func fixtureApp(t *testing.T) (*app, *bytes.Buffer) {
+	t.Helper()
+	dir := t.TempDir()
+	env := []string{"HOME=/home/alice", "CLAUDE_CONFIG_DIR=../session/testdata/config",
+		"XDG_DATA_HOME=" + filepath.Join(dir, "share"), "PATH=/usr/bin:/bin",
+		// somewhere with no tmux server: never touch this machine's own
+		"TMUX_TMPDIR=" + filepath.Join(dir, "no-tmux-here")}
+	var out bytes.Buffer
+	a := &app{env: parseEnv(env), logf: t.Logf, stdout: &out, stderr: &out}
+	if err := a.ensurePaths(); err != nil {
+		t.Fatal(err)
+	}
+	return a, &out
+}
+
+// fakeRunner writes a shell script that stands in for `<selfExe>
+// internal-runner <job dir>`: it records that it ran (marker) and then
+// finishes the job the way a successful runner would.
+func fakeRunner(t *testing.T, a *app, sid string) (script, marker string) {
+	t.Helper()
+	dir := t.TempDir()
+	marker = filepath.Join(dir, "runner-ran")
+	done := job.Journal{ID: sid, SessionID: sid, Finished: true, Outcome: "success",
+		Steps: []job.StepState{{Name: "transfer", Status: job.Done}}}
+	raw, err := json.MarshalIndent(done, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	successPath := filepath.Join(dir, "success.json")
+	if err := os.WriteFile(successPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script = filepath.Join(dir, "fake-runner.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ntouch "+marker+"\ncp "+successPath+" \"$2\"/job.json\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return script, marker
+}
+
+// unfinishedJob stores a failed, continuable job for sid.
+func unfinishedJob(t *testing.T, a *app, sid string) *job.Journal {
+	t.Helper()
+	j, err := job.New(a.paths.DataDir, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.SessionID, j.Direction, j.DestHost = sid, "to", "big-storage.example"
+	j.Steps = []job.StepState{{Name: "transfer", Status: job.Failed, Error: "tar stream: EOF"}}
+	j.Finished, j.Outcome = true, "failed"
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+
+// TestDryRunNeverContinuesAnExistingJob pins A1: with an unfinished job on
+// disk, `--dry-run` used to reach the "continue it" branch BEFORE the
+// dry-run check — spawning a runner that SIGSTOPs the live Claude and
+// teleports for real. Nothing may be spawned and the journal must be
+// untouched.
+func TestDryRunNeverContinuesAnExistingJob(t *testing.T) {
+	a, out := fixtureApp(t)
+	script, marker := fakeRunner(t, a, fixtureSID)
+	a.selfExe = script
+	unfinishedJob(t, a, fixtureSID)
+
+	o := orchestrate.Options{Direction: "to", Target: "big-storage.example",
+		Selector: session.Selector{ID: session.ID(fixtureSID)}, State: "auto", LocalDest: &a.paths}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if code := a.teleport(ctx, o, true); code != ExitOK {
+		t.Fatalf("dry run over an existing job = %d\n%s", code, out.String())
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatalf("--dry-run spawned a runner (marker %s exists)\n%s", marker, out.String())
+	}
+	j, ok, err := job.Open(a.paths.DataDir, fixtureSID)
+	if err != nil || !ok {
+		t.Fatalf("job.Open = %v %v", ok, err)
+	}
+	if j.RunnerPID != 0 || !j.Finished || j.Outcome != "failed" {
+		t.Errorf("--dry-run modified the journal: %+v", j)
+	}
+	if !strings.Contains(out.String(), "nothing was moved") {
+		t.Errorf("dry run must say nothing was moved:\n%s", out.String())
 	}
 }
