@@ -1,6 +1,7 @@
 package sshx
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -78,25 +79,53 @@ func idleTimeout(interval time.Duration, count int) time.Duration {
 //
 // The deadline is armed only after the handshake (enable), and only when
 // keepalives are on to guarantee the traffic that keeps it refreshed.
+//
+// A timed-out Read reports the stall through onStall (Dial wires it to
+// Client.dropLink) rather than relying on the error alone: on a link that
+// died mid-transfer the error by itself never gets anywhere — see
+// dropLink's note on x/crypto/ssh's locking (R-P3-NET-1).
 type idleConn struct {
 	net.Conn
-	idle atomic.Int64 // nanoseconds; 0 = no deadline
+	idle    atomic.Int64 // nanoseconds; 0 = no deadline
+	onStall func(reason string)
+	once    sync.Once
 }
 
 func (c *idleConn) enable(d time.Duration) { c.idle.Store(int64(d)) }
 
 func (c *idleConn) Read(b []byte) (int, error) {
-	if d := c.idle.Load(); d > 0 {
-		c.Conn.SetReadDeadline(time.Now().Add(time.Duration(d)))
+	d := time.Duration(c.idle.Load())
+	if d > 0 {
+		c.Conn.SetReadDeadline(time.Now().Add(d))
 	}
-	return c.Conn.Read(b)
+	n, err := c.Conn.Read(b)
+	var ne net.Error
+	if d > 0 && errors.As(err, &ne) && ne.Timeout() && c.onStall != nil {
+		c.onStall(fmt.Sprintf("nothing received for %s", d))
+	}
+	return n, err
 }
 
+// hardClose closes the socket itself, once. Closing the file descriptor is
+// the only thing that unblocks a goroutine already sitting in write(2) on
+// a dead link; Close is routed through it so a double close is not an
+// error.
+func (c *idleConn) hardClose() error {
+	var err error
+	c.once.Do(func() { err = c.Conn.Close() })
+	return err
+}
+
+func (c *idleConn) Close() error { return c.hardClose() }
+
 // startKeepalive sends keepalive@openssh.com requests every interval and
-// closes the connection after count consecutive unanswered ones, so a dead
-// link surfaces as an ordinary ssh error within interval*count. The
-// returned func stops the loop (Client.Close runs it).
-func startKeepalive(cl *ssh.Client, interval time.Duration, count int, desc string, logf func(string, ...any)) func() {
+// drops the link after count consecutive unanswered ones, so a dead link
+// surfaces as an ordinary ssh error within interval*count. The returned
+// func stops the loop (Client.Close runs it).
+//
+// drop is Client.dropLink, NOT ssh.Client.Close: on the link this exists
+// for, Close is itself one of the calls that hangs (see dropLink).
+func startKeepalive(cl *ssh.Client, interval time.Duration, count int, desc string, logf func(string, ...any), drop func(reason string)) func() {
 	stop := make(chan struct{})
 	go func() {
 		missed := 0
@@ -143,7 +172,7 @@ func startKeepalive(cl *ssh.Client, interval time.Duration, count int, desc stri
 			}
 			if missed >= count {
 				logf("no keepalive answer from %s in %s: closing the connection", desc, time.Duration(count)*interval)
-				cl.Close()
+				drop(fmt.Sprintf("no keepalive answer in %s", time.Duration(count)*interval))
 				return
 			}
 		}

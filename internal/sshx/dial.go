@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kevinburke/ssh_config"
@@ -45,6 +46,13 @@ type Client struct {
 	jumps  []*ssh.Client // outermost first
 	desc   string
 	closes []func()
+
+	// link is the first hop's socket — the one file descriptor the whole
+	// chain rides on, however many jumps are stacked above it.
+	link *idleConn
+
+	mu     sync.Mutex
+	reason string // why the link was dropped; "" while it is healthy
 }
 
 // SSH exposes the underlying client (used by remote tests and Plan 03 pty runs).
@@ -53,6 +61,65 @@ func (c *Client) SSH() *ssh.Client { return c.ssh }
 // Close stops the keepalive loop, then closes the target connection and
 // each jump, innermost first.
 func (c *Client) Close() error { return c.closeAll() }
+
+// gracefulCloseTimeout bounds the polite ssh teardown in closeAll. It is
+// generous for a healthy link (where the closes take microseconds) and
+// irrelevant on a dead one, where dropLink has usually already run.
+const gracefulCloseTimeout = 2 * time.Second
+
+// dropLink is the only thing that reliably breaks a connection that has
+// stopped moving, and it works by closing the first hop's socket.
+//
+// The reason is x/crypto/ssh's locking, and it is worth spelling out
+// (R-P3-NET-1, CI run 33787193998). A goroutine writing a bulk stream
+// holds, for the whole duration of one conn.Write, the ssh channel's
+// writeMu AND the handshakeTransport's mu — of every connection in the
+// chain, since a jump hop's packets are written into a channel of the hop
+// below it. That Write has no deadline, so on a frozen peer it sits in
+// write(2) until the peer comes back, minutes later. Everything that
+// would normally end the connection needs one of the locks it is holding:
+//
+//   - ssh.Client.Close() on a jumped connection does not close a socket at
+//     all — it writes a channel-close message, which blocks on the very
+//     write that is already stuck;
+//   - mux.loop's teardown (dropAll → channel.close, the thing that
+//     unblocks writers via window.close) takes channel.writeMu;
+//   - handshakeTransport.readLoop reports a failed read through
+//     recordWriteError, which takes the transport mu.
+//
+// So the idle read deadline fires, and nothing happens: the reader is
+// stuck reporting it and the writer is stuck holding the locks it needs.
+// Closing the file descriptor is the one operation that does not need any
+// of those locks — the runtime poller fails the in-flight write
+// immediately, and the whole stack unwinds from there.
+func (c *Client) dropLink(reason string) {
+	c.mu.Lock()
+	if c.reason == "" {
+		c.reason = reason
+	}
+	c.mu.Unlock()
+	if c.link != nil {
+		c.link.hardClose()
+	}
+}
+
+// linkError annotates an I/O failure with why the link died, so a
+// transfer that ends because the connection was dropped says so in the
+// journal ("connection lost to alice@dest: no keepalive answer in 45s")
+// instead of leaving a bare EOF from a channel torn down underneath it.
+// The original error is wrapped, so errors.Is/As still reach it.
+func (c *Client) linkError(err error) error {
+	if err == nil {
+		return nil
+	}
+	c.mu.Lock()
+	reason := c.reason
+	c.mu.Unlock()
+	if reason == "" {
+		return err
+	}
+	return fmt.Errorf("connection lost to %s: %s: %w", c.desc, reason, err)
+}
 
 // String renders user@host (via a, b).
 func (c *Client) String() string { return c.desc }
@@ -146,7 +213,8 @@ func Dial(ctx context.Context, r Resolved, cfg *ssh_config.Config, overrides map
 		// chain's liveness.
 		var idle *idleConn
 		if prev == nil {
-			idle = &idleConn{Conn: raw}
+			idle = &idleConn{Conn: raw, onStall: c.dropLink}
+			c.link = idle
 			raw = idle
 		}
 		if dl, ok := ctx.Deadline(); ok {
@@ -169,7 +237,7 @@ func Dial(ctx context.Context, r Resolved, cfg *ssh_config.Config, overrides map
 		} else {
 			c.ssh = cl
 			if keepaliveInterval > 0 {
-				c.closes = append(c.closes, startKeepalive(cl, keepaliveInterval, keepaliveCount, r.User+"@"+r.Host, logf))
+				c.closes = append(c.closes, startKeepalive(cl, keepaliveInterval, keepaliveCount, r.User+"@"+r.Host, logf, c.dropLink))
 			}
 		}
 		prev = cl
@@ -198,12 +266,31 @@ func (c *Client) closeAll() error {
 	for _, f := range c.closes {
 		f()
 	}
+	// The polite teardown is attempted first but can never be the last
+	// word: on a link that has stopped moving these closes block forever
+	// (dropLink explains why), and a Close that hangs wedges the very
+	// failure path that is trying to report the dead link. So it is
+	// bounded, and the socket is always closed afterwards — which also
+	// releases whatever the bounded attempt is still stuck on.
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		if c.ssh != nil {
+			err = c.ssh.Close()
+		}
+		for i := len(c.jumps) - 1; i >= 0; i-- {
+			c.jumps[i].Close()
+		}
+		done <- err
+	}()
 	var err error
-	if c.ssh != nil {
-		err = c.ssh.Close()
+	select {
+	case err = <-done:
+	case <-time.After(gracefulCloseTimeout):
+		err = fmt.Errorf("close %s: the connection stopped responding; dropping it", c.desc)
 	}
-	for i := len(c.jumps) - 1; i >= 0; i-- {
-		c.jumps[i].Close()
+	if c.link != nil {
+		c.link.hardClose()
 	}
 	return err
 }

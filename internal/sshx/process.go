@@ -9,6 +9,33 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// linkReader/linkWriteCloser annotate a stream's I/O errors with the
+// reason the connection died (Client.linkError), so a transfer cut short
+// by a dead link reports that rather than the bare EOF an ssh channel
+// returns once it has been torn down underneath the caller. On a healthy
+// connection they add nothing at all.
+type linkReader struct {
+	r io.Reader
+	c *Client
+}
+
+func (l linkReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	return n, l.c.linkError(err)
+}
+
+type linkWriteCloser struct {
+	w io.WriteCloser
+	c *Client
+}
+
+func (l linkWriteCloser) Write(p []byte) (int, error) {
+	n, err := l.w.Write(p)
+	return n, l.c.linkError(err)
+}
+
+func (l linkWriteCloser) Close() error { return l.c.linkError(l.w.Close()) }
+
 // Process is a started remote command.
 type Process struct {
 	Stdin  io.WriteCloser
@@ -50,15 +77,15 @@ func (c *Client) start(ctx context.Context, cmd string, pty bool, rows, cols int
 	}
 	stop := context.AfterFunc(ctx, func() { sess.Close() })
 	return &Process{
-		Stdin:  stdin,
-		Stdout: stdout,
-		Stderr: stderr,
+		Stdin:  linkWriteCloser{w: stdin, c: c},
+		Stdout: linkReader{r: stdout, c: c},
+		Stderr: linkReader{r: stderr, c: c},
 		Wait: func() error {
 			err := sess.Wait()
 			stop()
-			return err
+			return c.linkError(err)
 		},
-		Close: func() error { stop(); return sess.Close() },
+		Close: func() error { stop(); return c.linkError(sess.Close()) },
 	}, nil
 }
 
