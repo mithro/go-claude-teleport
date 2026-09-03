@@ -502,9 +502,9 @@ func (c *Client) StartClaude(ctx context.Context, ref *session.TmuxRef, id sessi
 	return c.call(ctx, OpStartClaude, StartClaudeArgs{Ref: ref, ID: id, JobID: jobID, Argv: argv}, nil)
 }
 
-func (c *Client) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration) (*session.Registry, error) {
+func (c *Client) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration, trusted bool) (*session.Registry, error) {
 	var r ConfirmClaudeResult
-	err := c.call(ctx, OpConfirmClaude, ConfirmClaudeArgs{Ref: ref, ID: id, Timeout: timeout}, &r)
+	err := c.call(ctx, OpConfirmClaude, ConfirmClaudeArgs{Ref: ref, ID: id, Timeout: timeout, Trusted: trusted}, &r)
 	return r.Registry, err
 }
 

@@ -19,7 +19,12 @@ type InstallReport struct {
 	Installed, SkippedSame, FastForwarded int
 	IndexMerged, HistoryAdded             int
 	ProjectEntryAdded                     bool
-	MemoryCopied, MemoryDiffers           []string
+	// TrustGranted says this call marked InstallExtras.TrustCwd trusted in
+	// the destination's global config (ruling R-P3-TRUST-1 item 1). False
+	// when the source was not trusted, or when the destination already
+	// said so — the grant is idempotent.
+	TrustGranted                bool
+	MemoryCopied, MemoryDiffers []string
 	// InstalledIDs is the manifest ids this call placed at Dst from
 	// scratch (the StagedSame case below) — never a PresentSame entry,
 	// which was already there before this call touched anything.
@@ -53,6 +58,18 @@ type InstallExtras struct {
 	History      []json.RawMessage
 	ProjectCwd   string
 	ProjectEntry session.ProjectEntry
+	// TrustCwd is the destination path whose ~/.claude.json project entry
+	// grants Claude Code's first-run trust dialog for this session
+	// (R-P3-TRUST-1 item 1). It is ProjectCwd for an ordinary session, and
+	// the mapped MAIN repository path when the session's cwd is a linked
+	// git worktree — real Claude Code 2.1.259 keys the entry there, not at
+	// the worktree, so granting it at ProjectCwd alone would leave the
+	// destination sitting at the dialog with no registry entry, which is
+	// exactly how the first real teleport failed.
+	TrustCwd string `json:"trust_cwd,omitempty"`
+	// SourceTrusted is the source's own answer to that dialog: the
+	// destination only grants trust it can point at on the source.
+	SourceTrusted bool `json:"source_trusted,omitempty"`
 	// Memory holds the memory-file entries: copy only if absent. INVARIANT:
 	// every entry MUST be a row of the SAME manifest passed to Install (same
 	// ID space) — i.e. m.ByID(e.ID) must find an entry with an identical
@@ -391,6 +408,54 @@ func install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 		}
 		rep.ProjectEntryAdded = added
 	}
+	return grantTrust(m, p, extra, rep)
+}
+
+// grantTrust carries the source's answer to Claude Code's first-run trust
+// dialog to the destination (ruling R-P3-TRUST-1 item 1), so the resumed
+// Claude reaches its prompt instead of the "Quick safety check" dialog —
+// which produces no registry entry, and so failed the whole start step.
+//
+// TrustCwd is source-supplied, so it is bounded twice here. It must be a
+// path THIS MANIFEST already names — its own ProjectCwd, or one of the
+// repository roots it declares (gitx's DstMain/DstWorktree, which is where
+// Claude Code keys the entry for a linked worktree) — so a source cannot
+// mark some unrelated directory trusted (PR #11 review item 3). And it
+// must be an absolute, already-clean path that is not the destination's
+// own home, config dir, data dir or the filesystem root: granting trust
+// for one of those would be a blanket "trusted" for everything under it.
+func grantTrust(m *Manifest, p session.Paths, extra InstallExtras, rep *InstallReport) error {
+	if !extra.SourceTrusted {
+		return nil
+	}
+	cwd := extra.TrustCwd
+	if cwd == "" || !filepath.IsAbs(cwd) || filepath.Clean(cwd) != cwd {
+		return Refuse(cwd, "trust cwd must be an absolute, clean path")
+	}
+	allowed := []string{extra.ProjectCwd}
+	for _, r := range m.Roots {
+		allowed = append(allowed, r.Path)
+	}
+	named := false
+	for _, a := range allowed {
+		if a != "" && filepath.Clean(a) == cwd {
+			named = true
+			break
+		}
+	}
+	if !named {
+		return Refuse(cwd, "trust cwd is neither this session's destination cwd nor one of the manifest's repository roots")
+	}
+	for _, forbidden := range []string{p.Home, p.ConfigDir, p.DataDir, string(filepath.Separator)} {
+		if forbidden != "" && cwd == filepath.Clean(forbidden) {
+			return Refuse(cwd, "refusing to grant the trust dialog for %s", forbidden)
+		}
+	}
+	granted, err := session.GrantProjectTrust(p.GlobalJSON, cwd)
+	if err != nil {
+		return fmt.Errorf("grant trust for %s: %w", cwd, err)
+	}
+	rep.TrustGranted = granted
 	return nil
 }
 

@@ -65,7 +65,11 @@ type Endpoint interface {
 	KillWindow(ctx context.Context, ref *session.TmuxRef) error
 	StartClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, jobID string, argv []string) error
 	ClaudeStatus(ctx context.Context, id session.ID) (*session.Registry, bool, error)
-	ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration) (*session.Registry, error)
+	// ConfirmClaude waits for the resumed Claude (spec §6.2). trusted is
+	// the source session's own answer to Claude Code's first-run trust
+	// dialog, which the destination may need in order to get past it
+	// (ruling R-P3-TRUST-1 item 2).
+	ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration, trusted bool) (*session.Registry, error)
 	ExitClaude(ctx context.Context, ref *session.TmuxRef, pid int, startTime string, timeout time.Duration) error
 	TypeCommand(ctx context.Context, ref *session.TmuxRef, argv []string) error
 	PaneState(ctx context.Context, ref *session.TmuxRef) (*tmuxx.PaneState, error)

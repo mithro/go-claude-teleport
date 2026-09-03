@@ -45,7 +45,13 @@ func (l *Local) ClaudeStatus(ctx context.Context, id session.ID) (*session.Regis
 // failure marker in NEW pane output, and status idle — or, for a `-p` run
 // that never reaches idle, busy after it has produced a turn (case 3) —
 // all within timeout.
-func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration) (*session.Registry, error) {
+//
+// trusted is the source session's own answer to Claude Code's first-run
+// trust dialog (ruling R-P3-TRUST-1 item 2). A destination Claude sitting
+// at that dialog has resumed but writes no registry entry until it is
+// answered: with trusted set, this answers it once, in the job's own pane
+// only; without it, nothing is typed and the failure says so precisely.
+func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration, trusted bool) (*session.Registry, error) {
 	// Both sides of this comparison are tmux's STORED session-name spelling
 	// (R-PRB-2): Claude Code writes registry.tmux from #{session_name}, and
 	// TmuxRef.Session carries the same spelling — so no decoding here, on
@@ -120,6 +126,15 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 	// way down.
 	var lastPrintReg *session.Registry
 
+	// answeredTrust: the trust dialog is answered at most once per call —
+	// the keystrokes are only ever sent while the pane is SHOWING the
+	// dialog and no registry entry exists, and a second send after that
+	// could land in a Claude that has meanwhile reached its prompt.
+	answeredTrust := false
+	// trustStuck: the Down keystroke did not move the selection, so Enter
+	// was withheld — reported as the reason this confirm gives up.
+	trustStuck := false
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -154,6 +169,53 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 				}
 			}
 			last = "no live registry entry for the session"
+			// R-P3-TRUST-1 item 2: no registry entry AND the pane is
+			// showing the trust dialog right now (the VISIBLE screen, not
+			// the scrollback — the same words up there describe a dialog
+			// already answered). This is the one place where the two
+			// facts together mean "waiting for a human", so it is the one
+			// place allowed to answer for them.
+			if ref != nil {
+				marker, waiting, err := l.trustPrompt(ctx, t, ref)
+				if err != nil {
+					return nil, err
+				}
+				if waiting {
+					if !trusted {
+						return nil, &Error{Code: "conflict", Message: fmt.Sprintf("%s on %s pane %s; accept it there, then run claude-teleport continue %s",
+							TrustPromptWaiting, l.Hostname, tmuxx.RefString(ref), id)}
+					}
+					if !answeredTrust {
+						answeredTrust = true
+						l.opts.Logf("confirm: %s shows Claude's trust prompt (%q); the source session was trusted, so answering %q in pane %s (Down, Enter)", tmuxx.RefString(ref), marker, "Yes, I trust this folder", ref.PaneID)
+						if err := tmuxx.SendKeys(ctx, t, ref.PaneID, "Down"); err != nil {
+							return nil, &Error{Code: "internal", Message: err.Error()}
+						}
+						l.opts.Sleep(500 * time.Millisecond)
+						// Self-validating (PR #11 review): Enter answers
+						// whatever is SELECTED, so it is only pressed once
+						// the pane really shows "Yes, I trust this folder"
+						// selected. If the Down never landed, pressing it
+						// anyway would answer "No, exit" and kill the
+						// destination Claude; the confirm fails instead,
+						// saying which half did not take.
+						screen, err := tmuxx.CaptureScreen(ctx, t, ref.PaneID)
+						if err != nil {
+							return nil, &Error{Code: "internal", Message: err.Error()}
+						}
+						if !TrustAnswerSelected(string(screen)) {
+							trustStuck = true
+							l.opts.Logf("confirm: %s still does not show %q selected after Down; not pressing Enter", tmuxx.RefString(ref), trustYesSelected)
+						} else if err := tmuxx.SendKeys(ctx, t, ref.PaneID, "Enter"); err != nil {
+							return nil, &Error{Code: "internal", Message: err.Error()}
+						}
+					}
+					last = "the destination Claude is answering its trust prompt"
+					if trustStuck {
+						last = fmt.Sprintf("the trust prompt's selection did not move to %q, so it was left unanswered — accept it on %s pane %s and re-run continue", trustYesSelected, l.Hostname, tmuxx.RefString(ref))
+					}
+				}
+			}
 		case wantTmux != "" && reg.Tmux != wantTmux:
 			last = fmt.Sprintf("registry pane %q is not our pane %q", reg.Tmux, wantTmux)
 		case reg.Status == "idle":
@@ -179,6 +241,17 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 		}
 		l.opts.Sleep(confirmPoll)
 	}
+}
+
+// trustPrompt reports whether ref's VISIBLE screen is showing Claude
+// Code's first-run trust dialog, and which marker matched.
+func (l *Local) trustPrompt(ctx context.Context, t tmuxx.Transport, ref *session.TmuxRef) (string, bool, error) {
+	screen, err := tmuxx.CaptureScreen(ctx, t, ref.PaneID)
+	if err != nil {
+		return "", false, &Error{Code: "internal", Message: err.Error()}
+	}
+	m, hit := HasTrustPrompt(string(screen))
+	return m, hit, nil
 }
 
 // transcriptSize returns id's transcript size, used only as growth

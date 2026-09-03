@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
@@ -74,7 +75,48 @@ func (l *Local) SessionExtras(ctx context.Context, id session.ID, pm session.Pat
 	} else if ok {
 		ex.ProjectEntry = pe
 	}
+	if err := l.findTrust(s.LaunchCwd, ex, pm); err != nil {
+		return nil, err
+	}
 	return ex, nil
+}
+
+// findTrust locates the project entry that answers Claude Code's
+// first-run trust dialog for cwd and records, in the destination's own
+// paths, where the destination must grant it (ruling R-P3-TRUST-1 item
+// 1).
+//
+// Verified against real Claude Code 2.1.259: for a session whose cwd is a
+// LINKED git worktree the trust flag is stored under the project entry
+// keyed by the MAIN repository path, and the worktree cwd has no entry at
+// all — which is why the first real teleport carried no trust and the
+// destination sat at the dialog. So: the cwd's own entry first, then the
+// main repository's when the cwd is a linked worktree. Nothing else is
+// consulted, and no entry is invented: an untrusted source stays
+// untrusted.
+func (l *Local) findTrust(cwd string, ex *transfer.InstallExtras, pm session.PathMap) error {
+	ex.TrustCwd = pm.ApplyPath(cwd)
+	if session.TrustAccepted(ex.ProjectEntry) {
+		ex.SourceTrusted = true
+		l.opts.Logf("extras: trust for %s comes from its own project entry", cwd)
+		return nil
+	}
+	gi, err := gitx.Inspect(cwd)
+	if err != nil || !gi.IsLinked || gi.MainDir == cwd {
+		l.opts.Logf("extras: no accepted trust dialog recorded for %s", cwd)
+		return nil
+	}
+	me, ok, err := session.ReadProjectEntry(l.paths.GlobalJSON, gi.MainDir)
+	if err != nil {
+		return err
+	}
+	if !ok || !session.TrustAccepted(me) {
+		l.opts.Logf("extras: no accepted trust dialog recorded for %s or its main repository %s", cwd, gi.MainDir)
+		return nil
+	}
+	ex.SourceTrusted, ex.TrustCwd = true, pm.ApplyPath(gi.MainDir)
+	l.opts.Logf("extras: %s is a linked worktree; its trust dialog was accepted for the main repository %s (granted on the destination at %s)", cwd, gi.MainDir, ex.TrustCwd)
+	return nil
 }
 
 // Cleanup removes staging/<jobID> after a successful job.

@@ -185,8 +185,8 @@ func (f *fakeTmux) Run(_ context.Context, cmd string) ([]string, error) {
 		}
 		var text strings.Builder
 		for _, k := range a[3:] {
-			if k == "Enter" {
-				text.WriteByte('\n')
+			if seq, ok := keySeq[k]; ok {
+				text.WriteString(seq)
 			} else {
 				text.WriteString(k)
 			}
@@ -215,6 +215,19 @@ func (f *fakeTmux) Run(_ context.Context, cmd string) ([]string, error) {
 		return nil, nil
 	}
 	return nil, fmt.Errorf("fakeTmux: unsupported command %q", cmd)
+}
+
+// keySeq maps the tmux key NAMES tmuxx.SendKeys passes bare to the bytes
+// a real tmux would deliver to the pane's tty. Only the ones the tool
+// actually sends are here: Enter (spec §6.3's /exit) and the cursor keys
+// the trust-dialog answer uses (ruling R-P3-TRUST-1 item 2) — a pane in
+// normal cursor mode gets the CSI form.
+var keySeq = map[string]string{
+	"Enter": "\n",
+	"Up":    "\x1b[A",
+	"Down":  "\x1b[B",
+	"Right": "\x1b[C",
+	"Left":  "\x1b[D",
 }
 
 func contains(a []string, s string) bool {

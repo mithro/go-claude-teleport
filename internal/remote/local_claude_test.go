@@ -60,7 +60,7 @@ func TestConfirmClaudeSucceedsWhenIdleInOurPane(t *testing.T) {
 	ref := &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}
 	writeRegistry(t, p, 5150, "busy", "work:@1.%7")
 	go func() { time.Sleep(50 * time.Millisecond); writeRegistry(t, p, 5150, "idle", "work:@1.%7") }()
-	reg, err := l.ConfirmClaude(context.Background(), ref, session.ID(sid), 5*time.Second)
+	reg, err := l.ConfirmClaude(context.Background(), ref, session.ID(sid), 5*time.Second, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestConfirmClaudeFailsOnMarkerAppearingDuringThisAttempt(t *testing.T) {
 	dial := func(context.Context, string) (tmuxx.Transport, error) { return f, nil }
 	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: dial, Sleep: func(time.Duration) {}})
 	writeRegistry(t, p, 5150, "busy", "work:@1.%7") // never idle: the marker must trip first
-	_, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), time.Second)
+	_, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), time.Second, false)
 	if err == nil || !strings.Contains(err.Error(), "Not logged in") {
 		t.Fatalf("err = %v, want marker failure", err)
 	}
@@ -130,7 +130,7 @@ func TestConfirmClaudeIgnoresStaleMarkerFromEarlierAttempt(t *testing.T) {
 	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: fakeDialer(f), Sleep: func(time.Duration) {}})
 	writeRegistry(t, p, 5150, "busy", "work:@1.%7")
 	go func() { time.Sleep(50 * time.Millisecond); writeRegistry(t, p, 5150, "idle", "work:@1.%7") }()
-	reg, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), 5*time.Second)
+	reg, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("err = %v, want the stale marker to be ignored", err)
 	}
@@ -166,7 +166,7 @@ func TestConfirmClaudeAcceptsBusyPrintModeAfterTurn(t *testing.T) {
 		defer f.Close()
 		f.WriteString(`{"type":"assistant"}` + "\n")
 	}()
-	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second)
+	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("err = %v, want the busy print-mode run to be accepted once its turn lands", err)
 	}
@@ -186,7 +186,7 @@ func TestConfirmClaudeBusyPrintModeTimesOutWithoutATurn(t *testing.T) {
 	os.MkdirAll(proj, 0o700)
 	os.WriteFile(filepath.Join(proj, sid+".jsonl"), []byte(`{"type":"user"}`+"\n"), 0o600)
 	writeRegistryEntrypoint(t, p, 5150, "busy", "", "sdk-cli")
-	_, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 300*time.Millisecond)
+	_, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 300*time.Millisecond, false)
 	if err == nil || !strings.Contains(err.Error(), "not confirmed within") {
 		t.Fatalf("err = %v, want a timeout", err)
 	}
@@ -199,7 +199,7 @@ func TestConfirmClaudeRejectsWrongPane(t *testing.T) {
 	slept := 0
 	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: fakeDialer(f), Sleep: func(time.Duration) { slept++ }})
 	writeRegistry(t, p, 5150, "idle", "other:@9.%9")
-	_, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), 600*time.Millisecond)
+	_, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), 600*time.Millisecond, false)
 	if err == nil || !strings.Contains(err.Error(), "pane") {
 		t.Fatalf("err = %v, want timeout mentioning the pane mismatch", err)
 	}
@@ -350,7 +350,7 @@ func TestConfirmClaudeDialsTmuxOnce(t *testing.T) {
 	slept := 0
 	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: dialer, Sleep: func(time.Duration) { slept++ }})
 	writeRegistry(t, p, 5150, "idle", "other:@9.%9") // never our pane: polls to the deadline
-	if _, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), 300*time.Millisecond); err == nil {
+	if _, err := l.ConfirmClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}, session.ID(sid), 300*time.Millisecond, false); err == nil {
 		t.Fatal("expected a timeout")
 	}
 	if slept < 2 {
@@ -400,7 +400,7 @@ func TestConfirmClaudeAcceptsPrintModeThatExitedBetweenPolls(t *testing.T) {
 	}})
 	writeRegistryEntrypoint(t, p, 5150, "busy", "", "sdk-cli")
 
-	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second)
+	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("err = %v, want the finished print-mode run to be accepted", err)
 	}
@@ -434,7 +434,7 @@ func TestConfirmClaudeDoesNotAcceptAVanishedInteractiveRun(t *testing.T) {
 		}
 	}})
 	writeRegistryEntrypoint(t, p, 5150, "busy", "", "cli")
-	_, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 300*time.Millisecond)
+	_, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 300*time.Millisecond, false)
 	if err == nil || !strings.Contains(err.Error(), "not confirmed within") {
 		t.Fatalf("err = %v, want a timeout", err)
 	}
@@ -477,7 +477,7 @@ func TestConfirmClaudeAcceptsTheRealPrintModeRegistryEntry(t *testing.T) {
 		defer f.Close()
 		f.WriteString(`{"type":"assistant"}` + "\n")
 	}()
-	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second)
+	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second, false)
 	if err != nil {
 		t.Fatalf("err = %v, want the real print-mode entry accepted once its turn lands", err)
 	}

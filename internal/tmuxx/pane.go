@@ -59,6 +59,22 @@ func Capture(ctx context.Context, t Transport, paneID string) ([]byte, error) {
 	return []byte(strings.Join(lines, "\n") + "\n"), nil
 }
 
+// CaptureScreen returns only the pane's VISIBLE screen (no -S -), with
+// the same escapes/join/print flags as Capture. It answers "what is on
+// this pane right now", which is the only form in which a prompt waiting
+// for an answer can be recognised: the same text sitting in the
+// scrollback is a record of a prompt already answered.
+func CaptureScreen(ctx context.Context, t Transport, paneID string) ([]byte, error) {
+	if err := checkTargetID("capture-pane", paneSigil, paneID); err != nil {
+		return nil, err
+	}
+	lines, err := t.Run(ctx, fmt.Sprintf("capture-pane -epJ -t %s", Quote(paneID)))
+	if err != nil {
+		return nil, fmt.Errorf("capture-pane %s: %w", paneID, err)
+	}
+	return []byte(strings.Join(lines, "\n") + "\n"), nil
+}
+
 // SendKeys sends keys to the pane. Key names tmux knows (Enter, C-c, …)
 // are passed bare; everything else is Quoted as literal text.
 func SendKeys(ctx context.Context, t Transport, paneID string, keys ...string) error {

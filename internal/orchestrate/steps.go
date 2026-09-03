@@ -7,6 +7,7 @@ import (
 	"io"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/gitx"
@@ -110,10 +111,102 @@ func (r *runner) runFreeze(ctx context.Context) error {
 	return r.src.Freeze(ctx, reg.PID, reg.ProcStart, r.p.Session.Tmux)
 }
 
+// ---- destination-owned session files -------------------------------------
+
+// destOwnsSession reports whether the destination's Claude is alive in
+// THIS job's own pane (ruling R-P3-TRUST-1 item 3).
+//
+// It can only be true on a re-run: the start step already typed `claude
+// --resume` there and that Claude has been appending to the destination's
+// copy of the transcript ever since. From that moment the session files
+// on the destination are DESTINATION-OWNED — the source's copy is the
+// stale one — so capture, transfer and install must leave them alone and
+// the job goes straight on to confirming, shaping and releasing the
+// source. Re-sending the source's transcript over a live one is exactly
+// what dead-ended the first real teleport: install (rightly) refused the
+// divergence, and no amount of `continue` could ever get past it.
+func (r *runner) destOwnsSession(ctx context.Context) (bool, error) {
+	if r.p.DestRef == nil {
+		return false, nil
+	}
+	reg, ok, err := r.dst.ClaudeStatus(ctx, r.id())
+	if err != nil || !ok {
+		return false, err
+	}
+	return reg.Tmux == tmuxx.RefString(r.p.DestRef), nil
+}
+
+// destOwnedIDs lists the manifest ids the destination now owns: the
+// session files (spec §7.1's CatSession — transcript, session-env, todos,
+// tasks, file-history) once destOwnsSession holds, and nothing at all
+// otherwise. Both the transfer step (what to send and what to wait for)
+// and the install step (what to place) subtract it.
+func (r *runner) destOwnedIDs(ctx context.Context) ([]int, error) {
+	owned, err := r.destOwnsSession(ctx)
+	if err != nil || !owned {
+		return nil, err
+	}
+	m, err := r.manifest()
+	if err != nil {
+		return nil, err
+	}
+	var ids []int
+	for _, e := range m.Entries {
+		if e.Category == session.CatSession {
+			ids = append(ids, e.ID)
+		}
+	}
+	return ids, nil
+}
+
+// noteDestOwned records the destination-owned ids on the plan (so the
+// SOURCE's tar stream stops offering them, see remote.Local.runStream) and
+// returns them as a set. It persists only when the set changed.
+func (r *runner) noteDestOwned(ctx context.Context) (map[int]bool, error) {
+	ids, err := r.destOwnedIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[int]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	// Ownership is a fact about right now, never a latch (PR #11 review):
+	// once the destination Claude has exited, those files are nobody's
+	// live copy again and the ordinary transfer/install must resume — a
+	// stale record here would keep the SOURCE's tar stream refusing to
+	// offer them (runStream subtracts it), dead-ending the transfer.
+	if !sameIDs(ids, r.p.DestOwnedIDs) {
+		if len(ids) > 0 {
+			r.logf("the destination Claude is live in %s: its %d session file(s) are destination-owned and will not be captured, transferred or installed again", tmuxx.RefString(r.p.DestRef), len(ids))
+		} else {
+			r.logf("the destination Claude is no longer live in %s: its %d session file(s) are the source's to transfer again", tmuxx.RefString(r.p.DestRef), len(r.p.DestOwnedIDs))
+		}
+		r.p.DestOwnedIDs = ids
+		if err := r.persist(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return set, nil
+}
+
 // ---- 3 capture ----------------------------------------------------------
 
 func (r *runner) verifyCapture(ctx context.Context) (bool, error) {
-	return r.p.Session.Tmux == nil, nil
+	if r.p.Session.Tmux == nil {
+		return true, nil
+	}
+	// A fresh capture would rebuild the manifest around a transcript the
+	// destination's live Claude has already moved past (R-P3-TRUST-1 item
+	// 3), so there is nothing left for this step to do.
+	owned, err := r.destOwnsSession(ctx)
+	if err != nil {
+		return false, err
+	}
+	if owned {
+		r.logf("capture: the destination Claude is live in %s; the session files are destination-owned, so the source pane is not re-captured", tmuxx.RefString(r.p.DestRef))
+	}
+	return owned, nil
 }
 
 func (r *runner) runCapture(ctx context.Context) error {
@@ -193,9 +286,41 @@ func (r *runner) verifyTransfer(ctx context.Context) (bool, error) {
 	// do — install/git-attach apply it — but Need deliberately keeps
 	// listing it (so a resend after a crash is never skipped), which would
 	// make this step never converge for exactly the fast-forward case.
-	pending := transfer.Pending(m, r.p.Statuses)
+	owned, err := r.noteDestOwned(ctx)
+	if err != nil {
+		return false, err
+	}
+	pending := notOwned(transfer.Pending(m, r.p.Statuses), owned)
 	r.logf("transfer: %d of %d entries still pending", len(pending), len(m.Entries))
 	return len(pending) == 0, nil
+}
+
+// sameIDs compares two id lists element-wise (both are built in manifest
+// order, so no sorting is needed).
+func sameIDs(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// notOwned drops the destination-owned ids from a list of manifest ids.
+func notOwned(ids []int, owned map[int]bool) []int {
+	if len(owned) == 0 {
+		return ids
+	}
+	out := ids[:0:0]
+	for _, id := range ids {
+		if !owned[id] {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func (r *runner) pump(ctx context.Context, kind remote.StreamKind, n string) error {
@@ -224,6 +349,14 @@ func (r *runner) pump(ctx context.Context, kind remote.StreamKind, n string) err
 }
 
 func (r *runner) runTransfer(ctx context.Context) error {
+	// Before the pump, not after: the ids recorded here are what the
+	// SOURCE's tar stream will refuse to offer (remote.Local.runStream
+	// subtracts Plan.DestOwnedIDs from Need), so a transcript the
+	// destination's Claude is writing is never even read, let alone sent.
+	owned, err := r.noteDestOwned(ctx)
+	if err != nil {
+		return err
+	}
 	if err := r.pump(ctx, remote.StreamTar, r.attempt("transfer")); err != nil {
 		return err
 	}
@@ -236,7 +369,7 @@ func (r *runner) runTransfer(ctx context.Context) error {
 	}
 	// Pending (see verifyTransfer): a real "still missing" failure, not an
 	// ff-candidate that is correctly staged and simply awaiting install.
-	if pending := transfer.Pending(m, r.p.Statuses); len(pending) > 0 {
+	if pending := notOwned(transfer.Pending(m, r.p.Statuses), owned); len(pending) > 0 {
 		return fmt.Errorf("%d entries still missing on the destination after the transfer (first: %s)", len(pending), mustEntry(m, pending[0]).Dst)
 	}
 	return r.persist(ctx)
@@ -282,8 +415,15 @@ func (r *runner) foldInstalledIDs(rep *transfer.InstallReport) {
 	// that isn't must never be added — see the doc comment above.
 }
 
-func (r *runner) installManifest() (*transfer.Manifest, error) {
+// installManifest is the manifest the install step actually places: the
+// full one minus git-attach's own entries (deferred) and minus anything
+// the destination now owns (R-P3-TRUST-1 item 3).
+func (r *runner) installManifest(ctx context.Context) (*transfer.Manifest, error) {
 	m, err := r.manifest()
+	if err != nil {
+		return nil, err
+	}
+	owned, err := r.noteDestOwned(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +431,7 @@ func (r *runner) installManifest() (*transfer.Manifest, error) {
 	im := *m
 	im.Entries = nil
 	for _, e := range m.Entries {
-		if !d[e.ID] {
+		if !d[e.ID] && !owned[e.ID] {
 			im.Entries = append(im.Entries, e)
 		}
 	}
@@ -316,11 +456,20 @@ func (r *runner) verifyInstall(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	d := r.deferred()
+	owned, err := r.noteDestOwned(ctx)
+	if err != nil {
+		return false, err
+	}
 	memory := map[int]bool{}
 	for _, e := range r.p.Extras.Memory {
 		memory[e.ID] = true
 	}
 	for _, e := range m.Entries {
+		// A destination-owned entry is the destination's own, live file:
+		// it will never match the source's hash again, and must not.
+		if owned[e.ID] {
+			continue
+		}
 		// A Deferred entry (the pane capture, and existing-main's dirty
 		// index/worktree files) is classified by staging state alone and
 		// can never read back PresentSame — demanding it re-ran install,
@@ -342,7 +491,7 @@ func (r *runner) verifyInstall(ctx context.Context) (bool, error) {
 	// the transcript itself — is already confirmed PresentSame by the
 	// loop above) and needs no path rewriting (an empty PathMap): we are
 	// reading dest-native state, not producing something to send.
-	if r.p.Extras != nil && (r.p.Extras.IndexEntry != nil || len(r.p.Extras.ProjectEntry) > 0 || len(r.p.Extras.History) > 0) {
+	if r.p.Extras != nil && (r.p.Extras.IndexEntry != nil || len(r.p.Extras.ProjectEntry) > 0 || len(r.p.Extras.History) > 0 || r.p.Extras.SourceTrusted) {
 		de, err := r.dst.SessionExtras(ctx, r.id(), session.PathMap{})
 		if err != nil {
 			return false, err
@@ -351,6 +500,14 @@ func (r *runner) verifyInstall(ctx context.Context) (bool, error) {
 			return false, nil
 		}
 		if len(r.p.Extras.ProjectEntry) > 0 && len(de.ProjectEntry) == 0 {
+			return false, nil
+		}
+		// R-P3-TRUST-1 item 1: the trust the source carried must have
+		// reached the destination's own global config before start types
+		// `claude --resume` — de is the DESTINATION's own reading of it
+		// (its cwd's entry, or its main repository's for a linked
+		// worktree), so this is reality, not a journal claim.
+		if r.p.Extras.SourceTrusted && !de.SourceTrusted {
 			return false, nil
 		}
 		// history.jsonl: session.AppendHistory dedups by timestamp+
@@ -366,7 +523,7 @@ func (r *runner) verifyInstall(ctx context.Context) (bool, error) {
 }
 
 func (r *runner) runInstall(ctx context.Context) error {
-	im, err := r.installManifest()
+	im, err := r.installManifest(ctx)
 	if err != nil {
 		return err
 	}
@@ -398,8 +555,11 @@ func (r *runner) runInstall(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	r.logf("install: %d installed, %d already present, %d fast-forwarded, index merged %d, history +%d, project entry added %v, memory copied %d (differs %d)",
-		rep.Installed, rep.SkippedSame, rep.FastForwarded, rep.IndexMerged, rep.HistoryAdded, rep.ProjectEntryAdded, len(rep.MemoryCopied), len(rep.MemoryDiffers))
+	r.logf("install: %d installed, %d already present, %d fast-forwarded, index merged %d, history +%d, project entry added %v, trust granted %v, memory copied %d (differs %d)",
+		rep.Installed, rep.SkippedSame, rep.FastForwarded, rep.IndexMerged, rep.HistoryAdded, rep.ProjectEntryAdded, rep.TrustGranted, len(rep.MemoryCopied), len(rep.MemoryDiffers))
+	if r.p.Extras != nil && r.p.Extras.SourceTrusted {
+		r.logf("install: the source's accepted trust dialog now covers %s on %s", r.p.Extras.TrustCwd, r.p.DestInfo.Hostname)
+	}
 	for _, m := range rep.MemoryDiffers {
 		r.logf("install: memory file differs on the destination and was left alone: %s", m)
 	}
@@ -482,7 +642,7 @@ func (r *runner) verifyStart(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	r.logf("start: session already alive in %s; confirming only", reg.Tmux)
-	if r.p.DestRegistry, err = r.dst.ConfirmClaude(ctx, r.p.DestRef, r.id(), r.p.Options.StartTimeout); err != nil {
+	if r.p.DestRegistry, err = r.dst.ConfirmClaude(ctx, r.p.DestRef, r.id(), r.p.Options.StartTimeout, r.p.sourceTrusted()); err != nil {
 		return false, err
 	}
 	return true, r.persist(ctx)
@@ -497,6 +657,12 @@ func (r *runner) runStart(ctx context.Context) error {
 		r.p.DestRegistry = &session.Registry{SessionID: string(r.id()), Status: "exited"}
 		return r.persist(ctx)
 	}
+	// atTrustPrompt: the pane this job opened is already running the
+	// resumed Claude, stopped at its first-run trust dialog (ruling
+	// R-P3-TRUST-1 item 2). Nothing may be typed over it either way — but
+	// with the source's trust this is not a dead end: ConfirmClaude below
+	// answers the dialog, so start confirms instead of starting again.
+	atTrustPrompt := false
 	if r.p.DestRef != nil {
 		st, err := r.dst.PaneState(ctx, r.p.DestRef)
 		switch {
@@ -505,6 +671,15 @@ func (r *runner) runStart(ctx context.Context) error {
 		case err != nil:
 			return err
 		case !tmuxx.IsShell(st.Command):
+			if _, waiting := remote.HasTrustPrompt(strings.Join(st.Content, "\n")); waiting {
+				if !r.p.sourceTrusted() {
+					return fmt.Errorf("%s on %s pane %s; accept it there, then run claude-teleport continue %s",
+						remote.TrustPromptWaiting, r.p.DestInfo.Hostname, tmuxx.RefString(r.p.DestRef), r.p.JobID)
+				}
+				r.logf("start: %s is already at Claude's trust prompt; confirming (which answers it) rather than typing over it", tmuxx.RefString(r.p.DestRef))
+				atTrustPrompt = true
+				break
+			}
 			return fmt.Errorf("destination pane %s we opened earlier now runs %q; refusing to type over it — wait for that command to finish (or close the pane) and re-run `claude-teleport continue %s`", r.p.DestRef.PaneID, st.Command, r.p.JobID)
 		}
 	}
@@ -524,11 +699,13 @@ func (r *runner) runStart(ctx context.Context) error {
 			return err
 		}
 	}
-	argv := PlaceholderArgv(r.id(), r.captureOnDest(), true, "", "")
-	if err := r.dst.StartClaude(ctx, r.p.DestRef, r.id(), r.p.JobID, argv); err != nil {
-		return err
+	if !atTrustPrompt {
+		argv := PlaceholderArgv(r.id(), r.captureOnDest(), true, "", "")
+		if err := r.dst.StartClaude(ctx, r.p.DestRef, r.id(), r.p.JobID, argv); err != nil {
+			return err
+		}
 	}
-	reg, err := r.dst.ConfirmClaude(ctx, r.p.DestRef, r.id(), r.p.Options.StartTimeout)
+	reg, err := r.dst.ConfirmClaude(ctx, r.p.DestRef, r.id(), r.p.Options.StartTimeout, r.p.sourceTrusted())
 	if err != nil {
 		return err
 	}

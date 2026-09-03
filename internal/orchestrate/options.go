@@ -73,7 +73,15 @@ type Plan struct {
 	// Statuses can no longer answer "what did THIS job install" (ruling
 	// R-P3-23a). abandon --delete-destination-files reads this field
 	// directly instead of deriving a candidate set from Statuses.
-	InstalledIDs   []int                   `json:"installed_ids"`
+	InstalledIDs []int `json:"installed_ids"`
+	// DestOwnedIDs is the manifest ids the DESTINATION's own live Claude
+	// owns: once it is running the session in the pane this job opened, it
+	// is the writer of those files and the source's copies are stale
+	// (ruling R-P3-TRUST-1 item 3). It is recorded on the plan — and so
+	// travels to both hosts' journals — because the SOURCE's tar stream
+	// reads it (remote.Local.runStream subtracts it from transfer.Need) to
+	// stop offering a transcript the destination is appending to.
+	DestOwnedIDs   []int                   `json:"dest_owned_ids,omitempty"`
 	Extras         *transfer.InstallExtras `json:"extras"`
 	CaptureEntryID int                     `json:"capture_entry_id"`
 	DestCwd        string                  `json:"dest_cwd"`
@@ -118,6 +126,15 @@ type UnreachableError struct {
 
 func (e *UnreachableError) Error() string { return fmt.Sprintf("%s: %v", e.Host, e.Err) }
 func (e *UnreachableError) Unwrap() error { return e.Err }
+
+// sourceTrusted is a nil-safe accessor for the source session's answer to
+// Claude Code's first-run trust dialog, carried in the install extras
+// (ruling R-P3-TRUST-1). The start step relays it to the destination so a
+// destination sitting at that dialog can be answered rather than timing
+// out; without it, nothing is ever typed at the dialog.
+func (p *Plan) sourceTrusted() bool {
+	return p.Extras != nil && p.Extras.SourceTrusted
+}
 
 // sourceState is a nil-safe accessor used by the steps.
 func (p *Plan) sourceState() session.State {

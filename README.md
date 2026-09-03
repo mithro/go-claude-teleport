@@ -352,6 +352,15 @@ here with `--from <host>` to inspect it locally).
   the pane — the normal case — is unaffected. The teleport still completes:
   the source is re-frozen only until step 9, which thaws it and asks it to
   exit.
+- **The trust dialog is only answered in a tmux pane.** When the
+  destination's Claude Code has never been trusted for that directory it
+  stops at its first-run "Quick safety check" dialog and registers
+  nothing; the teleport carries the source's own answer and presses it
+  there for you. Without tmux on the destination (`--no-tmux`, or no live
+  server), the resume runs under a pty with no pane to type into, so a
+  session that would hit that dialog fails confirmation instead — accept
+  it once on the destination (`claude` in that directory) and re-run
+  `claude-teleport continue <session>`.
 - **`-p` (print) session confirmation is best-effort.** Non-interactive
   runs are confirmed via the registry's `status` turning `busy` after a
   turn rather than a prompt actually being reached on screen.

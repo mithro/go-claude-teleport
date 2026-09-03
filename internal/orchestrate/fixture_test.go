@@ -75,6 +75,19 @@ type host struct {
 	tmux  *fakeTmux
 }
 
+// newHost builds a host whose panes are spawned with extraEnv on top of
+// the standard set (used to put fakeclaude into its trust-prompt mode on
+// the destination, FAKECLAUDE_TRUST_PROMPT=1).
+func newHostEnv(t *testing.T, name, user string, tm *fakeTmux, extraEnv ...string) *host {
+	t.Helper()
+	h := newHost(t, name, user, tm)
+	if tm != nil && len(extraEnv) > 0 {
+		base := tm.env
+		tm.env = func(paneID, sess, win string) []string { return append(base(paneID, sess, win), extraEnv...) }
+	}
+	return h
+}
+
 func newHost(t *testing.T, name, user string, tm *fakeTmux) *host {
 	t.Helper()
 	home := filepath.Join(t.TempDir(), "home", user)

@@ -286,6 +286,17 @@ func AppendHistory(historyFile string, lines []json.RawMessage) (added int, err 
 type ProjectEntry = map[string]any   // opaque; only copied whole
 func ReadProjectEntry(globalJSON, cwd string) (ProjectEntry, bool, error)
 func AddProjectEntry(globalJSON, cwd string, e ProjectEntry) (added bool, err error) // no-op if present; backup + temp + rename
+// TrustAccepted / GrantProjectTrust (ruling R-P3-TRUST-1): the one field
+// of a project entry the teleport reads rather than copies whole. Real
+// Claude Code 2.1.259 records its first-run trust dialog as
+// projects.<cwd>.hasTrustDialogAccepted — and for a session whose cwd is a
+// LINKED git worktree it keys that entry by the MAIN repository path, the
+// worktree cwd having no entry at all. GrantProjectTrust creates the entry
+// when absent and otherwise sets only that field; granted is false when it
+// already said true, so it is idempotent. Both writers (Add/Grant) share
+// one backup + temp + rename implementation.
+func TrustAccepted(e ProjectEntry) bool
+func GrantProjectTrust(globalJSON, cwd string) (granted bool, err error)
 ```
 
 ## internal/claudecfg
@@ -550,7 +561,14 @@ type Endpoint interface {
     Capture(ctx context.Context, ref *session.TmuxRef, jobID string) error   // writes jobs/<id>/capture.txt on that host
     OpenWindow(ctx context.Context, p *tmuxx.Plan) (*session.TmuxRef, error)
     StartClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, jobID string, argv []string) error
-    ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration) (*session.Registry, error)
+    // trusted (ruling R-P3-TRUST-1) is the SOURCE session's own answer to
+    // Claude Code's first-run trust dialog. A destination Claude waiting at
+    // that dialog has resumed but writes no registry entry until it is
+    // answered; with trusted set, ConfirmClaude answers it once (Down,
+    // Enter) in the job's own pane, and without it fails with an error
+    // naming the host, the pane and the `continue` command. Carried on the
+    // wire as ConfirmClaudeArgs.Trusted (`json:"trusted,omitempty"`).
+    ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id session.ID, timeout time.Duration, trusted bool) (*session.Registry, error)
     ExitClaude(ctx context.Context, ref *session.TmuxRef, pid int, startTime string, timeout time.Duration) error
     TypeCommand(ctx context.Context, ref *session.TmuxRef, argv []string) error
     PaneState(ctx context.Context, ref *session.TmuxRef) (*tmuxx.PaneState, error)
@@ -701,6 +719,11 @@ type InstallReport struct {
     Installed, SkippedSame, FastForwarded int
     IndexMerged, HistoryAdded            int
     ProjectEntryAdded                    bool
+    // TrustGranted (ruling R-P3-TRUST-1) says this call marked
+    // InstallExtras.TrustCwd trusted in the destination's global config.
+    // False when the source was not trusted, or the destination already
+    // said so — the grant is idempotent.
+    TrustGranted                         bool
     MemoryCopied, MemoryDiffers          []string
 }
 // Install moves staged entries into place per spec §7.5 and performs the
@@ -712,6 +735,18 @@ type InstallExtras struct {
     History      []json.RawMessage
     ProjectCwd   string
     ProjectEntry session.ProjectEntry
+    // TrustCwd/SourceTrusted (ruling R-P3-TRUST-1) carry the source's
+    // answer to Claude Code's first-run trust dialog. TrustCwd is the
+    // DESTINATION path whose project entry grants it: ProjectCwd for an
+    // ordinary session, and the mapped MAIN repository path when the cwd
+    // is a linked git worktree — real Claude Code 2.1.259 keys the entry
+    // there, not at the worktree. Install grants it (session.
+    // GrantProjectTrust) before the start step and refuses a TrustCwd
+    // that is not absolute and clean, that is the destination's own Home,
+    // ConfigDir, DataDir or "/", or that is not a path this manifest
+    // already names (its ProjectCwd or one of its Roots).
+    TrustCwd      string `json:"trust_cwd,omitempty"`
+    SourceTrusted bool   `json:"source_trusted,omitempty"`
     Memory       []Entry // memory files: copy only if absent
 }
 ```
@@ -942,6 +977,11 @@ type PaneState struct {
 }
 func OpenWindow(ctx context.Context, t Transport, p *Plan) (*session.TmuxRef, error)
 func Capture(ctx context.Context, t Transport, paneID string) ([]byte, error)  // -epJ -S -
+// CaptureScreen is Capture without -S -: only the pane's VISIBLE screen.
+// It answers "what is on this pane right now", the only form in which a
+// prompt still waiting for an answer can be recognised — the same text in
+// the scrollback records a prompt already answered (ruling R-P3-TRUST-1).
+func CaptureScreen(ctx context.Context, t Transport, paneID string) ([]byte, error) // -epJ
 func SendKeys(ctx context.Context, t Transport, paneID string, keys ...string) error
 func TypeCommand(ctx context.Context, t Transport, paneID string, argv []string) error // leading space + Enter
 func State(ctx context.Context, t Transport, paneID string, procs *procx.Table) (*PaneState, error)

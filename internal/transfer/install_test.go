@@ -1010,3 +1010,110 @@ func TestDiffTreatsThisJobsOwnRootAsInstallable(t *testing.T) {
 		t.Errorf("entry 1 (not yet placed, same root) = %s, want %s", st[1], StagedSame)
 	}
 }
+
+// TestInstallGrantsTrustAtTheMainRepoPath is ruling R-P3-TRUST-1 item 1's
+// destination half: when the source's session was trusted under a path
+// that is NOT the session cwd (a linked worktree's main repository), the
+// destination must grant the trust dialog at that mapped path — the one
+// the destination's Claude Code will actually consult — before the start
+// step ever types `claude --resume`.
+func TestInstallGrantsTrustAtTheMainRepoPath(t *testing.T) {
+	m, staging, p := staged(t)
+	main := filepath.Join(p.Home, "repo")
+	worktree := filepath.Join(main, ".worktrees", "x")
+	// The trust may only be granted somewhere the manifest itself names:
+	// its own ProjectCwd, or one of the repository roots it declares.
+	m.Roots = GitRoots(main, worktree, false)
+	st, _ := Diff(context.Background(), m, staging, p)
+	extra := InstallExtras{
+		ProjectCwd:    worktree,
+		TrustCwd:      main,
+		SourceTrusted: true,
+	}
+	rep, err := Install(context.Background(), m, st, staging, p, extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.TrustGranted {
+		t.Error("TrustGranted = false, want the trust merged on the destination")
+	}
+	e, ok, err := session.ReadProjectEntry(p.GlobalJSON, main)
+	if err != nil || !ok || !session.TrustAccepted(e) {
+		t.Fatalf("projects[%q] = %+v (%v %v)", main, e, ok, err)
+	}
+	// Idempotent: a re-run (continue) grants nothing new. Everything is
+	// PresentSame by now, so the re-diff is what a continue really sees.
+	st2, _ := Diff(context.Background(), m, staging, p)
+	rep2, err := Install(context.Background(), m, st2, staging, p, extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep2.TrustGranted {
+		t.Error("TrustGranted = true on a second install: the grant must be idempotent")
+	}
+}
+
+// TestInstallRefusesTrustOutsideTheManifestsOwnPaths is PR #11 review item
+// 3: TrustCwd is source-supplied, so it may only ever name a path this
+// manifest already names — its ProjectCwd or one of its declared roots
+// (DstMain/DstWorktree). Anything else, however plausible, is refused
+// before a single byte of the global config is rewritten.
+func TestInstallRefusesTrustOutsideTheManifestsOwnPaths(t *testing.T) {
+	m, staging, p := staged(t)
+	main := filepath.Join(p.Home, "repo")
+	worktree := filepath.Join(main, ".worktrees", "x")
+	m.Roots = GitRoots(main, worktree, false)
+	for _, bad := range []string{"/etc", filepath.Join(p.Home, "elsewhere"), filepath.Dir(main)} {
+		// A fresh diff each pass: an earlier Install in this loop has
+		// already moved the staged files into place (the trust grant is
+		// the last thing install does), so the statuses have moved on.
+		st, _ := Diff(context.Background(), m, staging, p)
+		extra := InstallExtras{ProjectCwd: worktree, TrustCwd: bad, SourceTrusted: true}
+		if _, err := Install(context.Background(), m, st, staging, p, extra); err == nil {
+			t.Errorf("TrustCwd %q was accepted: it is neither the manifest's ProjectCwd nor one of its roots", bad)
+		}
+		if e, _, err := session.ReadProjectEntry(p.GlobalJSON, bad); err != nil || e != nil {
+			t.Errorf("projects[%q] = %v (%v): nothing may be written for a refused trust cwd", bad, e, err)
+		}
+	}
+	// The declared worktree root and the ProjectCwd itself are both fine.
+	for _, ok := range []string{worktree, main} {
+		st, _ := Diff(context.Background(), m, staging, p)
+		extra := InstallExtras{ProjectCwd: worktree, TrustCwd: ok, SourceTrusted: true}
+		if _, err := Install(context.Background(), m, st, staging, p, extra); err != nil {
+			t.Errorf("TrustCwd %q refused: %v", ok, err)
+		}
+		if e, found, err := session.ReadProjectEntry(p.GlobalJSON, ok); err != nil || !found || !session.TrustAccepted(e) {
+			t.Errorf("projects[%q] = %v %v (%v)", ok, e, found, err)
+		}
+	}
+}
+
+// TestInstallRefusesTrustAtADangerousPath: even a path the manifest names,
+// the destination never grants the trust dialog for its own home, config
+// dir or data dir.
+func TestInstallRefusesTrustAtADangerousPath(t *testing.T) {
+	for _, bad := range []string{"", "relative/path", "/home/bob/../bob"} {
+		m, staging, p := staged(t)
+		st, _ := Diff(context.Background(), m, staging, p)
+		extra := InstallExtras{ProjectCwd: filepath.Join(p.Home, "work"), TrustCwd: bad, SourceTrusted: true}
+		if _, err := Install(context.Background(), m, st, staging, p, extra); err == nil {
+			t.Errorf("TrustCwd %q was accepted", bad)
+		}
+	}
+	for _, bad := range []func(p session.Paths) string{
+		func(p session.Paths) string { return p.Home },
+		func(p session.Paths) string { return p.ConfigDir },
+		func(p session.Paths) string { return p.DataDir },
+		func(p session.Paths) string { return "/" },
+	} {
+		m, staging, p := staged(t)
+		// Declared as the manifest's own ProjectCwd, so only the
+		// dangerous-path rule can be what refuses it.
+		st, _ := Diff(context.Background(), m, staging, p)
+		extra := InstallExtras{ProjectCwd: bad(p), TrustCwd: bad(p), SourceTrusted: true}
+		if _, err := Install(context.Background(), m, st, staging, p, extra); err == nil {
+			t.Errorf("TrustCwd %q was accepted", bad(p))
+		}
+	}
+}

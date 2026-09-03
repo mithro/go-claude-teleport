@@ -14,6 +14,7 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
@@ -345,7 +346,7 @@ func TestInstallVerifyRequiresMergePhaseNotJustFilePlacement(t *testing.T) {
 	if err := r.runTransfer(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	im, err := r.installManifest()
+	im, err := r.installManifest(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -830,4 +831,284 @@ func installDirs(t *testing.T, dst *host, jobID string, dirs ...string) {
 			t.Fatalf("install did not create %s: %v", d, err)
 		}
 	}
+}
+
+// liveDestEndpoint is a destination whose Claude is alive in the job's own
+// pane; everything else is the real Local underneath.
+type liveDestEndpoint struct {
+	remote.Endpoint
+	reg *session.Registry
+}
+
+func (d *liveDestEndpoint) ClaudeStatus(context.Context, session.ID) (*session.Registry, bool, error) {
+	return d.reg, true, nil
+}
+
+// TestContinueTreatsALiveDestSessionAsDestinationOwned is ruling
+// R-P3-TRUST-1 item 3. Once the destination's Claude is alive in the pane
+// THIS job opened, the session files on the destination belong to it: it
+// has been appending resume records to that transcript. A `continue` must
+// therefore never re-capture, re-transfer or re-install them — which is
+// how the first real teleport dead-ended, re-sending a transcript the
+// destination Claude had grown and then (correctly, safely) having the
+// install refuse the divergence for ever.
+func TestContinueTreatsALiveDestSessionAsDestinationOwned(t *testing.T) {
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	jobID := sid
+	ref := &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}
+	transcript := filepath.Join(dst.paths.ProjectDir("/home/bob/proj"), sid+".jsonl")
+	m := &transfer.Manifest{Version: 1, JobID: jobID, SessionID: jobID, Entries: []transfer.Entry{
+		{ID: 0, Category: session.CatSession, Mode: 0o600, Size: 10, Dst: transcript, FFAllowed: true},
+	}}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	if err := m.Save(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plan{
+		JobID: jobID, ManifestPath: manifestPath, DestRef: ref,
+		// A source pane exists, so the capture step has work to do until
+		// the destination owns the session files.
+		Session: &session.Session{ID: session.ID(sid), State: session.StateIdle,
+			Tmux: &session.TmuxRef{SocketPath: "/s", Session: "main", WindowID: "@2", PaneID: "%2"}},
+		Git: &gitx.Plan{Mode: gitx.ModeNotRepo}, Extras: &transfer.InstallExtras{},
+		CaptureEntryID: -1,
+	}
+	j := &job.Journal{ID: jobID}
+	j.Step("transfer").Attempts = 1 // an ff-candidate's Pending is only trustworthy after a pump
+
+	// Baseline: with nothing alive on the destination the transcript is
+	// simply missing, so every one of these steps has work to do.
+	cold := &runner{p: p, j: j, src: dst.ep, dst: dst.ep, logf: t.Logf}
+	for _, c := range []struct {
+		name   string
+		verify func(context.Context) (bool, error)
+	}{{"capture", cold.verifyCapture}, {"transfer", cold.verifyTransfer}, {"install", cold.verifyInstall}} {
+		done, err := c.verify(context.Background())
+		if err != nil {
+			t.Fatalf("%s.Verify: %v", c.name, err)
+		}
+		if done {
+			t.Fatalf("%s.Verify = done with the transcript absent on the destination", c.name)
+		}
+	}
+
+	// Now the destination's Claude is alive in OUR pane.
+	live := &liveDestEndpoint{Endpoint: dst.ep, reg: &session.Registry{SessionID: sid, PID: 4242, Status: "idle", Tmux: "work:@1.%7"}}
+	r := &runner{p: p, j: j, src: dst.ep, dst: live, logf: t.Logf}
+	owned, err := r.destOwnsSession(context.Background())
+	if err != nil || !owned {
+		t.Fatalf("destOwnsSession = %v %v, want true", owned, err)
+	}
+	for _, c := range []struct {
+		name   string
+		verify func(context.Context) (bool, error)
+	}{{"capture", r.verifyCapture}, {"transfer", r.verifyTransfer}, {"install", r.verifyInstall}} {
+		done, err := c.verify(context.Background())
+		if err != nil {
+			t.Fatalf("%s.Verify: %v", c.name, err)
+		}
+		if !done {
+			t.Errorf("%s.Verify = not done, but the destination owns the session files", c.name)
+		}
+	}
+	// And nothing session-shaped may reach install or the tar stream.
+	im, err := r.installManifest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(im.Entries) != 0 {
+		t.Errorf("install manifest still carries %d entry/entries: %+v", len(im.Entries), im.Entries)
+	}
+	ids, err := r.destOwnedIDs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != 0 {
+		t.Errorf("destOwnedIDs = %v, want the session entry's id", ids)
+	}
+	// A destination whose Claude runs in some OTHER pane is not ours.
+	elsewhere := &liveDestEndpoint{Endpoint: dst.ep, reg: &session.Registry{SessionID: sid, PID: 4242, Status: "idle", Tmux: "other:@9.%9"}}
+	r2 := &runner{p: p, j: j, src: dst.ep, dst: elsewhere, logf: t.Logf}
+	if owned, err := r2.destOwnsSession(context.Background()); err != nil || owned {
+		t.Errorf("destOwnsSession = %v %v for a session alive in another pane, want false", owned, err)
+	}
+}
+
+// deadDestEndpoint is a destination with no live Claude at all.
+type deadDestEndpoint struct{ remote.Endpoint }
+
+func (deadDestEndpoint) ClaudeStatus(context.Context, session.ID) (*session.Registry, bool, error) {
+	return nil, false, nil
+}
+
+// TestDestOwnedIDsAreClearedWhenTheDestinationClaudeExits is PR #11 review
+// item 1: destination ownership is a fact about right now, not a one-way
+// latch. Once the destination Claude has exited (the user /exit'd it, it
+// crashed), the session files there are nobody's live copy again — so a
+// `continue` must transfer and install them normally. A sticky
+// Plan.DestOwnedIDs would keep the SOURCE's tar stream refusing to offer
+// them (remote.Local.runStream subtracts the recorded ids), dead-ending
+// the transfer step with "still missing" or leaving --force with nothing
+// staged to hash.
+func TestDestOwnedIDsAreClearedWhenTheDestinationClaudeExits(t *testing.T) {
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	jobID := sid
+	ref := &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}
+	transcript := filepath.Join(dst.paths.ProjectDir("/home/bob/proj"), sid+".jsonl")
+	m := &transfer.Manifest{Version: 1, JobID: jobID, SessionID: jobID, Entries: []transfer.Entry{
+		{ID: 0, Category: session.CatSession, Mode: 0o600, Size: 10, Dst: transcript, FFAllowed: true},
+	}}
+	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
+	if err := m.Save(manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	p := &Plan{
+		JobID: jobID, ManifestPath: manifestPath, DestRef: ref,
+		Session: &session.Session{ID: session.ID(sid), State: session.StateIdle,
+			Tmux: &session.TmuxRef{SocketPath: "/s", Session: "main", WindowID: "@2", PaneID: "%2"}},
+		Git: &gitx.Plan{Mode: gitx.ModeNotRepo}, Extras: &transfer.InstallExtras{},
+		CaptureEntryID: -1,
+		// The previous attempt recorded the destination as the owner.
+		DestOwnedIDs: []int{0},
+	}
+	j := &job.Journal{ID: jobID}
+	j.Step("transfer").Attempts = 1
+
+	r := &runner{p: p, j: j, src: dst.ep, dst: deadDestEndpoint{Endpoint: dst.ep}, logf: t.Logf}
+	owned, err := r.noteDestOwned(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(owned) != 0 {
+		t.Errorf("noteDestOwned = %v with no live destination Claude", owned)
+	}
+	if len(r.p.DestOwnedIDs) != 0 {
+		t.Errorf("Plan.DestOwnedIDs = %v, want it cleared once the destination Claude is gone", r.p.DestOwnedIDs)
+	}
+	jp, err := PlanFromJournal(r.j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jp.DestOwnedIDs) != 0 {
+		t.Errorf("journal Plan.DestOwnedIDs = %v, want the clearing persisted", jp.DestOwnedIDs)
+	}
+	// And the steps go back to doing their ordinary work.
+	done, err := r.verifyTransfer(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done {
+		t.Error("transfer.Verify = done, but the transcript is absent on the destination and no longer destination-owned")
+	}
+	im, err := r.installManifest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(im.Entries) != 1 {
+		t.Errorf("install manifest = %d entries, want the session entry back", len(im.Entries))
+	}
+}
+
+// TestSameIDs is the small table the review asked for: the predicate that
+// decides whether Plan.DestOwnedIDs changed (and so must be persisted).
+func TestSameIDs(t *testing.T) {
+	cases := []struct {
+		a, b []int
+		want bool
+	}{
+		{nil, nil, true},
+		{[]int{}, nil, true},
+		{[]int{1, 2}, []int{1, 2}, true},
+		{[]int{1, 2}, []int{2, 1}, false},
+		{[]int{1}, []int{1, 2}, false},
+		{nil, []int{0}, false},
+	}
+	for _, c := range cases {
+		if got := sameIDs(c.a, c.b); got != c.want {
+			t.Errorf("sameIDs(%v, %v) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// trustPanePendingEndpoint is a destination whose pane already runs Claude,
+// waiting at its first-run trust dialog, with no registry entry.
+type trustPanePendingEndpoint struct {
+	remote.Endpoint
+	typed     bool
+	confirmed bool
+	reg       *session.Registry
+}
+
+func (e *trustPanePendingEndpoint) PaneState(context.Context, *session.TmuxRef) (*tmuxx.PaneState, error) {
+	return &tmuxx.PaneState{PaneID: "%7", Command: "claude", Argv: []string{"claude", "--resume", sid}, PID: 4242,
+		Content: []string{"Quick safety check: Is this a project you created or one you trust?", " ❯ No, exit", "   Yes, I trust this folder"}}, nil
+}
+
+func (e *trustPanePendingEndpoint) ClaudeStatus(context.Context, session.ID) (*session.Registry, bool, error) {
+	return nil, false, nil
+}
+
+func (e *trustPanePendingEndpoint) StartClaude(context.Context, *session.TmuxRef, session.ID, string, []string) error {
+	e.typed = true
+	return nil
+}
+
+func (e *trustPanePendingEndpoint) ConfirmClaude(context.Context, *session.TmuxRef, session.ID, time.Duration, bool) (*session.Registry, error) {
+	e.confirmed = true
+	return e.reg, nil
+}
+
+func (e *trustPanePendingEndpoint) JournalPut(context.Context, *job.Journal) error { return nil }
+
+// TestRunStartOnAPaneStillAtTheTrustDialog is PR #11 review minor 4: the
+// pane this job opened is running Claude, not a shell, so start must not
+// type over it. Without the source's trust that is a dead end and the
+// error has to be the trust advice — never the generic "now runs %q"
+// message, which the CLI answers with the misleading `/login` hint. With
+// the source's trust it is not a dead end at all: confirmation answers the
+// dialog, so start confirms instead of typing a second `claude --resume`.
+func TestRunStartOnAPaneStillAtTheTrustDialog(t *testing.T) {
+	newRunner := func(trusted bool, ep remote.Endpoint) *runner {
+		extras := &transfer.InstallExtras{SourceTrusted: trusted}
+		p := &Plan{
+			JobID: sid, Session: &session.Session{ID: session.ID(sid), State: session.StateIdle},
+			DestInfo: remote.HostInfo{Hostname: "dest.private"}, Extras: extras,
+			Tmux:    &tmuxx.Plan{SocketPath: "/s", Group: "work", WindowName: "claude"},
+			DestRef: &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"},
+			Options: Options{StartTimeout: time.Second},
+		}
+		return &runner{p: p, j: &job.Journal{ID: sid}, src: ep, dst: ep, logf: t.Logf}
+	}
+	t.Run("untrusted: the trust advice, not the generic refusal", func(t *testing.T) {
+		ep := &trustPanePendingEndpoint{}
+		r := newRunner(false, ep)
+		err := r.runStart(context.Background())
+		if err == nil {
+			t.Fatal("runStart succeeded over a pane still at the trust dialog")
+		}
+		for _, want := range []string{remote.TrustPromptWaiting, "dest.private", "work:@1.%7", "claude-teleport continue " + sid} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "refusing to type over it") {
+			t.Errorf("the generic pane refusal is the wrong diagnosis here: %v", err)
+		}
+		if ep.typed {
+			t.Error("nothing may be typed into a pane already running Claude")
+		}
+	})
+	t.Run("trusted: confirm answers it instead of typing again", func(t *testing.T) {
+		ep := &trustPanePendingEndpoint{reg: &session.Registry{SessionID: sid, PID: 4242, Status: "idle", Tmux: "work:@1.%7"}}
+		r := newRunner(true, ep)
+		if err := r.runStart(context.Background()); err != nil {
+			t.Fatalf("runStart = %v, want the confirm step to answer the dialog", err)
+		}
+		if ep.typed {
+			t.Error("start typed a second `claude --resume` over a live Claude")
+		}
+		if !ep.confirmed {
+			t.Error("start did not confirm (and so never answered the dialog)")
+		}
+	})
 }

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -302,4 +303,70 @@ func TestRegistryEntrypoint(t *testing.T) {
 	if pr.Kind != "interactive" || pr.Entrypoint != "sdk-cli" {
 		t.Errorf("print-mode registry kind=%q entrypoint=%q, want interactive/sdk-cli: %s", pr.Kind, pr.Entrypoint, data)
 	}
+}
+
+// TestTrustPromptModeWaitsForDownThenEnter covers FAKECLAUDE_TRUST_PROMPT
+// (added for ruling R-P3-TRUST-1): the dialog is printed and NO registry
+// entry exists until it is answered — the shape of a real Claude Code
+// first run, and what makes a destination stuck on it invisible to the
+// confirm step. Down+Enter answers "Yes, I trust this folder" and the
+// session comes up; a bare Enter is "No, exit".
+func TestTrustPromptModeWaitsForDownThenEnter(t *testing.T) {
+	e := setup(t)
+	c := e.cmd(t, []string{"FAKECLAUDE_TRUST_PROMPT=1"}, "--session-id", sid)
+	stdin, _ := c.StdinPipe()
+	var out lockedString
+	c.Stdout, c.Stderr = &out, os.Stderr
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { c.Process.Kill(); c.Wait() }()
+	pid := c.Process.Pid
+	waitFor(t, "the trust dialog", func() bool { return strings.Contains(out.String(), "Quick safety check") })
+	if _, ok := registry(e, pid); ok {
+		t.Fatal("a Claude waiting at the trust dialog must have no registry entry")
+	}
+	// The cursor-down sequence real tmux sends, then Enter.
+	io.WriteString(stdin, "\x1b[B\r")
+	waitFor(t, "registry idle", func() bool { r, ok := registry(e, pid); return ok && r.Status == "idle" })
+	if !strings.Contains(out.String(), "Yes, I trust this folder") {
+		t.Errorf("output should show the answered dialog:\n%s", out.String())
+	}
+	io.WriteString(stdin, "/exit\n")
+	if err := c.Wait(); err != nil {
+		t.Fatalf("exit: %v", err)
+	}
+
+	// Enter alone selects "No, exit": non-zero, no registry, no session.
+	c2 := e.cmd(t, []string{"FAKECLAUDE_TRUST_PROMPT=1"}, "--session-id", sid)
+	stdin2, _ := c2.StdinPipe()
+	c2.Stdout, c2.Stderr = io.Discard, os.Stderr
+	if err := c2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(stdin2, "\r")
+	if err := c2.Wait(); err == nil {
+		t.Error("declining the trust dialog must exit non-zero")
+	}
+	if _, ok := registry(e, c2.Process.Pid); ok {
+		t.Error("declining the trust dialog must leave no registry entry")
+	}
+}
+
+// lockedString is a concurrency-safe io.Writer for a child's stdout.
+type lockedString struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedString) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedString) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }

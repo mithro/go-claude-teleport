@@ -31,6 +31,51 @@ func ReadProjectEntry(globalJSON, cwd string) (ProjectEntry, bool, error) {
 // and only to add a key; every other key is preserved byte-for-byte in
 // value (numbers via json.Number, HTML unescaped).
 func AddProjectEntry(globalJSON, cwd string, e ProjectEntry) (added bool, err error) {
+	return editProjects(globalJSON, func(projects map[string]any) bool {
+		if _, present := projects[cwd]; present {
+			return false
+		}
+		projects[cwd] = e
+		return true
+	})
+}
+
+// TrustAccepted reports whether a project entry records the first-run
+// trust dialog as accepted. Verified against real Claude Code 2.1.259:
+// the flag is projects.<cwd>.hasTrustDialogAccepted, a JSON true — and
+// for a session running in a LINKED git worktree the entry that carries
+// it is the one keyed by the MAIN repository path, not by the worktree
+// cwd (see remote.Local.SessionExtras).
+func TrustAccepted(e ProjectEntry) bool {
+	v, _ := e["hasTrustDialogAccepted"].(bool)
+	return v
+}
+
+// GrantProjectTrust marks projects[cwd] as trusted (ruling R-P3-TRUST-1
+// item 1), creating the entry when it is absent and otherwise setting
+// only that one field — everything else in the entry, and in the file, is
+// left exactly as it was. granted is false when the entry already said
+// true, so the call is idempotent and writes nothing in that case.
+func GrantProjectTrust(globalJSON, cwd string) (granted bool, err error) {
+	return editProjects(globalJSON, func(projects map[string]any) bool {
+		e, _ := projects[cwd].(map[string]any)
+		if TrustAccepted(e) {
+			return false
+		}
+		if e == nil {
+			e = map[string]any{}
+		}
+		e["hasTrustDialogAccepted"] = true
+		projects[cwd] = e
+		return true
+	})
+}
+
+// editProjects applies mutate to the file's "projects" map and rewrites
+// the file when mutate reports a change (backup first, then temp file +
+// rename). It is the ONE writer of the global config: AddProjectEntry and
+// GrantProjectTrust differ only in what they do to the map.
+func editProjects(globalJSON string, mutate func(projects map[string]any) bool) (changed bool, err error) {
 	doc, exists, err := readJSONDoc(globalJSON)
 	if err != nil {
 		return false, err
@@ -42,7 +87,7 @@ func AddProjectEntry(globalJSON, cwd string, e ProjectEntry) (added bool, err er
 	if projects == nil {
 		projects = map[string]any{}
 	}
-	if _, present := projects[cwd]; present {
+	if !mutate(projects) {
 		return false, nil
 	}
 	if exists {
@@ -50,7 +95,6 @@ func AddProjectEntry(globalJSON, cwd string, e ProjectEntry) (added bool, err er
 			return false, fmt.Errorf("backup %s: %w", globalJSON, err)
 		}
 	}
-	projects[cwd] = e
 	doc["projects"] = projects
 	out, err := encodeIndented(doc)
 	if err != nil {
