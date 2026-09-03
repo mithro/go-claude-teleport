@@ -186,10 +186,39 @@ func underDir(cleanPath, dir string) bool {
 // hostile or buggy source put in the wire Dst field. jobID is the
 // manifest's own JobID (callers pass m.JobID), matching the path
 // internal/orchestrate/steps.go built the entry with on the source side.
+//
+// Ruling R-P3-B1c: a CatPack entry is refused outright — see Diff's own
+// CatPack branch for why no Dst is ever legitimate for that category.
+// CatSession and CatCapture are the only two categories with a Dst this
+// function can fully authenticate on its own (ConfigDir+Forbidden, and the
+// re-derived canonical path, respectively). CatRepo/CatWorktree sit in
+// between: existing-main's dirty index/worktree files carry those
+// categories AND Entry.Deferred, and are refused by Install's separate
+// "only capture may be deferred" gate below — installManifest
+// (internal/orchestrate/steps.go) never even sends them here. But a
+// NON-deferred CatRepo/CatWorktree entry is legitimately placed by this
+// very function: fresh-main (session.CatRepo covering the whole transferred
+// .git, session.CatWorktree for a linked worktree) and not-a-repo cwds
+// (session.CatWorktree for every plain file) copy their entire tree through
+// the ordinary Install path, not through gitx.Attach, which does nothing at
+// all for an unlinked fresh-main and only repairs linked metadata otherwise
+// (internal/gitx/attach.go, internal/gitx/plan.go: NeedPack stays false for
+// ModeFreshMain). Their Dst is checked only "under Home" here, same as any
+// other non-special category — this function has no access to the git
+// plan's DstMain/DstWorktree to check tighter containment, so a hostile
+// source naming CatRepo/CatWorktree with a Dst elsewhere under Home (not
+// the actual repo/worktree root) is NOT caught by this check. Closing that
+// gap needs the caller to thread repo-root containment through from
+// gitx.Plan (mirroring gitx.checkDirtyContainment's own DstMain/DstWorktree
+// check, used by the git-attach path) — tracked as a follow-up, out of this
+// ruling's scope (see prC-B1c-report.md).
 func validateDst(e Entry, p session.Paths, jobID string) error {
 	dst := filepath.Clean(e.Dst)
 	if !underDir(dst, p.Home) {
 		return fmt.Errorf("refusing entry: %s is not under home %s", e.Dst, p.Home)
+	}
+	if e.Category == session.CatPack {
+		return fmt.Errorf("refusing pack entry: %s: category %q has no legitimate Dst and is never installed by this path", e.Dst, e.Category)
 	}
 	if e.Category == session.CatSession {
 		if !underDir(dst, p.ConfigDir) {

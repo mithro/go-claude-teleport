@@ -176,6 +176,23 @@ func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, 
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		// Ruling R-P3-B1c: CatPack has no legitimate Dst at all — no
+		// FileEntry anywhere in this codebase (session.FileEntry,
+		// gitx.Files, session.InventoryFiles) is ever built with this
+		// category; the git pack itself travels as the raw StreamPack,
+		// straight into gitx.Attach, never as a manifest entry. So, unlike
+		// CatCapture (which legitimately owns exactly one canonical Dst,
+		// checked below) or CatRepo/CatWorktree (legitimately placed by
+		// Install itself for fresh-main/not-a-repo teleports, and
+		// legitimately Deferred for existing-main's dirty index/worktree
+		// files below), a CatPack entry is refused unconditionally, before
+		// any Lstat or staging-state check, regardless of Deferred and
+		// regardless of whether Dst already exists — there is no path
+		// through which the destination could ever receive one honestly.
+		if e.Category == session.CatPack {
+			out[e.ID] = PresentDifferent
+			continue
+		}
 		if e.Category == session.CatCapture && (captureDstErr != nil || filepath.Clean(e.Dst) != captureDst) {
 			out[e.ID] = PresentDifferent
 			continue
@@ -323,10 +340,21 @@ func Pending(m *Manifest, st map[int]Status) []int {
 
 // Blocking lists entries whose status forbids install: present-different,
 // unless force is set and the entry belongs to this session (FFAllowed).
+//
+// Ruling R-P3-B1c: FFAllowed is a SOURCE-computed wire field
+// (manifest.go's Build sets it true only for CatSession, but nothing
+// stops a hostile or buggy source from also setting it on any other
+// entry), so the exemption additionally requires CatSession itself —
+// spec §7.3's force-overwrite is a session-transcript feature, and in
+// particular a CatCapture entry (already forced present-different above
+// by Diff's canonical-Dst check whenever it is not this job's own
+// capture.txt) must never be exempted from blocking just because a
+// hostile source also set FFAllowed:true on it.
 func Blocking(m *Manifest, st map[int]Status, force bool) []Entry {
 	var out []Entry
 	for _, e := range m.Entries {
-		if st[e.ID] == PresentDifferent && !(force && e.FFAllowed) {
+		exempt := force && e.FFAllowed && e.Category == session.CatSession
+		if st[e.ID] == PresentDifferent && !exempt {
 			out = append(out, e)
 		}
 	}
