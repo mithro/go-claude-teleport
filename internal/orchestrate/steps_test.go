@@ -265,13 +265,12 @@ func TestGitAttachFreshMainLinkedDetachedAlwaysRepairsMetadata(t *testing.T) {
 	// succeeds and reports MainExists/WorktreeExists — exactly what a
 	// resumed job sees after install has placed a fresh-main transfer's
 	// files but repairLinkedMetadata has not run yet.
-	if err := os.MkdirAll(dstMain, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// The two directories are created by a REAL install on the
+	// destination, which is also what records them in that host's own
+	// jobs/<id>/roots.json — fresh-main git-attach may only ever touch
+	// directories this job's install created (ruling R-P3-B1f N1).
+	installDirs(t, dst, sid, dstMain, dstWorktree)
 	gitc(t, dstMain, "init", "-q", "-b", "main")
-	if err := os.MkdirAll(dstWorktree, 0o755); err != nil {
-		t.Fatal(err)
-	}
 	staleGitFile := filepath.Join(dstWorktree, ".git")
 	if err := os.WriteFile(staleGitFile, []byte("gitdir: /home/alice/repo/.git/worktrees/feat\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -798,6 +797,37 @@ func TestRecordStepAppendsOneHistoryRowPerRun(t *testing.T) {
 		}
 		if n := strings.Count(strings.TrimRight(string(raw), "\n"), "\n") + 1; n != 1 {
 			t.Errorf("%s recorded %d history rows for one job, want 1:\n%s", h.name, n, raw)
+		}
+	}
+}
+
+// installDirs runs a real, minimal install on dst that places dirs as this
+// job's own CatRepo/CatWorktree directory entries — the step that, on a
+// fresh-main teleport, both creates the destination repository directories
+// and records them as this job's in jobs/<id>/roots.json.
+func installDirs(t *testing.T, dst *host, jobID string, dirs ...string) {
+	t.Helper()
+	m := &transfer.Manifest{Version: 1, JobID: jobID, SessionID: jobID,
+		Roots: transfer.GitRoots(dirs[0], dirs[len(dirs)-1], false)}
+	staging := job.StagingDir(dst.paths.DataDir, jobID)
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i, d := range dirs {
+		m.Entries = append(m.Entries, transfer.Entry{ID: i, Category: session.CatWorktree, Dst: d, Mode: uint32(os.ModeDir | 0o755)})
+		if err := os.WriteFile(transfer.StagedPath(staging, i)+".dir", nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := dst.ep.ManifestDiff(context.Background(), m, jobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.ep.Install(context.Background(), m, jobID); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range dirs {
+		if fi, err := os.Lstat(d); err != nil || !fi.IsDir() {
+			t.Fatalf("install did not create %s: %v", d, err)
 		}
 	}
 }

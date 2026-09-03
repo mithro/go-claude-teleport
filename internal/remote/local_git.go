@@ -97,6 +97,11 @@ func (l *Local) GitAttach(ctx context.Context, p *gitx.Plan, jobID string) error
 	if p == nil {
 		return &Error{Code: "usage", Message: "git-attach: nil plan"}
 	}
+	// R-P3-B1f N1: the wire Plan's own destination paths are validated
+	// here, before anything is read or written on their account.
+	if err := l.checkAttachPlan(p, jobID); err != nil {
+		return refusalError(err)
+	}
 	staging := job.StagingDir(l.paths.DataDir, jobID)
 	packPath := ""
 	if p.NeedPack {

