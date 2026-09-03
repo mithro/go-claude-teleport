@@ -94,6 +94,9 @@ func (l *Local) GitAttach(ctx context.Context, p *gitx.Plan, jobID string) error
 	if err := checkJobID(jobID); err != nil {
 		return err
 	}
+	if p == nil {
+		return &Error{Code: "usage", Message: "git-attach: nil plan"}
+	}
 	staging := job.StagingDir(l.paths.DataDir, jobID)
 	packPath := ""
 	if p.NeedPack {

@@ -32,7 +32,7 @@ func TestFreezeAndThawVerifySkipWhenSourceNotRunning(t *testing.T) {
 	dst := newHost(t, "big-storage.example", "bob", nil)
 	p := &Plan{Session: &session.Session{ID: session.ID(sid), State: session.StateIdle}, TargetState: "idle"}
 	j := &job.Journal{ID: sid}
-	steps := Steps(p, j, src.ep, dst.ep, selfExe(t), t.Logf)
+	steps := Steps(p, j, src.ep, dst.ep, t.Logf)
 	byName := map[string]job.Step{}
 	for _, s := range steps {
 		byName[s.Name] = s
@@ -54,7 +54,7 @@ func TestRecordVerifyUsesJournal(t *testing.T) {
 	dst := newHost(t, "big-storage.example", "bob", nil)
 	p := &Plan{Session: &session.Session{ID: session.ID(sid)}}
 	j := &job.Journal{ID: sid}
-	steps := Steps(p, j, src.ep, dst.ep, selfExe(t), t.Logf)
+	steps := Steps(p, j, src.ep, dst.ep, t.Logf)
 	rec := steps[len(steps)-1]
 	if done, _ := rec.Verify(context.Background()); done {
 		t.Error("record must run when the journal has no done record step")
@@ -85,7 +85,7 @@ func TestInstallVerifyDistrustsStaleJournalDoneAgainstDestReality(t *testing.T) 
 	}
 	j := &job.Journal{ID: sid}
 	j.Step("install").Status = job.Done // stale: nothing has actually been installed on dst
-	steps := Steps(p, j, src.ep, dst.ep, selfExe(t), t.Logf)
+	steps := Steps(p, j, src.ep, dst.ep, t.Logf)
 	var install job.Step
 	for _, s := range steps {
 		if s.Name == "install" {
@@ -123,7 +123,7 @@ func TestJobRunStopsAtNextStepBoundaryOnCancelledContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	all := Steps(p, j, src.ep, dst.ep, selfExe(t), t.Logf)
+	all := Steps(p, j, src.ep, dst.ep, t.Logf)
 	var capture job.Step
 	for _, s := range all {
 		if s.Name == "capture" {
@@ -211,7 +211,7 @@ func TestInstallVerifyKeepsFullManifestOnDestForGitAttachModes(t *testing.T) {
 
 	p := &Plan{JobID: jobID, ManifestPath: manifestPath, Git: gp, Extras: &transfer.InstallExtras{}}
 	j := &job.Journal{ID: jobID}
-	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, logf: t.Logf}
 
 	if _, err := r.verifyInstall(context.Background()); err != nil {
 		t.Fatal(err)
@@ -276,7 +276,7 @@ func TestGitAttachFreshMainLinkedDetachedAlwaysRepairsMetadata(t *testing.T) {
 		PackEntryID: gitx.NoEntry, IndexEntryID: gitx.NoEntry}
 	p := &Plan{JobID: sid, Git: gp}
 	j := &job.Journal{ID: sid}
-	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, logf: t.Logf}
 
 	done, err := r.verifyGitAttach(context.Background())
 	if err != nil {
@@ -333,7 +333,7 @@ func TestInstallVerifyRequiresMergePhaseNotJustFilePlacement(t *testing.T) {
 	}
 
 	j := &job.Journal{ID: sid}
-	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, logf: t.Logf}
 	if err := r.runPreflight(context.Background()); err != nil { // OpenStream needs a journal on both hosts first
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestFastForwardedEntryNotRecordedAsInstalledUnlessAlreadyOurs(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r1 := &runner{p: p1, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	r1 := &runner{p: p1, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, logf: t.Logf}
 	if err := r1.runPreflight(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +446,7 @@ func TestFastForwardedEntryNotRecordedAsInstalledUnlessAlreadyOurs(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2 := &runner{p: p2, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	r2 := &runner{p: p2, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, logf: t.Logf}
 	if err := r2.runPreflight(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +491,7 @@ func TestFastForwardedEntryStaysInstalledWhenItIsAlreadyOurs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &runner{p: p, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	r := &runner{p: p, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, logf: t.Logf}
 	if err := r.runPreflight(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -610,7 +610,7 @@ func TestRunInstallPersistsPartialInstalledIDsBeforeFailing(t *testing.T) {
 		t.Fatal(err)
 	}
 	j := &job.Journal{ID: sid}
-	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, selfExe: selfExe(t), logf: t.Logf}
+	r := &runner{p: p, j: j, src: src.ep, dst: dst.ep, logf: t.Logf}
 	if err := r.runPreflight(context.Background()); err != nil {
 		t.Fatal(err)
 	}

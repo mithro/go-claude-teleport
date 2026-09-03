@@ -196,6 +196,9 @@ func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string)
 	if err := checkJobID(jobID); err != nil {
 		return nil, err
 	}
+	if m == nil {
+		return nil, &Error{Code: "usage", Message: "install: nil manifest"}
+	}
 	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID))
 	if err != nil {
 		return nil, err

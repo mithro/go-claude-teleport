@@ -40,7 +40,7 @@ func teleport(t *testing.T, o Options, src, dst *host) (*Plan, *job.Journal) {
 	factory := func(context.Context, Options) (remote.Endpoint, remote.Endpoint, func(), error) {
 		return src.ep, dst.ep, func() {}, nil
 	}
-	if err := RunJob(ctx, driver.paths.DataDir, sid, factory, selfExe(t), t.Logf); err != nil {
+	if err := RunJob(ctx, driver.paths.DataDir, sid, factory, t.Logf); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 	jj, _, _ := job.Open(driver.paths.DataDir, sid)

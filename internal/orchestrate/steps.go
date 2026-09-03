@@ -27,19 +27,12 @@ type runner struct {
 	p        *Plan
 	j        *job.Journal
 	src, dst remote.Endpoint
-	// selfExe is unused by any step in this file: no step here re-execs
-	// itself. It is threaded through Steps()'s signature (part of this
-	// task's specified interface) for Task 21's runner/continue driver,
-	// which needs it to re-dial or re-exec `claude-teleport` when resuming
-	// a job (implementer-rules: "tmux -C control mode and claude --version
-	// are its only subprocesses (plus self re-exec)").
-	selfExe string
-	logf    func(string, ...any)
+	logf     func(string, ...any)
 }
 
 // Steps builds the job.Step list for the plan (spec §6 table).
-func Steps(p *Plan, j *job.Journal, src, dst remote.Endpoint, selfExe string, logf func(string, ...any)) []job.Step {
-	r := &runner{p: p, j: j, src: src, dst: dst, selfExe: selfExe, logf: logf}
+func Steps(p *Plan, j *job.Journal, src, dst remote.Endpoint, logf func(string, ...any)) []job.Step {
+	r := &runner{p: p, j: j, src: src, dst: dst, logf: logf}
 	return []job.Step{
 		{Name: "preflight", Verify: r.verifyPreflight, Run: r.runPreflight},
 		{Name: "freeze", Verify: r.verifyFreeze, Run: r.runFreeze},

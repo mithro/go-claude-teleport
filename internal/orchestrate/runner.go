@@ -19,7 +19,7 @@ type EndpointFactory func(ctx context.Context, o Options) (src, dst remote.Endpo
 // RunJob is the detached runner's main: load the journal and plan, build
 // the endpoints, run the steps, record the outcome. On failure the source
 // is thawed (the freezer would also thaw on our death).
-func RunJob(ctx context.Context, dataDir, jobID string, factory EndpointFactory, selfExe string, logf func(string, ...any)) error {
+func RunJob(ctx context.Context, dataDir, jobID string, factory EndpointFactory, logf func(string, ...any)) error {
 	j, ok, err := job.Open(dataDir, jobID)
 	if err != nil {
 		return err
@@ -27,13 +27,30 @@ func RunJob(ctx context.Context, dataDir, jobID string, factory EndpointFactory,
 	if !ok {
 		return fmt.Errorf("no job %s under %s", jobID, dataDir)
 	}
+	// From here on a journal exists, so every early return must leave it
+	// FINISHED and failed (finding A2). internal-runner is detached and its
+	// exit code is discarded; the foreground `follow` ends on Finished and
+	// nothing else reports these errors, so an early return that left the
+	// journal untouched hung the foreground forever and Ctrl-C then
+	// claimed "the runner keeps going" about a process that had died
+	// before its first step.
+	failEarly := func(err error) error {
+		logf("FAILED before any step ran: %v", err)
+		logf("next: claude-teleport status %s | claude-teleport continue %s | claude-teleport abandon %s", jobID, jobID, jobID)
+		j.Outcome, j.Finished = "failed", true
+		j.UpdatedAt = time.Now()
+		if serr := j.Save(); serr != nil {
+			logf("saving the failed journal: %v", serr)
+		}
+		return err
+	}
 	p, err := PlanFromJournal(j)
 	if err != nil {
-		return err
+		return failEarly(err)
 	}
 	src, dst, closeFn, err := factory(ctx, p.Options)
 	if err != nil {
-		return err
+		return failEarly(err)
 	}
 	defer closeFn()
 	j.RunnerPID = os.Getpid()
@@ -42,7 +59,7 @@ func RunJob(ctx context.Context, dataDir, jobID string, factory EndpointFactory,
 		return err
 	}
 	logf("runner %d: job %s (%s -> %s), continuing at %s", os.Getpid(), jobID, p.SourceInfo.Hostname, p.DestInfo.Hostname, firstIncomplete(j))
-	runErr := job.Run(ctx, j, Steps(p, j, src, dst, selfExe, logf), logf)
+	runErr := job.Run(ctx, j, Steps(p, j, src, dst, logf), logf)
 	if runErr != nil {
 		j.Outcome = "failed"
 		if p.sourceState() == session.StateRunning && p.Session.Registry != nil {

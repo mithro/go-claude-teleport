@@ -229,6 +229,11 @@ func (a *app) fail(err error) int {
 
 // spawnAndFollow starts the detached runner and follows its log.
 func (a *app) spawnAndFollow(ctx context.Context, j *job.Journal, bang bool) int {
+	// Snapshot thaw+exit BEFORE the new runner can touch it: in !-mode
+	// follow returns as soon as that step starts, and the journal may
+	// still carry the REPLACED run's status for it (carry 2). Only a
+	// change made by the runner we are about to start counts as evidence.
+	base := stepState(j, "thaw+exit")
 	pid, err := procx.SpawnDetached([]string{a.selfExe, "internal-runner", j.Dir}, "/", j.LogPath(), envSlice(a.env))
 	if err != nil {
 		return a.fail(fmt.Errorf("start runner: %w", err))
@@ -247,13 +252,38 @@ func (a *app) spawnAndFollow(ctx context.Context, j *job.Journal, bang bool) int
 		return a.fail(err)
 	}
 	a.logf("runner pid %d, log %s", pid, j.LogPath())
-	return a.follow(ctx, j, bang)
+	return a.follow(ctx, j, bang, base)
+}
+
+// stepState reads a step's recorded state WITHOUT job.Journal.Step's
+// side effect of appending a Pending entry for an unknown name.
+func stepState(j *job.Journal, name string) job.StepState {
+	for _, s := range j.Steps {
+		if s.Name == name {
+			return s
+		}
+	}
+	return job.StepState{Name: name, Status: job.Pending}
+}
+
+// bangDone reports whether the runner we are following has reached the
+// thaw+exit step, given how that step stood before it started (base). In
+// !-mode the foreground must return the moment the source Claude is
+// thawed and asked to exit — it is that Claude's own child — but the
+// journal may carry a stale thaw+exit status from the run this one
+// replaces, and returning on that would report success while the new
+// runner is still dialling (carry 2). A fresh attempt (Attempts beyond
+// the baseline) or a transition into Done is evidence from the NEW
+// runner; anything unchanged is not.
+func bangDone(jj *job.Journal, base job.StepState) bool {
+	st := stepState(jj, "thaw+exit")
+	return st.Attempts > base.Attempts || (st.Status == job.Done && base.Status != job.Done)
 }
 
 // follow streams log.txt until the job finishes (or, in !-mode, until step
 // thaw+exit begins — after which the parent Claude must be free to read
 // our exit), then maps the journal to an exit code.
-func (a *app) follow(ctx context.Context, j *job.Journal, bang bool) int {
+func (a *app) follow(ctx context.Context, j *job.Journal, bang bool, base job.StepState) int {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	reload := func() *job.Journal {
@@ -263,13 +293,28 @@ func (a *app) follow(ctx context.Context, j *job.Journal, bang bool) int {
 		}
 		return jj
 	}
+	finished := func(jj *job.Journal) bool {
+		return jj.Finished || (bang && bangDone(jj, base))
+	}
+	runnerGone := false
 	done := func() bool {
 		jj := reload()
-		if bang {
-			st := jj.Step("thaw+exit")
-			return jj.Finished || st.Status != job.Pending
+		if finished(jj) {
+			return true
 		}
-		return jj.Finished
+		// A runner that died before marking the journal (crash, SIGKILL,
+		// an early return that never got to save) must not hold the
+		// foreground forever (finding A2). The runner's last Save
+		// strictly precedes its exit, so re-reading the journal after
+		// seeing the process gone can never miss a final state.
+		if jj.RunnerPID > 0 && !a.runnerAlive(jj.RunnerPID) {
+			if jj = reload(); finished(jj) {
+				return true
+			}
+			runnerGone = true
+			return true
+		}
+		return false
 	}
 	if bang {
 		for !done() {
@@ -288,6 +333,14 @@ func (a *app) follow(ctx context.Context, j *job.Journal, bang bool) int {
 		return a.fail(err)
 	}
 	jj := reload()
+	if runnerGone {
+		fmt.Fprintf(a.stderr, "the teleport runner (pid %d) exited without finishing job %s; its last words are in %s:\n", jj.RunnerPID, session.ID(j.ID).Short(), jj.LogPath())
+		for _, l := range tailLog(jj.LogPath(), 20) {
+			fmt.Fprintln(a.stderr, l)
+		}
+		nextHint(a.stderr, j.ID)
+		return ExitFailed
+	}
 	if bang && !jj.Finished {
 		p, err := orchestrate.PlanFromJournal(jj)
 		if err == nil {
@@ -324,10 +377,17 @@ func tailLog(path string, n int) []string {
 
 // runnerAlive reports whether pid is a live internal-runner process — the
 // pid alone is not enough (pids are reused), so this also requires the
-// cmdline to name internal-runner. Shared by continueJob and abandon (do
-// not duplicate this closure elsewhere).
-func runnerAlive(pid int) bool {
-	t, err := procx.Scan("/proc")
+// cmdline to name internal-runner. It reads the process table under
+// a.paths.ProcRoot, the one place the proc root is configured (tests point
+// it at a fixture); an app whose paths were never resolved falls back to
+// /proc. Shared by follow, continueJob and abandon (do not duplicate this
+// closure elsewhere).
+func (a *app) runnerAlive(pid int) bool {
+	procRoot := a.paths.ProcRoot
+	if procRoot == "" {
+		procRoot = "/proc"
+	}
+	t, err := procx.Scan(procRoot)
 	if err != nil {
 		return false
 	}
@@ -337,9 +397,9 @@ func runnerAlive(pid int) bool {
 
 // continueJob attaches to a live runner or respawns a dead one.
 func (a *app) continueJob(ctx context.Context, j *job.Journal, bang bool) int {
-	if j.RunnerAlive(runnerAlive) {
+	if j.RunnerAlive(a.runnerAlive) {
 		fmt.Fprintf(a.stdout, "attaching to runner %d\n", j.RunnerPID)
-		return a.follow(ctx, j, bang)
+		return a.follow(ctx, j, bang, stepState(j, "thaw+exit"))
 	}
 	return a.spawnAndFollow(ctx, j, bang)
 }
@@ -399,7 +459,7 @@ func newInternalRunnerCmd(a *app) *cobra.Command {
 				fmt.Fprintf(a.stderr, "%s %s\n", time.Now().UTC().Format(time.RFC3339), fmt.Sprintf(format, v...))
 			}
 			a.logf = logf
-			if err := orchestrate.RunJob(ctx, dataDir, id, a.endpoints, a.selfExe, logf); err != nil {
+			if err := orchestrate.RunJob(ctx, dataDir, id, a.endpoints, logf); err != nil {
 				// internal-runner is detached (procx.SpawnDetached releases
 				// it; nothing waits on its exit code in the normal flow —
 				// the foreground `follow()` reports spec §5's exit code

@@ -109,7 +109,10 @@ func (l *Local) DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids [
 	// manifest's own entries), but a manifest that carries one at all
 	// must carry a legitimate one: a wire payload whose job id is a
 	// traversal is a caller this host should not be serving.
-	if m != nil && m.JobID != "" {
+	if m == nil {
+		return nil, &Error{Code: "usage", Message: "delete-installed: nil manifest"}
+	}
+	if m.JobID != "" {
 		if err := checkJobID(m.JobID); err != nil {
 			return nil, err
 		}

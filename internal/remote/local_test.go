@@ -413,3 +413,36 @@ func TestServeStreamLocalTarCompletesOnClientWriteThenClose(t *testing.T) {
 		t.Fatalf("after ServeStream: status = %v, want staged-same", st)
 	}
 }
+
+// TestLocalNilPayloadsAreUsageErrors covers B3. Every one of these
+// arguments arrives as a decoded wire field, so a peer that omits it (or
+// sends `null`) reaches Local with a nil pointer. Before this fix the nil
+// dereferenced deep inside transfer/gitx and the dispatch's recover shipped
+// the panic — debug.Stack() and all — back to the peer as an "internal"
+// error. They must be plain usage errors instead, like ManifestDiff's.
+func TestLocalNilPayloadsAreUsageErrors(t *testing.T) {
+	l := NewLocal(testPaths(t), "x", LocalOptions{ProcRoot: "/proc"})
+	ctx := context.Background()
+	jobID := sid
+
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"manifest-diff", func() error { _, err := l.ManifestDiff(ctx, nil, jobID); return err }},
+		{"install", func() error { _, err := l.Install(ctx, nil, jobID); return err }},
+		{"git-attach", func() error { return l.GitAttach(ctx, nil, jobID) }},
+		{"delete-installed", func() error { _, err := l.DeleteInstalled(ctx, nil, []int{0}); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			var re *Error
+			if !errors.As(err, &re) || re.Code != "usage" {
+				t.Fatalf("err = %v (%T), want a remote.Error with code usage", err, err)
+			}
+			if !strings.Contains(re.Message, "nil") {
+				t.Errorf("message = %q, want it to name the missing payload", re.Message)
+			}
+		})
+	}
+}

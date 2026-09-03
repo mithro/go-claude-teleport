@@ -48,7 +48,7 @@ func newAbandonCmd(a *app) *cobra.Command {
 			if !ok {
 				return usageErr(fmt.Errorf("no job for session %s", id.Short()))
 			}
-			if j.RunnerAlive(runnerAlive) {
+			if j.RunnerAlive(a.runnerAlive) {
 				return fail(ExitFailed, "job %s has a live runner (pid %d); stop it first (kill %d) or let it finish", id.Short(), j.RunnerPID, j.RunnerPID)
 			}
 

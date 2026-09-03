@@ -195,3 +195,86 @@ func TestDryRunNeverContinuesAnExistingJob(t *testing.T) {
 		t.Errorf("dry run must say nothing was moved:\n%s", out.String())
 	}
 }
+
+// TestFollowEndsWhenTheRunnerDies pins the foreground half of finding A2:
+// a runner that dies before it ever marks the journal (peer down, a bad
+// plan, an outright crash) left `follow` waiting on jj.Finished forever,
+// and Ctrl-C then printed "the runner keeps going" about a dead process.
+func TestFollowEndsWhenTheRunnerDies(t *testing.T) {
+	a, out := fixtureApp(t)
+	dir := t.TempDir()
+	script := filepath.Join(dir, "dying-runner.sh")
+	// A runner that exits at once without touching the journal.
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 3\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a.selfExe = script
+	j := unfinishedJob(t, a, fixtureSID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	code := a.spawnAndFollow(ctx, j, false)
+	elapsed := time.Since(start)
+	if code == ExitOK || code == ExitInterrupted {
+		t.Fatalf("follow over a dead runner = %d after %s, want a plain failure\n%s", code, elapsed, out.String())
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("follow took %s to notice the dead runner", elapsed)
+	}
+	if !strings.Contains(out.String(), "runner") {
+		t.Errorf("the failure must say the runner died:\n%s", out.String())
+	}
+}
+
+// TestBangModeIgnoresAReplacedRunsThawExitStatus pins carry 2: in !-mode
+// `follow` returns as soon as the thaw+exit step starts, but a job being
+// continued still carries the REPLACED run's status for that step — so
+// `! claude-teleport continue` over a job that failed at or after step 9
+// reported success the instant it started, while its freshly spawned
+// runner was still dialling.
+func TestBangModeIgnoresAReplacedRunsThawExitStatus(t *testing.T) {
+	a, out := fixtureApp(t)
+	j := unfinishedJob(t, a, fixtureSID)
+	j.Steps = []job.StepState{
+		{Name: "start", Status: job.Done, Attempts: 1},
+		{Name: "thaw+exit", Status: job.Failed, Attempts: 1, Error: "source claude did not exit within 30s"},
+	}
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+	// The runner takes a moment to get anywhere, then makes its own,
+	// second attempt at thaw+exit.
+	dir := t.TempDir()
+	fresh := *j
+	fresh.Steps = []job.StepState{
+		{Name: "start", Status: job.Done, Attempts: 1},
+		{Name: "thaw+exit", Status: job.Running, Attempts: 2},
+	}
+	fresh.Finished, fresh.Outcome = false, ""
+	raw, err := json.MarshalIndent(fresh, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshPath := filepath.Join(dir, "second-attempt.json")
+	if err := os.WriteFile(freshPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "slow-runner.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 1\ncp "+freshPath+" \"$2\"/job.json\nsleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a.selfExe = script
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	start := time.Now()
+	code := a.spawnAndFollow(ctx, j, true)
+	elapsed := time.Since(start)
+	if code != ExitOK {
+		t.Fatalf("!-mode follow = %d after %s\n%s", code, elapsed, out.String())
+	}
+	if elapsed < time.Second {
+		t.Errorf("!-mode follow returned after %s — it trusted the replaced run's thaw+exit status\n%s", elapsed, out.String())
+	}
+}
