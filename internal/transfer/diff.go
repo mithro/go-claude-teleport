@@ -255,6 +255,13 @@ func Need(m *Manifest, st map[int]Status) []int {
 // later install/git-attach step needs staged; go/claude-teleport's own
 // transfer step is done at that point even though Need would still list
 // some of them.
+//
+// Caveat (carry-6): an ff-candidate is assigned that Status unconditionally
+// while nothing is staged yet, so before any pump has run Pending cannot
+// tell an optimistic ff-candidate from a staged-and-verified one and a
+// caller must gate on having attempted the transfer at least once —
+// internal/orchestrate/steps.go's verifyTransfer does exactly that with its
+// `Step("transfer").Attempts == 0` guard.
 func Pending(m *Manifest, st map[int]Status) []int {
 	var ids []int
 	for _, e := range m.Entries {

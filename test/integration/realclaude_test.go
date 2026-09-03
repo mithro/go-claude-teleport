@@ -27,8 +27,18 @@ func init() {
 	// return that stale, unrelated request instead of failing loudly.
 	// Clearing it once here (before TestMain brings up this run's own
 	// `api` container) makes "latest" unambiguous for this process.
-	os.RemoveAll("api-log")
-	os.MkdirAll("api-log", 0o755)
+	//
+	// A failure here must be fatal, not ignored: leaving a stale file
+	// behind silently reintroduces exactly the wrong-request bug this
+	// clearing exists to prevent. init() has no *testing.T to fail, so
+	// panic — TestMain has not started any container yet, so there is
+	// nothing to tear down.
+	if err := os.RemoveAll("api-log"); err != nil {
+		panic("clear api-log before the run: " + err.Error())
+	}
+	if err := os.MkdirAll("api-log", 0o755); err != nil {
+		panic("recreate api-log: " + err.Error())
+	}
 }
 
 // seedOnboarding pre-seeds svc/user's Claude Code global config with the
@@ -83,6 +93,13 @@ func init() {
 // the tool never installs or logs in" — a real destination machine has
 // already been through both of the above exactly once, by a human, before
 // any teleport ever lands on it.
+//
+// Nothing seeded here is a credential: "dummy-key" is the same inert
+// placeholder docker-compose.yml sets as ANTHROPIC_API_KEY (pointing at the
+// in-harness fakeapi, never api.anthropic.com), and the field records that
+// SOME key was approved — the decision, not a secret. There is no
+// oauthAccount, no token and no real endpoint anywhere in this seed, and no
+// host ~/.claude is ever read (controller requirement A).
 func seedOnboarding(t testing.TB, svc, user, cwd string) {
 	t.Helper()
 	body := `{"hasCompletedOnboarding": true, "customApiKeyResponses": {"approved": ["dummy-key"], "rejected": []}, "projects": {"` + cwd + `": {"hasTrustDialogAccepted": true}}}`
@@ -228,7 +245,19 @@ claude -p --session-id "$sid" 'kind probe: remember the word pineapple' &
 pid=$!
 last=""
 snap=0
+polls=0
+# Bounded (600 x 0.05s = 30s of sampling): a real -p turn against this
+# fakeapi's canned reply finishes in about two seconds, so the cap is only
+# ever reached by a claude that hung — in which case it is killed here and
+# the exit-status assertion below reports it, rather than the suite
+# spinning a container CPU until go test's own -timeout fires.
 while kill -0 "$pid"; do
+  polls=$((polls+1))
+  if [ "$polls" -gt 600 ]; then
+    echo "=== poll cap reached after $polls samples; killing $pid ==="
+    kill "$pid"
+    break
+  fi
   f=$(grep -ls "\"sessionId\":\"$sid\"" ~/.claude/sessions/*.json | head -1)
   if [ -n "$f" ]; then
     cur=$(cat "$f" 2>&1) || cur=""
@@ -239,8 +268,17 @@ while kill -0 "$pid"; do
       last="$cur"
     fi
   fi
+  sleep 0.05
 done
-wait "$pid" || true
+# The exit status is recorded rather than discarded with "|| true": a
+# claude -p that failed (or was killed at the cap above) must fail this
+# test, not leave it quietly asserting over zero snapshots. Captured into
+# rc instead of letting the shell's own -e abort here, so the
+# after-exit registry state below still makes it into the log for a
+# failure to be read from.
+rc=0
+wait "$pid" || rc=$?
+echo "=== claude -p exit $rc ==="
 echo "=== after exit ==="
 f=$(grep -ls "\"sessionId\":\"$sid\"" ~/.claude/sessions/*.json | head -1)
 if [ -n "$f" ]; then
@@ -252,18 +290,31 @@ fi
 	out := sh(t, "source", "alice", script)
 	t.Logf("entrypoint probe for sid %s:\n%s", sid, out)
 
-	// Assert the fact ConfirmClaude's gate depends on: every "busy"
-	// snapshot observed must carry entrypoint "sdk-cli". Parse each
-	// snapshot block (a JSON object) rather than doing a blind substring
-	// search, since a false negative here (missing a real "busy" snapshot)
-	// would silently under-report the finding.
-	var busySnapshots, printSnapshots int
-	for _, block := range strings.Split(out, "=== snapshot") {
-		if !strings.Contains(block, "{") {
+	// The backgrounded run must have succeeded: a claude -p that failed (or
+	// never started, or hit the poll cap) would otherwise leave this test
+	// asserting over an empty snapshot list and passing for the wrong
+	// reason. Checked before the snapshots so a broken claude reports
+	// itself rather than surfacing as "captured no snapshot".
+	if !strings.Contains(out, "=== claude -p exit 0 ===") {
+		t.Fatalf("the backgrounded claude -p did not exit 0:\n%s", out)
+	}
+
+	// Parse each snapshot section on its own (the JSON between the section
+	// header and the next "=== " marker) rather than scanning the whole
+	// transcript for one { ... } span, which would run a final snapshot
+	// together with the after-exit dump and silently fail to parse.
+	var snapshots, busySnapshots int
+	for _, sec := range strings.Split(out, "=== ") {
+		if !strings.HasPrefix(sec, "snapshot ") {
 			continue
 		}
-		start := strings.Index(block, "{")
-		end := strings.LastIndex(block, "}")
+		nl := strings.Index(sec, "\n")
+		if nl < 0 {
+			continue
+		}
+		body := sec[nl+1:]
+		start := strings.Index(body, "{")
+		end := strings.LastIndex(body, "}")
 		if start < 0 || end < start {
 			continue
 		}
@@ -272,26 +323,38 @@ fi
 			Kind       string `json:"kind"`
 			Entrypoint string `json:"entrypoint"`
 		}
-		if err := json.Unmarshal([]byte(block[start:end+1]), &reg); err != nil {
-			t.Logf("entrypoint probe: could not parse snapshot block: %v", err)
+		if err := json.Unmarshal([]byte(body[start:end+1]), &reg); err != nil {
+			t.Errorf("registry snapshot is not parseable JSON (%v):\n%s", err, body)
 			continue
 		}
-		if strings.EqualFold(reg.Kind, "print") {
-			t.Errorf(`a real claude -p run wrote kind=%q: real Claude Code was believed to have no "print" kind at all (task-26-report.md) — ConfirmClaude's gate may need revisiting`, reg.Kind)
-		}
+		snapshots++
 		if strings.EqualFold(reg.Status, "busy") {
 			busySnapshots++
-			t.Logf("entrypoint probe: busy snapshot has kind=%q entrypoint=%q", reg.Kind, reg.Entrypoint)
-			if strings.EqualFold(reg.Entrypoint, "sdk-cli") {
-				printSnapshots++
-			} else {
-				t.Errorf(`ConfirmClaude gates a "busy" print-mode turn on entrypoint=="sdk-cli" (internal/remote/local_claude.go), but a real claude -p run wrote status=busy with entrypoint=%q (kind=%q)`, reg.Entrypoint, reg.Kind)
-			}
+		}
+
+		// PINNED REAL-CLAUDE FACTS (task-26-report.md; identical on 2.1.247
+		// and 2.1.259). These two lines are the whole point of this probe:
+		// the tool's own print-mode gate is built on them, so a Claude Code
+		// release that changes either must fail HERE, loudly, instead of
+		// silently defeating the gate in production.
+		//
+		//  1. kind is "interactive" for a `-p` run just as it is for a
+		//     terminal one — real Claude Code has no "print" kind at all,
+		//     which is why ConfirmClaude no longer keys on Kind (M5).
+		//  2. entrypoint is "sdk-cli" for `-p` vs "cli" for an interactive
+		//     terminal run — the field that actually distinguishes them,
+		//     and the one internal/remote/local_claude.go's ConfirmClaude
+		//     now gates its "busy" print-mode acceptance on, read through
+		//     internal/session.Registry.Entrypoint.
+		if !strings.EqualFold(reg.Kind, "interactive") {
+			t.Errorf(`pinned fact broken: a real claude -p registry entry had kind=%q, want "interactive" (real Claude Code has no "print" kind; internal/remote/local_claude.go's ConfirmClaude gate and internal/session.Registry were built on this — re-verify both)`, reg.Kind)
+		}
+		if !strings.EqualFold(reg.Entrypoint, "sdk-cli") {
+			t.Errorf(`pinned fact broken: a real claude -p registry entry had entrypoint=%q, want "sdk-cli" (internal/remote/local_claude.go's ConfirmClaude accepts a "busy" print-mode turn only on entrypoint=="sdk-cli", via internal/session.Registry.Entrypoint — that gate can no longer match)`, reg.Entrypoint)
 		}
 	}
-	if busySnapshots == 0 {
-		t.Logf("entrypoint probe: never observed a busy snapshot (the window between registration and completion may be too short to sample against this fakeapi's near-instant canned reply) — see the full transcript above for what WAS observed")
-	} else {
-		t.Logf("entrypoint probe: observed %d busy snapshot(s), %d with entrypoint=sdk-cli", busySnapshots, printSnapshots)
+	if snapshots == 0 {
+		t.Fatalf("captured no registry snapshot at all for a live `claude -p` — the probe asserts nothing unless it sees one (real Claude Code writes ~/.claude/sessions/<pid>.json for the life of the process):\n%s", out)
 	}
+	t.Logf("entrypoint probe: %d registry snapshot(s), %d with status=busy; kind/entrypoint pinned on every one", snapshots, busySnapshots)
 }

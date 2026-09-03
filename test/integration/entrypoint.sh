@@ -44,15 +44,24 @@ grep -q PermitUserEnvironment /etc/ssh/sshd_config || echo 'PermitUserEnvironmen
 # source of truth for the fakeapi URL and dummy key) keeps controller
 # requirement A intact: nothing here is a hardcoded credential, and a
 # missing/empty value is simply not written.
+#
+# Written for BOTH users, not just alice: the layer-2 image puts
+# /home/alice/.local/bin on every account's PATH (an image-level ENV is
+# container-wide — Dockerfile), so bob's sessions can reach that same real
+# claude binary. Giving bob the PATH but not the fakeapi endpoint is the
+# one combination that would let a bob@dest scenario reach for the real
+# api.anthropic.com, so the two always travel together.
 if [ -x /home/alice/.local/bin/claude ]; then
-  {
-    echo 'PATH=/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin'
-    [ -n "${ANTHROPIC_BASE_URL:-}" ] && echo "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
-    [ -n "${ANTHROPIC_API_KEY:-}" ] && echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
-    [ -n "${DISABLE_AUTOUPDATER:-}" ] && echo "DISABLE_AUTOUPDATER=$DISABLE_AUTOUPDATER"
-    [ -n "${DISABLE_TELEMETRY:-}" ] && echo "DISABLE_TELEMETRY=$DISABLE_TELEMETRY"
-    [ -n "${DISABLE_ERROR_REPORTING:-}" ] && echo "DISABLE_ERROR_REPORTING=$DISABLE_ERROR_REPORTING"
-    [ -n "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-}" ] && echo "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
-  } >> /home/alice/.ssh/environment
+  for u in alice bob; do
+    {
+      echo 'PATH=/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin'
+      [ -n "${ANTHROPIC_BASE_URL:-}" ] && echo "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
+      [ -n "${ANTHROPIC_API_KEY:-}" ] && echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+      [ -n "${DISABLE_AUTOUPDATER:-}" ] && echo "DISABLE_AUTOUPDATER=$DISABLE_AUTOUPDATER"
+      [ -n "${DISABLE_TELEMETRY:-}" ] && echo "DISABLE_TELEMETRY=$DISABLE_TELEMETRY"
+      [ -n "${DISABLE_ERROR_REPORTING:-}" ] && echo "DISABLE_ERROR_REPORTING=$DISABLE_ERROR_REPORTING"
+      [ -n "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-}" ] && echo "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+    } >> /home/$u/.ssh/environment
+  done
 fi
 exec /usr/sbin/sshd -D -e

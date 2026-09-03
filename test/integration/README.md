@@ -10,3 +10,9 @@ Three containers — `source`, `jump`, `dest` — with sshd, tmux and git.
     CLAUDE_VERSION=2.1.247 go test -tags 'integration realclaude' ./test/integration/ -run TestReal -v -timeout 30m
 
 Everything under `keys/` and `api-log/` is generated per run and git-ignored.
+
+`build.sh` with a CLAUDE_VERSION argument also builds the profile-gated
+`api` (fakeapi) image; without one it builds only the layer-1 services,
+since layer 1 never starts `api`. Pass `-count=1` when re-running a suite
+locally: `go test` caches a passing result, and a cached `ok` starts no
+container at all.

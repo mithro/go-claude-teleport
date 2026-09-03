@@ -125,7 +125,27 @@ func TestLocalListSessionsScansRegistryAndProjects(t *testing.T) {
 
 	// idA (sid) has a live registry entry: pid 5150 is alive in this
 	// ProcRoot, matching writeRegistry's hardcoded procStart "777".
-	l := NewLocal(p, "x", LocalOptions{ProcRoot: fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})})
+	//
+	// Both idA and idC also have a placeholder pane. idA's must be
+	// ignored — a live registry entry means the session is running, and
+	// the pane it runs in can legitimately still show a placeholder argv
+	// mid-handover — while idC's is the only evidence it exists at all,
+	// so idC is the suspended one (same precedence session.Load applies).
+	probe := &paneProbe{
+		socket: "/run/tmux/default",
+		panes: map[string][]string{
+			"%1": {"claude-teleport", "placeholder", "--resume", sid},
+			"%3": {"claude-teleport", "placeholder", "--resume", string(idC)},
+		},
+		infos: []session.PaneInfo{
+			{Session: "work", WindowID: "@1", PaneID: "%1"},
+			{Session: "work", WindowID: "@3", PaneID: "%3"},
+		},
+	}
+	l := NewLocal(p, "x", LocalOptions{
+		ProcRoot: fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}}),
+		Probe:    probe,
+	})
 	writeRegistry(t, p, 5150, "busy", "work:@1.%1")
 
 	// idB also has a registry entry, but its pid (6161) is not in the proc
@@ -163,7 +183,7 @@ func TestLocalListSessionsScansRegistryAndProjects(t *testing.T) {
 		t.Errorf("idB (registry row for a dead pid must not count as running) summary = %+v", b)
 	}
 	c := out[0]
-	if c.State != "idle" || c.Cwd != "/home/alice/proj-c" || c.Tmux != "" {
-		t.Errorf("idC (no registry entry at all) summary = %+v", c)
+	if c.State != "suspended" || c.Cwd != "/home/alice/proj-c" || c.Tmux != "work:@3.%3" {
+		t.Errorf("idC (no registry entry, held by a placeholder pane) summary = %+v", c)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"sort"
 
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
@@ -121,6 +122,14 @@ func (l *Local) DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids [
 }
 
 // ListSessions scans the projects tree and the registry (spec §5 `list`).
+//
+// The three states are registry-alive => running, placeholder pane =>
+// suspended, otherwise idle: exactly what the local `list` reports
+// (internal/cli.listSessions) and what session.Load/ResolveSession derive
+// from the same probe. `list --host` reaches this method over the wire, so
+// without the probe consultation below a suspended session on the remote
+// host was indistinguishable from an idle one — the one state the whole
+// placeholder mechanism exists to make visible.
 func (l *Local) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 	regs, err := session.ReadRegistry(l.paths.SessionsDir())
 	if err != nil && !os.IsNotExist(err) {
@@ -134,6 +143,32 @@ func (l *Local) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 	for _, r := range regs {
 		if procs.Alive(r.PID, r.ProcStart) {
 			byID[r.SessionID] = r
+		}
+	}
+	// A live registry entry always wins: a running Claude whose pane also
+	// happens to carry a placeholder argv is running, not suspended (the
+	// same precedence session.Load applies by returning before it probes).
+	// A nil probe means this host has no reachable tmux server, in which
+	// case no session can be suspended at all.
+	suspended := map[string]session.PaneInfo{}
+	if l.opts.Probe != nil {
+		panes, err := l.opts.Probe.ListPanes()
+		if err != nil {
+			return nil, fmt.Errorf("list tmux panes on %s: %w", l.Hostname, err)
+		}
+		for _, pi := range panes {
+			argv, _, ok := l.opts.Probe.PaneCommand(pi.PaneID)
+			if !ok {
+				continue
+			}
+			sid, placeholder, ok := session.ArgvSessionID(argv)
+			if !ok || !placeholder || sid == "" {
+				continue
+			}
+			if _, running := byID[sid]; running {
+				continue
+			}
+			suspended[sid] = pi
 		}
 	}
 	projects, err := os.ReadDir(l.paths.ProjectsDir())
@@ -165,6 +200,9 @@ func (l *Local) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 			sum := SessionSummary{ID: id, State: session.StateIdle.String(), Cwd: meta.LaunchCwd, Branch: meta.Branch, Version: meta.Version, LastTS: meta.LastTS}
 			if r, ok := byID[string(id)]; ok {
 				sum.State, sum.Name, sum.Tmux = session.StateRunning.String(), r.Name, r.Tmux
+			} else if pi, ok := suspended[string(id)]; ok {
+				sum.State = session.StateSuspended.String()
+				sum.Tmux = tmuxx.RefString(&session.TmuxRef{Session: pi.Session, WindowID: pi.WindowID, PaneID: pi.PaneID})
 			}
 			out = append(out, sum)
 		}

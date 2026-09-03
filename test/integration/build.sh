@@ -12,4 +12,14 @@ rm -f test/integration/keys/id_ed25519 test/integration/keys/id_ed25519.pub
 ssh-keygen -q -t ed25519 -N '' -C claude-teleport-it -f test/integration/keys/id_ed25519
 chmod 644 test/integration/keys/id_ed25519   # the container copies it into alice's ~/.ssh with 600
 export CLAUDE_VERSION="${1:-}"
-docker compose -f test/integration/docker-compose.yml build
+if [ -n "$CLAUDE_VERSION" ]; then
+  # Layer 2 (real Claude) also runs the fakeapi service, and `api` is
+  # gated behind the "realclaude" profile: a plain `compose build` skips
+  # profile-gated services entirely, so without this the fakeapi image is
+  # never rebuilt here — `compose up` would build it only if no image of
+  # that name exists yet, silently reusing a stale one after any change to
+  # internal/fakeapi or test/fakeapi-server.
+  docker compose -f test/integration/docker-compose.yml --profile realclaude build
+else
+  docker compose -f test/integration/docker-compose.yml build
+fi

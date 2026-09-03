@@ -48,7 +48,10 @@ jobs:
         with:
           go-version-file: go.mod
       - run: test/integration/build.sh
-      - run: go test -tags integration ./test/integration/ -v -timeout 40m
+      # -count=1: setup-go restores GOCACHE between runs, so without it a
+      # re-run on an unchanged commit can report a cached `ok` and never
+      # start a container at all.
+      - run: go test -tags integration ./test/integration/ -v -count=1 -timeout 40m
       # The suite's TestMain tears down its containers on every path it
       # returns from — an ordinary test failure included — so this step
       # normally finds nothing (C9). It exists for the paths where TestMain
@@ -84,7 +87,9 @@ jobs:
         with:
           go-version-file: go.mod
       - run: test/integration/build.sh ${{ matrix.claude }}
-      - run: CLAUDE_VERSION=${{ matrix.claude }} go test -tags 'integration realclaude' ./test/integration/ -run TestReal -v -timeout 40m
+      # -count=1 for the same reason as the integration job: a cached
+      # `ok` would make the weekly real-Claude matrix a silent no-op.
+      - run: CLAUDE_VERSION=${{ matrix.claude }} go test -tags 'integration realclaude' ./test/integration/ -run TestReal -v -count=1 -timeout 40m
       # See the integration job's equivalent step: TestMain already tears
       # down on every path it returns from, so this is for the -timeout
       # panic (and harness panics) only, and never for job-level
