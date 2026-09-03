@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -160,7 +161,19 @@ func TestStalledLinkFailsAnInFlightStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	// Close is bounded too, and on a dead link that is not free: the
+	// polite ssh teardown blocks on exactly the write that is stuck, so a
+	// Close that is not bounded wedges the very failure path trying to
+	// report the drop.
+	defer func() {
+		closed := make(chan struct{})
+		go func() { c.Close(); close(closed) }()
+		select {
+		case <-closed:
+		case <-time.After(gracefulCloseTimeout + 3*time.Second):
+			t.Error("Close blocked on the stalled link")
+		}
+	}()
 
 	p, err := c.Start(context.Background(), "sink")
 	if err != nil {
@@ -204,6 +217,11 @@ func TestStalledLinkFailsAnInFlightStream(t *testing.T) {
 		t.Logf("pump failed %s after the stall: %v", took.Round(time.Millisecond), res.err)
 		if took > budget {
 			t.Errorf("pump took %s to fail, want < %s", took.Round(time.Millisecond), budget)
+		}
+		// The journal has to say what happened: a bare EOF from a channel
+		// torn down underneath the copy tells whoever reads it nothing.
+		if !strings.Contains(res.err.Error(), "connection lost to alice@dest") {
+			t.Errorf("error %q does not name the lost connection", res.err)
 		}
 	case <-time.After(budget):
 		buf := make([]byte, 1<<20)

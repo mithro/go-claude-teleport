@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mithro/go-claude-teleport/internal/sshx"
 )
 
 // scenario 1: a running session teleports to a running session on dest;
@@ -315,6 +317,7 @@ func TestNetworkDropThenContinueCompletes(t *testing.T) {
 	// died, and is only unpaused for the `continue` below. `source` is
 	// never paused, so the runner can still be observed throughout.
 	compose(t, "pause", "jump")
+	paused := time.Now()
 	unpaused := false
 	unpause := func() {
 		if !unpaused {
@@ -323,16 +326,25 @@ func TestNetworkDropThenContinueCompletes(t *testing.T) {
 		}
 	}
 	t.Cleanup(unpause)
-	deadline := time.Now().Add(3 * time.Minute)
+	// The budget is derived from the liveness settings, not picked to be
+	// comfortable (R-P3-NET-1). sshx gives up on the keepalives after
+	// ServerAliveInterval x ServerAliveCountMax (45s) and its idle read
+	// deadline covers one interval more (60s); double that for a loaded CI
+	// runner and allow 30s for the failure path itself (thaw, journal,
+	// exit) and the tool has 150s. The old deadline was three minutes,
+	// which was long enough to pass while the transfer actually hung until
+	// the link came back — the bug this scenario exists to catch.
+	budget := 2*sshx.DefaultKeepaliveInterval*time.Duration(sshx.DefaultKeepaliveCountMax+1) + 30*time.Second
 	for {
 		if _, code := shCode(t, "source", "alice", "pgrep -f '[c]laude-teleport internal-runner'"); code != 0 {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("runner did not stop after the network drop")
+		if waited := time.Since(paused); waited > budget {
+			t.Fatalf("runner still running %s after the network drop; a dead link must fail the job within %s", waited.Round(time.Second), budget)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+	t.Logf("the runner gave up %s after the link went down (budget %s)", time.Since(paused).Round(time.Second), budget)
 	unpause()
 	journal := sh(t, "source", "alice", "cat ~/.local/share/claude-teleport/jobs/"+sid+"/job.json")
 	if !strings.Contains(journal, `"outcome": "failed"`) {
