@@ -94,7 +94,22 @@ func (a *app) rootCmd() *cobra.Command {
 			return exitErr(a.runTeleport(cmd.Context(), tf, args))
 		},
 	}
-	root.SetHelpTemplate("{{.Long}}\n")
+	// R-P3-28b: this template is inherited by every child command (cobra
+	// walks up to the nearest ancestor with one set), so it must work for
+	// all of them, not only root. Root keeps its old, exact behaviour — a
+	// hand-written Long that already documents everything, with nothing
+	// auto-appended. Every other command falls back to Short (if any) plus
+	// cobra's own UsageString (Use line, its own flags, subcommands) when
+	// it has no Long, and gets UsageString appended after its Long when it
+	// does — otherwise a command with no Long (continue, status, abandon,
+	// list, doctor, version, and the hidden internal-* / remote commands)
+	// printed nothing at all for `--help`.
+	root.SetHelpTemplate(`{{if not .HasParent}}{{.Long}}
+{{else}}{{if .Long}}{{.Long}}
+
+{{else if .Short}}{{.Short}}
+
+{{end}}{{.UsageString}}{{end}}`)
 	root.SetFlagErrorFunc(func(cmd *cobra.Command, err error) error {
 		return Exit(ExitUsage, "%v", err)
 	})

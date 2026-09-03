@@ -4,6 +4,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // TestTeleportOptionsFromFlags replaces the old
@@ -147,5 +150,65 @@ func TestInspectFixture(t *testing.T) {
 	}
 	if code, _, stderr := run(t, env, "inspect", "zzzz"); code != ExitRefused || !strings.Contains(stderr, "session not found") {
 		t.Fatalf("not found: %d %q", code, stderr)
+	}
+}
+
+// TestSubcommandHelpNeverEmpty is R-P3-28b: root.go's SetHelpTemplate
+// ("{{.Long}}\n") is inherited by every child command (cobra walks up to
+// the nearest ancestor with a template set), so any command without its
+// own Long — continue, status, abandon, list, doctor, version among the
+// public ones — printed nothing at all for `<cmd> --help`. This walks the
+// real command tree (every command registered under root, including the
+// hidden internal ones) and asserts `--help` on each one is never empty:
+// it must show the command's own name (from Use) and, for a command that
+// defines its own flags, every one of those flag names.
+func TestSubcommandHelpNeverEmpty(t *testing.T) {
+	a := &app{env: parseEnv(nil)}
+	root := a.rootCmd()
+
+	type target struct {
+		path      []string
+		wantToken string
+		wantFlags []string
+	}
+	var targets []target
+	var walk func(cmd *cobra.Command, path []string)
+	walk = func(cmd *cobra.Command, path []string) {
+		if cmd.Name() == "help" { // cobra's own builtin "help" command
+			return
+		}
+		var flags []string
+		cmd.LocalFlags().VisitAll(func(f *pflag.Flag) { flags = append(flags, "--"+f.Name) })
+		targets = append(targets, target{path: path, wantToken: strings.Fields(cmd.Use)[0], wantFlags: flags})
+		for _, sub := range cmd.Commands() {
+			walk(sub, append(append([]string{}, path...), sub.Name()))
+		}
+	}
+	for _, sub := range root.Commands() {
+		walk(sub, []string{sub.Name()})
+	}
+	if len(targets) < 10 {
+		t.Fatalf("only found %d commands under root; tree walk is broken", len(targets))
+	}
+
+	for _, tgt := range targets {
+		args := append(append([]string{}, tgt.path...), "--help")
+		code, out, stderr := run(t, nil, args...)
+		if code != ExitOK {
+			t.Errorf("%v: exit %d, stderr %q", args, code, stderr)
+			continue
+		}
+		if strings.TrimSpace(out) == "" {
+			t.Errorf("%v: --help printed nothing", args)
+			continue
+		}
+		if !strings.Contains(out, tgt.wantToken) {
+			t.Errorf("%v: --help missing Use token %q:\n%s", args, tgt.wantToken, out)
+		}
+		for _, fn := range tgt.wantFlags {
+			if !strings.Contains(out, fn) {
+				t.Errorf("%v: --help missing flag %q:\n%s", args, fn, out)
+			}
+		}
 	}
 }
