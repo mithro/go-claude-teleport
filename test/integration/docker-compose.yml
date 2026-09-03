@@ -11,7 +11,15 @@ x-common: &common
     - ./keys:/run/keys:ro
     - ../../dist/claude-teleport:/usr/local/bin/claude-teleport:ro
   environment:
-    CLAUDE_CONFIG_DIR: /home/alice/.claude
+    # LC_ALL: entrypoint.sh's ~/.ssh/environment covers real ssh sessions
+    # (where the tool's own dial lands); this covers `docker compose exec`
+    # (the tests' own invocations) the same way, for the same tmux reason.
+    LC_ALL: C.UTF-8
+    # No CLAUDE_CONFIG_DIR here: it must default to $HOME/.claude per-user
+    # (alice vs bob) rather than being pinned to one user for the whole
+    # container — docker exec inherits this from the container config
+    # regardless of -u, so a hardcoded path here broke every bob@dest
+    # scenario with a permission-denied (bob can't reach alice's $HOME).
     DISABLE_AUTOUPDATER: "1"
     DISABLE_TELEMETRY: "1"
     DISABLE_ERROR_REPORTING: "1"
