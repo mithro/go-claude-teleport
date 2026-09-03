@@ -177,6 +177,23 @@ func (j *Journal) saveLocked() error {
 // its own progress, and then overwrite that progress with the caller's
 // now-stale snapshot. Under CPU contention this is not merely
 // theoretical — it reproduces reliably (see internal/cli spawnAndFollow).
+//
+// This only protects fields SaveMerged itself amends: the journal's OWNER
+// (the runner, via its own plain Save calls) still does a blind
+// whole-journal write of its own continuously-held in-memory state, which
+// does not know about anything SaveMerged wrote. Today the only field the
+// CLI amends this way is RunnerPID, and it stays correct only because the
+// runner independently sets that SAME value itself (os.Getpid(), matching
+// the pid the CLI just spawned) as part of its own first Save — so a
+// runner Save landing after SaveMerged reverts nothing, it just reasserts
+// the identical value. Amending any OTHER field via SaveMerged in future,
+// one the runner does not also set, would be silently reverted by the
+// runner's next Save; that field would need the runner's cooperation too
+// (or its own dedicated file), not just a SaveMerged call here.
+//
+// flock is sufficient (rather than needing a distributed lock) because
+// the runner and the CLI process that spawned it are always on the same
+// host, sharing the same job directory on the same filesystem.
 func SaveMerged(dataDir, id string, mutate func(*Journal)) (*Journal, error) {
 	dir := Dir(dataDir, id)
 	var out *Journal

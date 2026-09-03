@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -311,6 +312,15 @@ func TestBangModeGate(t *testing.T) {
 // must derive !-mode from $CLAUDE_PID and the stored plan exactly as
 // runTeleport does.
 func TestContinueDerivesBangMode(t *testing.T) {
+	// The stand-in runner below flock(1)s job.SaveMerged's lock file so its
+	// write is correctly serialized against spawnAndFollow's (see that
+	// function's doc comment). Skip explicitly rather than let a host
+	// without flock(1) fail with the write silently going elsewhere or the
+	// script erroring out, which would masquerade as the regression this
+	// test pins.
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock(1) not installed")
+	}
 	a, out := fixtureApp(t)
 	a.env["CLAUDE_PID"] = "4242"
 	j := unfinishedJob(t, a, fixtureSID)
