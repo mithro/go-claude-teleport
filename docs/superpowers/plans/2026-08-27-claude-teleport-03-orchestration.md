@@ -11061,10 +11061,24 @@ Everything below is new relative to `2026-08-27-claude-teleport-00-interfaces.md
 
 **internal/tmuxx**
 - `DialControl` takes a socket **path** (`tmux -S`); `ErrNoServer`
-- `var Dial Dialer = DialControl` (FindServer's liveness probe; tests swap it)
+- `var Dial Dialer = DialControl` (FindServer's liveness probe; tests swap it) — `internal/cli` dials through this var too, so a test that swaps it also covers `remote serve`'s own probe
 - `SessionInfo{Name, Group string}`, `ListSessions(ctx, t) ([]SessionInfo, error)`, `BaseSession(sessions, group) (string, bool)`
 - `ShellQuote(argv []string) string`
+- `RefString(ref *session.TmuxRef) string` — the one spelling of `<session>:<window>.<pane>`; every caller that formats a pane ref (steps, `list`, the registry comparison in `verifyStart`) uses it
+- `IsShell(comm string) bool` — the shared "is this pane running a shell" predicate (`orchestrate` had a private copy; C4/B6)
+- `PanePID(ctx, t, paneID) (int, error)` — the pid tmux itself started in the pane; the group the pty's foreground reverts to after a stopped job is thawed
 - `StartTestServer(t) (socketPath, socketDir string)` under build tag `tmuxlive`
+- **Knowing deviation from the "no package reads the environment" rule:** `utf8Env` (client.go) reads `LC_ALL`/`LC_CTYPE`/`LANG` out of the environment it is given and forces a UTF-8 locale for the `tmux -C` child. It is not a directory or a default a caller could pass instead — it is the locale of the very process being spawned, and a non-UTF-8 one makes tmux mangle non-ASCII pane names and content. Documented here rather than plumbed through every call site.
+
+**internal/job**
+- `ValidateID(id string) error` — the one rule for what may appear as `jobs/<id>`/`staging/<id>` on either host (non-empty, no separators, no `.`/`..`, no control characters); the wire dispatch and every `Local` method that turns an id into a path call it (rulings R-P3-23i/R-P3-23n)
+
+**internal/sshx**
+- `DefaultKeepaliveInterval = 15 * time.Second`, `DefaultKeepaliveCountMax = 3` and `Options.KeepaliveInterval time.Duration` / `Options.KeepaliveCountMax int` (OpenSSH's `ServerAliveInterval`/`ServerAliveCountMax`). Unlike OpenSSH they are ON by default: a teleport runs unattended, and a half-open link must fail the job into a continuable journal rather than hang it. `interval <= 0` disables them; `-o ServerAliveInterval=`/`-o ServerAliveCountMax=` and the same two keywords in `~/.ssh/config` override, and `ServerAliveCountMax=0` is an error rather than a silent default
+- `sshtest.Options.GlobalRequestDelay func(n int) time.Duration` — delays the n-th global request so a test can simulate a link that stops answering keepalives
+
+**internal/procx**
+- `(*Freezer).Warnings() string` — whatever the freezer helper wrote to stderr (its degrade-to-bare-pid notes), so the caller can put them in `log.txt` on the success path too
 
 **internal/remote**
 - `Endpoint` gains: `GitFiles`, `GitSourceFacts`, `BuildManifest`, `SessionExtras`, `TmuxSessions`, `KillWindow`, `ClaudeStatus`, `ListSessions`, `Cleanup`, `DeleteInstalled`, `RemoveJob` (signatures in Tasks 13, 16, 23; `RemoveJob` removes `jobs/<id>/` entirely — the wire dispatch handler refuses any id not prefixed `inspect-`, ruling R-P3-23i)
@@ -11080,11 +11094,15 @@ Everything below is new relative to `2026-08-27-claude-teleport-00-interfaces.md
 **internal/transfer**
 - Plan 02's `Build` already takes `Size` from the bytes it hashes and `Mode`/`ModTime` from `os.Stat` when the `FileEntry` leaves them zero, which is what the capture entry (`runCapture`, built on the driver and hashed by `BuildManifest` on the source) relies on.
 - `InstallReport.InstalledIDs []int` (`json:"InstalledIDs"`, ruling R-P3-23a: ids `Install` placed at `Dst` from scratch) and `InstallReport.FastForwardedIDs []int` (ruling R-P3-23h: ids `Install` fast-forwarded — folded into `Plan.InstalledIDs`, below, only when already recorded there)
+- `InstallExtras.Force bool` (the driver's `--force`, relayed to the destination) and `InstallReport.ForceOverwritten int` (entries replaced wholesale under it, hash-verified) — B12
 
 **internal/orchestrate**
 - `Options.Target string`, `Options.Via []string`, `Options.SSHOptions map[string]string`, `Options.LocalDest *session.Paths` (tests)
 - `Plan` JSON tags (`options`, `statuses`, `git`, `extras`, … — `remote.planView` depends on them) and fields `JobID`, `SourceFacts`, `Files`, `Statuses`, `InstalledIDs` (`json:"installed_ids"`, ruling R-P3-23a — the durable record of what THIS job installed; `Statuses` is overwritten by later manifest-diffs and cannot answer that once a job finishes), `Extras`, `CaptureEntryID`, `DestCwd`, `DestCapture`, `DestRef`, `CreatedSession`, `CreatedWindow`, `DestRegistry`, `StartedAt`
 - `(*Plan).ToJSON()`, `PlanFromJournal(j)`, `RefusedError`, `UnreachableError`, `PlaceholderArgv`, `SuspendArgv`, `StepNames`, `EndpointFactory`, `RunJob`, `ExitCode`, `FailedStep`
+- `Plan.RecordedSrc`/`Plan.RecordedDst bool` (`json:"recorded_src"`/`"recorded_dst"`) — each host's history row is appended once per job, so a re-run of the record step cannot duplicate it (finding A8)
+- `ExitOK = 0`, `ExitFailed = 1`, `ExitNotResumed = 5` — the spec §5 codes a journal can decide, defined once here next to `ExitCode` and re-exported by `internal/cli` (finding A13)
+- `Steps(p, j, src, dst, logf)` and `RunJob(ctx, dataDir, jobID, factory, logf)` take no `selfExe`: no step re-execs the binary (finding A9)
 
 **test/fakeclaude**
 - (no additions) `FAKECLAUDE_TMUX`, `FAKECLAUDE_FAIL=not-logged-in` and `FAKECLAUDE_RUN_CHILD` are Plan 01 Task 19's env contract, used as defined there

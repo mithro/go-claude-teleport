@@ -455,8 +455,20 @@ type Options struct {
     AgentSocket    string          // $SSH_AUTH_SOCK
     StrictHostKey  string          // "yes" (default) | "accept-new" | "no"
     ConnectTimeout time.Duration
+    // OpenSSH's ServerAliveInterval/ServerAliveCountMax. ON by default
+    // (unlike OpenSSH): a teleport runs unattended, so a half-open link
+    // must fail the job into a continuable journal, not hang it. 0 takes
+    // the default, a negative interval disables them; `-o ServerAlive*`
+    // and the same keywords in ~/.ssh/config override, and
+    // ServerAliveCountMax=0 is an error rather than a silent default.
+    KeepaliveInterval time.Duration
+    KeepaliveCountMax int
     Logf           func(string, ...any)
 }
+const (
+    DefaultKeepaliveInterval = 15 * time.Second
+    DefaultKeepaliveCountMax = 3
+)
 type Client struct{ /* wraps *ssh.Client and the jump clients */ }
 // Dial connects through the jump chain; each hop's hostname is resolved by
 // the previous hop (client.Dial("tcp", host:port)).
@@ -709,6 +721,12 @@ type InstallExtras struct {
 ```go
 package job
 
+// ValidateID is the one rule for what may appear as jobs/<id> or
+// staging/<id> on either host: non-empty, no path separators, no "."/"..",
+// no control characters. The wire dispatch and every Local method that
+// turns an id into a path call it.
+func ValidateID(id string) error
+
 type StepStatus string
 const (
     Pending StepStatus = "pending"
@@ -931,7 +949,24 @@ func KillWindow(ctx context.Context, t Transport, windowID string) error
 
 // Prober adapts a Transport to session.PaneProbe.
 func Prober(ctx context.Context, t Transport, procs *procx.Table, socketPath string) session.PaneProbe
+
+// The one spelling of a pane ref ("<session>:<window>.<pane>") and the one
+// "does this pane run a shell" predicate: every caller (orchestrate's
+// steps, cli's list, the registry comparison in verifyStart) uses these
+// rather than its own copy.
+func RefString(ref *session.TmuxRef) string
+func IsShell(comm string) bool
+// PanePID is the pid tmux started in the pane (the shell, ordinarily): the
+// process group the pty's foreground reverts to when a stopped job thaws.
+func PanePID(ctx context.Context, t Transport, paneID string) (int, error)
 ```
+
+**Knowing deviation from "only `internal/cli` reads the environment":**
+`utf8Env` forces a UTF-8 locale (`LC_ALL`/`LC_CTYPE`/`LANG`) on the
+`tmux -C` child by reading those three variables out of the environment it
+is handed. They are the locale of the very process being spawned, not a
+directory or default a caller could pass instead, and a non-UTF-8 one makes
+tmux mangle non-ASCII pane names and captured content.
 
 ## internal/orchestrate (Plan 03)
 
