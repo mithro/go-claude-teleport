@@ -262,3 +262,38 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+// TestAnnotateManifestSkipsWorktreeDirs covers B10. Every CatWorktree
+// manifest entry was registered in Git.DirtyEntries, directory entries
+// included — but git-attach reads that map as "dst path -> the staged FILE
+// to place here", so a directory landed in it as a file to copy. A
+// directory needs no dirty-file treatment: the ordinary install path
+// creates it.
+func TestAnnotateManifestSkipsWorktreeDirs(t *testing.T) {
+	p := &Plan{
+		Git:    &gitx.Plan{Mode: gitx.ModeExistingMain, IndexEntryID: gitx.NoEntry, PackEntryID: gitx.NoEntry},
+		Extras: &transfer.InstallExtras{},
+	}
+	dir := filepath.Join("/home", "bob", "repo", "sub")
+	file := filepath.Join(dir, "dirty.txt")
+	m := &transfer.Manifest{Version: 1, Entries: []transfer.Entry{
+		{ID: 0, Category: session.CatWorktree, Dst: dir, Mode: uint32(os.ModeDir | 0o755)},
+		{ID: 1, Category: session.CatWorktree, Dst: file, Mode: 0o644},
+	}}
+	p.annotateManifest(m, nil)
+
+	if _, ok := p.Git.DirtyEntries[dir]; ok {
+		t.Errorf("DirtyEntries = %v, want the directory entry left out", p.Git.DirtyEntries)
+	}
+	if id, ok := p.Git.DirtyEntries[file]; !ok || id != 1 {
+		t.Errorf("DirtyEntries = %v, want the dirty file registered as id 1", p.Git.DirtyEntries)
+	}
+	// The directory must still be installed by the ordinary path, so it
+	// must NOT be deferred either.
+	if m.Entries[0].Deferred {
+		t.Error("a worktree directory entry must not be deferred: the plain install path creates it")
+	}
+	if !m.Entries[1].Deferred {
+		t.Error("the dirty worktree file is git-attach's to place, so it stays deferred")
+	}
+}

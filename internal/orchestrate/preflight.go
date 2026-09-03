@@ -290,7 +290,12 @@ func (p *Plan) annotateManifest(m *transfer.Manifest, memorySrcs map[string]bool
 		case e.Category == session.CatRepo && e.Src == indexSrc:
 			p.Git.IndexEntryID = e.ID
 			e.Deferred = true
-		case e.Category == session.CatWorktree:
+		// B10: a directory is not a dirty FILE. GitAttach reads
+		// DirtyEntries as "dst path -> the staged file to place here", so
+		// a directory entry in there is a copy that cannot work; the
+		// ordinary install path creates the directory instead, which also
+		// means it must not be deferred.
+		case e.Category == session.CatWorktree && !e.IsDir():
 			p.Git.DirtyEntries[e.Dst] = e.ID
 			e.Deferred = true
 		}
