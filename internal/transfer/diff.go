@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
@@ -125,12 +126,59 @@ func deferrableCategory(cat session.Category) bool {
 	return false
 }
 
+// dataDirFromStagingDir recovers the destination's own claude-teleport
+// DataDir from a stagingDir argument, instead of adding a session.Paths
+// parameter to Diff that every caller of it — including ones with nothing
+// to do with this fix — would then have to thread through. Every real
+// caller builds stagingDir as job.StagingDir(DataDir, jobID), i.e.
+// "<DataDir>/staging/<jobID>" (internal/remote/local.go's stagingDir
+// method, used identically for both ManifestDiff and Install), so
+// stripping the last two path components recovers exactly DataDir.
+// stagingDir is never wire data — the caller builds it from its own
+// trusted configuration — so this is exactly as trustworthy as being
+// handed DataDir directly, and it never depends on any wire-supplied job
+// id lining up with anything: it is pure path arithmetic on a
+// caller-constructed argument.
+func dataDirFromStagingDir(stagingDir string) string {
+	return filepath.Dir(filepath.Dir(filepath.Clean(stagingDir)))
+}
+
+// canonicalCaptureDst is the ONE legitimate Dst a manifest's CatCapture
+// entry may ever name: job.Dir(dataDir, jobID)/capture.txt — exactly the
+// path internal/orchestrate/steps.go's runCapture builds on the source
+// side. jobID is re-validated with job.ValidateID even though callers
+// already check it at the dispatch boundary (internal/remote/jobid.go):
+// this function itself joins it straight into a filesystem path, so it
+// re-derives the safety property rather than trusting it was already
+// applied.
+func canonicalCaptureDst(dataDir, jobID string) (string, error) {
+	if err := job.ValidateID(jobID); err != nil {
+		return "", fmt.Errorf("capture entry: %w", err)
+	}
+	return filepath.Join(job.Dir(dataDir, jobID), "capture.txt"), nil
+}
+
 // Diff runs on the destination and classifies every entry.
 func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, error) {
 	out := make(map[int]Status, len(m.Entries))
+	// Ruling R-P3-B1b (the B1 residual hole): a hostile or buggy source
+	// can set a CatCapture entry's Dst to any path under Home (e.g.
+	// ~/.bashrc), mark it Deferred, and stage attacker-chosen bytes under
+	// that entry's id — Diff's Deferred branch below would then classify
+	// it staged-same purely from staging state, WITHOUT ever comparing
+	// Dst, and Install would rename the staged bytes straight over it.
+	// The destination re-derives the only legitimate capture Dst itself,
+	// once, up front, and the per-entry check below refuses any other Dst
+	// unconditionally — before the Deferred short-circuit, before any
+	// Lstat of Dst, regardless of what (if anything) already lives there.
+	captureDst, captureDstErr := canonicalCaptureDst(dataDirFromStagingDir(stagingDir), m.JobID)
 	for _, e := range m.Entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if e.Category == session.CatCapture && (captureDstErr != nil || filepath.Clean(e.Dst) != captureDst) {
+			out[e.ID] = PresentDifferent
+			continue
 		}
 		staged, mismatch, err := stagedState(stagingDir, e)
 		if err != nil {

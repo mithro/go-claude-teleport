@@ -179,7 +179,14 @@ func underDir(cleanPath, dir string) bool {
 // manifest (or an InstallExtras.Memory entry) whose Dst tries to smuggle a
 // write outside the sandbox — e.g. <ConfigDir>/.credentials.json, or a path
 // outside $HOME entirely.
-func validateDst(e Entry, p session.Paths) error {
+//
+// Ruling R-P3-B1b: a CatCapture entry's Dst must additionally equal
+// canonicalCaptureDst(p.DataDir, jobID) — the destination's own re-derived
+// answer to "where does THIS job's pane capture belong" — never whatever a
+// hostile or buggy source put in the wire Dst field. jobID is the
+// manifest's own JobID (callers pass m.JobID), matching the path
+// internal/orchestrate/steps.go built the entry with on the source side.
+func validateDst(e Entry, p session.Paths, jobID string) error {
 	dst := filepath.Clean(e.Dst)
 	if !underDir(dst, p.Home) {
 		return fmt.Errorf("refusing entry: %s is not under home %s", e.Dst, p.Home)
@@ -194,6 +201,15 @@ func validateDst(e Entry, p session.Paths) error {
 		}
 		if session.Forbidden(rel) {
 			return fmt.Errorf("refusing session entry: %s is a forbidden path (%s)", e.Dst, rel)
+		}
+	}
+	if e.Category == session.CatCapture {
+		canon, err := canonicalCaptureDst(p.DataDir, jobID)
+		if err != nil {
+			return fmt.Errorf("refusing capture entry: %s: %w", e.Dst, err)
+		}
+		if dst != canon {
+			return fmt.Errorf("refusing capture entry: %s is not this job's own capture path (%s)", e.Dst, canon)
 		}
 	}
 	return nil
@@ -222,12 +238,12 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 	rep := &InstallReport{}
 	// Defense-in-depth destination re-check, before anything is touched.
 	for _, e := range m.Entries {
-		if err := validateDst(e, p); err != nil {
+		if err := validateDst(e, p, m.JobID); err != nil {
 			return rep, err
 		}
 	}
 	for _, e := range extra.Memory {
-		if err := validateDst(e, p); err != nil {
+		if err := validateDst(e, p, m.JobID); err != nil {
 			return rep, err
 		}
 	}
@@ -384,7 +400,7 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 // session's own paths.
 func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
 	for _, e := range m.Entries {
-		if err := validateDst(e, p); err != nil {
+		if err := validateDst(e, p, m.JobID); err != nil {
 			return nil, err
 		}
 	}

