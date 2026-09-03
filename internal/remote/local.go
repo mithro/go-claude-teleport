@@ -90,8 +90,9 @@ func (l *Local) Hello(ctx context.Context) (HostInfo, error) {
 	info.HasTmux = err == nil
 	_, err = exec.LookPath("claude-resume")
 	info.HasClaudeResume = err == nil
-	if claudePath, err := exec.LookPath("claude"); err == nil {
+	if claudePath, ok := resolveExe("claude", l.paths.Home); ok {
 		info.HasClaude = true
+		info.ClaudePath = claudePath
 		cmd := exec.CommandContext(ctx, claudePath, "--version")
 		out, verr := cmd.Output()
 		if verr != nil {
@@ -103,6 +104,41 @@ func (l *Local) Hello(ctx context.Context) (HostInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+// remoteExeFallbacks lists the well-known locations checked, in order,
+// when exec.LookPath does not find a binary on the CURRENT process's PATH.
+// HK-3 (real-world bug): `doctor ten64` reported "FAIL remote claude"
+// because the remote `claude-teleport remote serve` process itself runs
+// with the ssh session's non-interactive PATH (HK-2's fix gets
+// claude-teleport ITSELF started despite that PATH, but does not change
+// it), and Claude Code's native installer places `claude` under
+// $HOME/.local/bin — on PATH for interactive shells only in many default
+// zsh/bash configs.
+var remoteExeFallbacks = []string{".local/bin", "bin"}
+
+// resolveExe finds name via exec.LookPath first (the ordinary case), then
+// checks $HOME/.local/bin, $HOME/bin, /usr/local/bin and /usr/bin in turn,
+// returning the first path that exists and is executable. home is
+// l.paths.Home, never the environment's $HOME (Local must not read the
+// environment — the same ruling Hello's TmuxSocketDir already follows).
+func resolveExe(name, home string) (path string, ok bool) {
+	if p, err := exec.LookPath(name); err == nil {
+		return p, true
+	}
+	var candidates []string
+	for _, dir := range remoteExeFallbacks {
+		if home != "" {
+			candidates = append(candidates, filepath.Join(home, dir, name))
+		}
+	}
+	candidates = append(candidates, filepath.Join("/usr/local/bin", name), filepath.Join("/usr/bin", name))
+	for _, cand := range candidates {
+		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
+			return cand, true
+		}
+	}
+	return "", false
 }
 
 func firstLine(s string) string {

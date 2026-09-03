@@ -106,6 +106,12 @@ func remoteChecks(ctx context.Context, ep remote.Endpoint, host string) ([]check
 	if hi.ClaudeVersionErr != "" {
 		claudeDetail = fmt.Sprintf("found but --version failed: %s", hi.ClaudeVersionErr)
 	}
+	// HK-3: name which path resolveExe used, so a claude found only via a
+	// $HOME/.local/bin (etc.) fallback — rather than the remote process's
+	// own PATH — is visible here instead of just "ok".
+	if hi.ClaudePath != "" {
+		claudeDetail = fmt.Sprintf("%s (%s)", claudeDetail, hi.ClaudePath)
+	}
 	cs = append(cs, check{"remote claude", claudeDetail, hi.HasClaude && hi.ClaudeVersionErr == ""})
 	cs = append(cs, check{"remote tmux", fmt.Sprintf("present: %v", hi.HasTmux), true})
 	cs = append(cs, check{"remote claude-resume", fmt.Sprintf("present: %v; home %s; config %s", hi.HasClaudeResume, hi.Home, hi.ConfigDir), true})

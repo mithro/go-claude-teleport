@@ -82,7 +82,15 @@ func claudeEnv(base []string, p session.Paths) []string {
 // RunPtyResume runs `claude --resume <id>` under a pty in cwd, confirms
 // per spec §6.2, then exits it (spec §9, no-tmux destination).
 func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, timeout time.Duration) error {
-	cmd := exec.CommandContext(ctx, "claude", "--resume", string(id))
+	// HK-3: resolve claude the same way Hello does (exec.LookPath, then
+	// $HOME/.local/bin etc.) rather than a bare "claude" — this process's
+	// own PATH is the ssh session's, which may not carry a native
+	// ~/.local/bin install (see resolveExe's doc comment in local.go).
+	claudeExe := "claude"
+	if p, ok := resolveExe("claude", l.paths.Home); ok {
+		claudeExe = p
+	}
+	cmd := exec.CommandContext(ctx, claudeExe, "--resume", string(id))
 	cmd.Dir = cwd
 	cmd.Env = append(claudeEnv(os.Environ(), l.paths), "TERM=xterm-256color")
 	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 40, Cols: 120})

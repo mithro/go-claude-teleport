@@ -21,6 +21,7 @@ type HostInfo struct {
 	TmuxSocketDir    string `json:"tmux_socket_dir"`
 	HasTmux          bool   `json:"has_tmux"`
 	HasClaude        bool   `json:"has_claude"`
+	ClaudePath       string `json:"claude_path,omitempty"` // resolveExe's result: LookPath, or which fallback location found it (HK-3)
 	ClaudeVersion    string `json:"claude_version"`
 	ClaudeVersionErr string `json:"claude_version_err,omitempty"` // `claude --version` failed; message, not swallowed
 	HasClaudeResume  bool   `json:"has_claude_resume"`            // go-tmux-saver's claude-resume on PATH
