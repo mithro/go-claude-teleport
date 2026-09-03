@@ -104,6 +104,27 @@ func ffPrefixCheck(dst, staged string) (bool, error) {
 	return session.IsPrefix(dst, staged)
 }
 
+// deferrableCategory reports whether Entry.Deferred is meaningful for cat.
+//
+// Deferred is a SOURCE-controlled wire field that tells the destination to
+// classify an entry by staging state alone, without ever looking at Dst.
+// That is exactly right for the three categories that own their Dst by
+// construction — the job's own pane capture (CatCapture, whose Dst is
+// <jobID>/capture.txt) and existing-main git-attach's dirty index and
+// worktree files (CatRepo/CatWorktree, which git-attach places itself with
+// git's own semantics) — and a licence to overwrite anything at all for
+// every other category. So the DESTINATION decides, from the category, not
+// from the flag: for anything else the flag is ignored and Dst is compared
+// as usual, which turns a smuggled ~/.bashrc entry into present-different
+// and hence a Blocking collision (spec §7.4).
+func deferrableCategory(cat session.Category) bool {
+	switch cat {
+	case session.CatCapture, session.CatRepo, session.CatWorktree:
+		return true
+	}
+	return false
+}
+
 // Diff runs on the destination and classifies every entry.
 func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, error) {
 	out := make(map[int]Status, len(m.Entries))
@@ -125,7 +146,7 @@ func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, 
 				return Absent
 			}
 		}
-		if e.Deferred {
+		if e.Deferred && deferrableCategory(e.Category) {
 			// A deferred entry is never compared against Dst: Dst is
 			// whatever the destination's own current checkout already
 			// holds there (an existing-main teleport's whole premise), not

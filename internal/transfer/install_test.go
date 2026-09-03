@@ -457,3 +457,49 @@ func TestUninstallRemovesEmptiedNestedDirs(t *testing.T) {
 		t.Errorf("sidecar dir left behind: %v", err)
 	}
 }
+
+// TestInstallRefusesSmuggledDeferredEntry is the Install half of B1: even
+// with a status map that says staged-same (a compromised source could get
+// there via a peer whose Diff is older, or simply by a bug), Install must
+// refuse to place a Deferred entry whose category is not the pane capture
+// — the only Deferred category the plain file-install path ever handles —
+// before anything at all is touched.
+func TestInstallRefusesSmuggledDeferredEntry(t *testing.T) {
+	m, staging, p := staged(t)
+	victim := 2 // a plain session-category file
+	if !m.Entries[victim].IsRegular() {
+		t.Fatalf("fixture entry %d is not a plain file: %+v", victim, m.Entries[victim])
+	}
+	if err := os.MkdirAll(p.Home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bashrc := filepath.Join(p.Home, ".bashrc")
+	rc := "# the user's own shell rc\n"
+	if err := os.WriteFile(bashrc, []byte(rc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.Entries[victim].Category = session.CatPack
+	m.Entries[victim].Dst = bashrc
+	m.Entries[victim].Deferred = true
+
+	// The hostile status map the destination must not trust.
+	st := map[int]Status{}
+	for _, e := range m.Entries {
+		st[e.ID] = StagedSame
+	}
+	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
+	if err == nil || !strings.Contains(err.Error(), "deferred") || !strings.Contains(err.Error(), bashrc) {
+		t.Fatalf("err = %v, want a deferred-entry refusal naming %s", err, bashrc)
+	}
+	if got, _ := os.ReadFile(bashrc); string(got) != rc {
+		t.Errorf("%s was modified: %q", bashrc, got)
+	}
+	for i, e := range m.Entries {
+		if i == victim || e.IsDir() {
+			continue
+		}
+		if _, err := os.Lstat(e.Dst); err == nil {
+			t.Errorf("entry %d (%s) must not have been installed before the smuggled entry was rejected", i, e.Dst)
+		}
+	}
+}
