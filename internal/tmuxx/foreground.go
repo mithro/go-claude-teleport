@@ -69,7 +69,7 @@ type ForegroundOptions struct {
 // typed text, and the ` 'fg'` that arrives next lands on the polluted
 // line. The pane a real return leg was left with:
 //
-//	tim@ten64:~$ 997;1n997;1n 'fg'
+//	alice@laptop:~$ 997;1n997;1n 'fg'
 //	bash: 997: command not found
 //
 // with Claude still stopped and the shell still owning the tty. Typing

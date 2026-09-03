@@ -123,7 +123,10 @@ func (a *app) teleport(ctx context.Context, o orchestrate.Options, dryRun bool) 
 			return ExitOK
 		}
 		fmt.Fprintf(a.stdout, "job %s is %s at step %s; continuing it to %s (use `abandon` to start over)\n", sess.ID.Short(), stateWord(j), firstIncompleteName(j), storedDest(j))
-		return a.continueJob(ctx, a.noteContinueFlags(j, o), o.BangMode)
+		// The same question continueJob asks, asked once here so the
+		// flag notes can say whether a runner is already past reading
+		// its plan (F-PROOF2-6).
+		return a.continueJob(ctx, a.noteContinueFlags(j, o, j.RunnerAlive(a.runnerAlive)), o.BangMode)
 	}
 	plan, err := orchestrate.Preflight(ctx, o, src, dst, jobID)
 	if err != nil {
@@ -193,15 +196,26 @@ func (a *app) continueBang(j *job.Journal) bool {
 //
 // An omitted flag never retracts consent the job already recorded:
 // leaving it off a continue is not a request to withdraw it.
-func continueFlags(stored, given orchestrate.Options) (notes []string, updated orchestrate.Options, changed bool) {
+//
+// liveRunner says a runner for this job is already in flight. That runner
+// decoded its plan once at start (orchestrate.RunJob) and never re-reads
+// it, so consent added now is written to the journal but cannot reach the
+// steps it is already running — it applies from the next run of the job.
+// Saying "honouring it from here on" in that case would be a promise the
+// tool cannot keep, so the note says which it is.
+func continueFlags(stored, given orchestrate.Options, liveRunner bool) (notes []string, updated orchestrate.Options, changed bool) {
 	updated = stored
+	when := "honouring it from here on"
+	if liveRunner {
+		when = "recorded; it applies from the next run of this job (the runner already in flight read its plan at start)"
+	}
 	if given.Force && !stored.Force {
 		updated.Force, changed = true, true
-		notes = append(notes, "  --force: this job was planned without it; honouring it from here on")
+		notes = append(notes, "  --force: this job was planned without it; "+when)
 	}
 	if given.AllowDrift && !stored.AllowDrift {
 		updated.AllowDrift, changed = true, true
-		notes = append(notes, "  --allow-config-drift: this job was planned without it; honouring it from here on")
+		notes = append(notes, "  --allow-config-drift: this job was planned without it; "+when)
 	}
 	if given.TmuxSocket != "" && given.TmuxSocket != stored.TmuxSocket {
 		was := stored.TmuxSocket
@@ -220,12 +234,12 @@ func continueFlags(stored, given orchestrate.Options) (notes []string, updated o
 // step is allowed to do, never whether the continue may proceed, and
 // refusing to continue a half-moved session over a journal write would be
 // a far worse answer than continuing under the options already stored.
-func (a *app) noteContinueFlags(j *job.Journal, o orchestrate.Options) *job.Journal {
+func (a *app) noteContinueFlags(j *job.Journal, o orchestrate.Options, liveRunner bool) *job.Journal {
 	p, err := orchestrate.PlanFromJournal(j)
 	if err != nil {
 		return j
 	}
-	notes, updated, changed := continueFlags(p.Options, o)
+	notes, updated, changed := continueFlags(p.Options, o, liveRunner)
 	if len(notes) > 0 {
 		fmt.Fprintln(a.stdout, "flags given now that this job was not planned with:")
 		for _, n := range notes {

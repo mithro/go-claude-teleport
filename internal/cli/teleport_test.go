@@ -457,7 +457,8 @@ func storedPlanJob(t *testing.T, a *app, sid string, opts orchestrate.Options) *
 // omitted flag never retracts consent the job already recorded.
 func TestContinueFlagsHonoursConsentAndReportsTheRest(t *testing.T) {
 	stored := orchestrate.Options{TmuxSocket: "/run/tmux-1000/default"}
-	notes, updated, changed := continueFlags(stored, orchestrate.Options{Force: true, AllowDrift: true, TmuxSocket: "/run/tmux-1000/other"})
+	given := orchestrate.Options{Force: true, AllowDrift: true, TmuxSocket: "/run/tmux-1000/other"}
+	notes, updated, changed := continueFlags(stored, given, false)
 	if !changed || !updated.Force || !updated.AllowDrift {
 		t.Errorf("continueFlags did not honour the consent flags: %+v (changed %v)", updated, changed)
 	}
@@ -465,16 +466,28 @@ func TestContinueFlagsHonoursConsentAndReportsTheRest(t *testing.T) {
 		t.Errorf("--tmux-socket must not be retargeted mid-job: %q", updated.TmuxSocket)
 	}
 	all := strings.Join(notes, "\n")
-	for _, want := range []string{"--force", "--allow-config-drift", "--tmux-socket", "/run/tmux-1000/other", "/run/tmux-1000/default"} {
+	for _, want := range []string{"--force", "--allow-config-drift", "--tmux-socket", "/run/tmux-1000/other", "/run/tmux-1000/default", "honouring it from here on"} {
 		if !strings.Contains(all, want) {
 			t.Errorf("the notes never mention %q:\n%s", want, all)
 		}
 	}
 
+	// A runner already in flight decoded its plan at start and never
+	// re-reads it, so consent added now cannot reach the steps it is
+	// running — the note must not promise otherwise (review round 1).
+	live, _, _ := continueFlags(stored, given, true)
+	liveAll := strings.Join(live, "\n")
+	if !strings.Contains(liveAll, "applies from the next run of this job") {
+		t.Errorf("with a runner in flight the notes must not claim the flags take effect now:\n%s", liveAll)
+	}
+	if strings.Contains(liveAll, "honouring it from here on") {
+		t.Errorf("with a runner in flight the notes overstate what the flags do:\n%s", liveAll)
+	}
+
 	// Nothing new given: nothing to say, nothing to change — and the
 	// consent already stored survives being left off the command line.
 	consented := orchestrate.Options{Force: true, AllowDrift: true}
-	notes, updated, changed = continueFlags(consented, orchestrate.Options{})
+	notes, updated, changed = continueFlags(consented, orchestrate.Options{}, false)
 	if changed || len(notes) != 0 {
 		t.Errorf("an invocation adding no flags said %v (changed %v)", notes, changed)
 	}
@@ -504,7 +517,7 @@ func TestTeleportOverAnExistingJobAnnouncesNewFlags(t *testing.T) {
 	defer cancel()
 	a.teleport(ctx, o, false)
 
-	for _, want := range []string{"continuing it to", "--force", "--allow-config-drift", "--tmux-socket"} {
+	for _, want := range []string{"continuing it to", "--force", "--allow-config-drift", "--tmux-socket", "honouring it from here on"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("continuing an existing job never mentioned %q:\n%s", want, out.String())
 		}
