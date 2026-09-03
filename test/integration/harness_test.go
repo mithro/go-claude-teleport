@@ -4,13 +4,17 @@
 package integration
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mithro/go-claude-teleport/internal/job"
 )
 
 // projectName is unique per test-binary run (controller requirement C: a
@@ -195,7 +199,10 @@ func newSID(t testing.TB) string {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	if _, err := f.Read(b); err != nil {
+	// io.ReadFull, not f.Read: a short read from /dev/urandom would
+	// silently leave part of the "uuid" as zero bytes, and two tests in the
+	// same second could then collide on a session id (C14).
+	if _, err := io.ReadFull(f, b); err != nil {
 		t.Fatal(err)
 	}
 	b[6] = (b[6] & 0x0f) | 0x40
@@ -280,6 +287,53 @@ func procState(t testing.TB, svc, user, pid string) string {
 func transcriptPath(home, cwd, sid string) string {
 	munged := strings.NewReplacer("/", "-", ".", "-").Replace(cwd)
 	return home + "/.claude/projects/" + munged + "/" + sid + ".jsonl"
+}
+
+// readJournal parses jobs/<sid>/job.json on svc as user. ok is false while
+// the job directory does not exist yet (or the file is being rewritten),
+// so callers can poll with it.
+func readJournal(t testing.TB, svc, user, sid string) (job.Journal, bool) {
+	t.Helper()
+	out, code := shCode(t, svc, user, "cat ~/.local/share/claude-teleport/jobs/"+sid+"/job.json")
+	if code != 0 {
+		return job.Journal{}, false
+	}
+	var j job.Journal
+	if err := json.Unmarshal([]byte(out), &j); err != nil {
+		return job.Journal{}, false
+	}
+	return j, true
+}
+
+// journalStep returns the named step's state from a journal read by
+// readJournal. Journal.Step is deliberately not used: it APPENDS a pending
+// step when the name is absent, which is right for the runner and wrong
+// for an observer.
+func journalStep(j job.Journal, name string) (job.StepState, bool) {
+	for _, s := range j.Steps {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return job.StepState{}, false
+}
+
+// waitStepRunning blocks until the named step is running (or has already
+// finished, which a fast step can reach between two polls).
+func waitStepRunning(t testing.TB, svc, user, sid, step string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		if j, ok := readJournal(t, svc, user, sid); ok {
+			if st, ok := journalStep(j, step); ok && st.Status != job.Pending {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("[%s/%s] step %s never started for %s", svc, user, step, sid)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func teleport(t testing.TB, svc, user, args string) (string, int) {
