@@ -493,7 +493,7 @@ func (r *runner) verifyStart(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	r.logf("start: session already alive in %s; confirming only", reg.Tmux)
-	if r.p.DestRegistry, err = r.dst.ConfirmClaude(ctx, r.p.DestRef, r.id(), r.p.Options.StartTimeout); err != nil {
+	if r.p.DestRegistry, err = r.dst.ConfirmClaude(ctx, r.p.DestRef, r.id(), r.p.Options.StartTimeout, r.p.sourceTrusted()); err != nil {
 		return false, err
 	}
 	return true, r.persist(ctx)
@@ -539,7 +539,7 @@ func (r *runner) runStart(ctx context.Context) error {
 	if err := r.dst.StartClaude(ctx, r.p.DestRef, r.id(), r.p.JobID, argv); err != nil {
 		return err
 	}
-	reg, err := r.dst.ConfirmClaude(ctx, r.p.DestRef, r.id(), r.p.Options.StartTimeout)
+	reg, err := r.dst.ConfirmClaude(ctx, r.p.DestRef, r.id(), r.p.Options.StartTimeout, r.p.sourceTrusted())
 	if err != nil {
 		return err
 	}

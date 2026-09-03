@@ -159,6 +159,9 @@ type ConfirmClaudeArgs struct {
 	Ref     *session.TmuxRef `json:"ref"`
 	ID      session.ID       `json:"id"`
 	Timeout time.Duration    `json:"timeout"`
+	// Trusted relays the source session's accepted trust dialog, so the
+	// destination may answer its own (ruling R-P3-TRUST-1 item 2).
+	Trusted bool `json:"trusted,omitempty"`
 }
 type ConfirmClaudeResult struct {
 	Registry *session.Registry `json:"registry"`

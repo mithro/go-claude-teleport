@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/orchestrate"
 	"github.com/mithro/go-claude-teleport/internal/procx"
+	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
@@ -371,7 +373,7 @@ func (a *app) follow(ctx context.Context, j *job.Journal, bang bool, base job.St
 		if name, ok := orchestrate.FailedStep(jj); ok {
 			fmt.Fprintf(a.stderr, "teleport failed at step %s: %s\n", name, jj.Step(name).Error)
 			if name == "start" {
-				fmt.Fprintln(a.stderr, "the destination Claude did not resume — log in there (`claude` then /login) and run: claude-teleport continue", j.ID)
+				startFailureHint(a.stderr, j.ID, jj.Step(name).Error)
 			} else {
 				nextHint(a.stderr, j.ID)
 			}
@@ -383,6 +385,21 @@ func (a *app) follow(ctx context.Context, j *job.Journal, bang bool, base job.St
 		}
 	}
 	return code
+}
+
+// startFailureHint advises on a failed start step. The standing advice
+// assumes the destination Claude never came up — usually because it is
+// not logged in there. A Claude waiting at its first-run TRUST dialog did
+// come up, and the confirm error already names the host, the pane and the
+// exact continue command (ruling R-P3-TRUST-1 item 2), so repeating the
+// `/login` line over it would send the user hunting a login problem that
+// does not exist — which is what the first real teleport printed.
+func startFailureHint(w io.Writer, jobID, stepErr string) {
+	if strings.Contains(stepErr, remote.TrustPromptWaiting) {
+		nextHint(w, jobID)
+		return
+	}
+	fmt.Fprintln(w, "the destination Claude did not resume — log in there (`claude` then /login) and run: claude-teleport continue", jobID)
 }
 
 func tailLog(path string, n int) []string {

@@ -212,7 +212,7 @@ var plan02Ops = map[string]handler{
 		if err != nil {
 			return nil, err
 		}
-		reg, err := ep.ConfirmClaude(ctx, a.Ref, a.ID, a.Timeout)
+		reg, err := ep.ConfirmClaude(ctx, a.Ref, a.ID, a.Timeout, a.Trusted)
 		return ConfirmClaudeResult{Registry: reg}, err
 	},
 	OpExitClaude: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {

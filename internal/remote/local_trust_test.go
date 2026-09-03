@@ -2,11 +2,16 @@ package remote
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 )
 
 // seedTranscript writes the minimum session.Load needs for cwd: a
@@ -103,5 +108,119 @@ func TestSessionExtrasReportsNoTrustWhenNeitherPathHasIt(t *testing.T) {
 	}
 	if ex.SourceTrusted {
 		t.Error("SourceTrusted = true for a cwd whose entry says hasTrustDialogAccepted false")
+	}
+}
+
+// trustPane is a fake tmux transport whose pane shows Claude Code's
+// first-run trust dialog until it receives Down THEN Enter — the two keys
+// that move the selection from "❯ No, exit" to "Yes, I trust this folder"
+// and answer it. onAccept fires when the dialog is answered, so a test can
+// make the registry entry appear exactly then (as a real Claude does).
+type trustPane struct {
+	mu       sync.Mutex
+	cmds     []string
+	sawDown  bool
+	accepted bool
+	onAccept func()
+}
+
+const trustDialog = "╭─────────────────────────────────╮\n" +
+	"│ Quick safety check              │\n" +
+	"│ Is this a project you created   │\n" +
+	"│ or one you trust?               │\n" +
+	"│  ❯ No, exit                     │\n" +
+	"│    Yes, I trust this folder     │\n" +
+	"╰─────────────────────────────────╯"
+
+func (p *trustPane) Run(_ context.Context, cmd string) ([]string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cmds = append(p.cmds, cmd)
+	switch {
+	case strings.HasPrefix(cmd, "capture-pane"):
+		if p.accepted {
+			return []string{"╭─ Welcome to Claude Code ─╮", "> "}, nil
+		}
+		return strings.Split(trustDialog, "\n"), nil
+	case strings.HasPrefix(cmd, "send-keys"):
+		switch {
+		case strings.HasSuffix(cmd, " Down"):
+			p.sawDown = true
+		case strings.HasSuffix(cmd, " Enter") && p.sawDown:
+			p.accepted = true
+			if p.onAccept != nil {
+				p.onAccept()
+			}
+		}
+		return nil, nil
+	}
+	return nil, fmt.Errorf("trustPane: unexpected command %q", cmd)
+}
+
+func (p *trustPane) Close() error { return nil }
+
+func (p *trustPane) sent() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []string
+	for _, c := range p.cmds {
+		if strings.HasPrefix(c, "send-keys") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// TestConfirmClaudeAutoAcceptsTheTrustPromptWhenTheSourceWasTrusted is
+// ruling R-P3-TRUST-1 item 2: the destination Claude resumed and is
+// waiting at the trust dialog (so there is no registry entry at all). The
+// source's own trust dialog was accepted, so confirmation answers this one
+// — Down then Enter, into the job's pane and nothing else — and keeps
+// waiting for the registry rather than failing.
+func TestConfirmClaudeAutoAcceptsTheTrustPromptWhenTheSourceWasTrusted(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	pane := &trustPane{}
+	pane.onAccept = func() { writeRegistry(t, p, 5150, "idle", "work:@1.%7") }
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: func(context.Context, string) (tmuxx.Transport, error) { return pane, nil }, Sleep: func(time.Duration) {}, Logf: t.Logf})
+	ref := &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}
+	reg, err := l.ConfirmClaude(context.Background(), ref, session.ID(sid), 5*time.Second, true)
+	if err != nil {
+		t.Fatalf("ConfirmClaude = %v, want the trust prompt answered and the session confirmed", err)
+	}
+	if reg.Status != "idle" {
+		t.Errorf("reg = %+v", reg)
+	}
+	want := []string{`send-keys -t "%7" Down`, `send-keys -t "%7" Enter`}
+	if got := pane.sent(); len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("keys sent = %v, want exactly %v (into the job's pane only, once)", got, want)
+	}
+}
+
+// TestConfirmClaudeFailsWithTrustAdviceWhenTheSourceWasNotTrusted is the
+// other half: with no trust to carry, nothing may be typed into the pane
+// on the user's behalf, and the error must say what is actually wrong —
+// never the "/login" advice, which sent the first real teleport's user
+// looking for a login problem that did not exist.
+func TestConfirmClaudeFailsWithTrustAdviceWhenTheSourceWasNotTrusted(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	pane := &trustPane{}
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: func(context.Context, string) (tmuxx.Transport, error) { return pane, nil }, Sleep: func(time.Duration) {}, Logf: t.Logf})
+	ref := &session.TmuxRef{SocketPath: "/s", Session: "work", WindowID: "@1", PaneID: "%7"}
+	_, err := l.ConfirmClaude(context.Background(), ref, session.ID(sid), 300*time.Millisecond, false)
+	if err == nil {
+		t.Fatal("ConfirmClaude succeeded with the destination stuck at the trust prompt")
+	}
+	for _, want := range []string{TrustPromptWaiting, l.Hostname, "work:@1.%7", "claude-teleport continue " + sid} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "/login") {
+		t.Errorf("error must not blame login: %q", err)
+	}
+	if got := pane.sent(); len(got) != 0 {
+		t.Errorf("nothing may be typed into the pane without the source's trust; sent %v", got)
 	}
 }

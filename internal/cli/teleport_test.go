@@ -385,3 +385,27 @@ func TestBangFollowTailsTheLogOnFailure(t *testing.T) {
 		t.Errorf("!-mode failure must tail log.txt:\n%s", out.String())
 	}
 }
+
+// TestStartFailureHintNeverBlamesLoginForTheTrustPrompt is ruling
+// R-P3-TRUST-1 item 2's user-facing half. A destination sitting at
+// Claude's trust dialog resumed perfectly well, so the standing "log in
+// there (`claude` then /login)" advice is simply wrong for it — and it is
+// what the first real teleport printed. The confirm error already says
+// exactly what to do; the hint must not talk over it.
+func TestStartFailureHintNeverBlamesLoginForTheTrustPrompt(t *testing.T) {
+	var buf bytes.Buffer
+	trustErr := "step start: conflict: " + remote.TrustPromptWaiting + " on dest.private pane work:@1.%7; accept it there, then run claude-teleport continue " + fixtureSID
+	startFailureHint(&buf, fixtureSID, trustErr)
+	if got := buf.String(); strings.Contains(got, "/login") {
+		t.Errorf("trust-prompt hint must not mention /login:\n%s", got)
+	}
+	if got := buf.String(); !strings.Contains(got, "claude-teleport continue "+fixtureSID) {
+		t.Errorf("hint must still say how to resume:\n%s", got)
+	}
+	// The not-logged-in case keeps its own advice.
+	buf.Reset()
+	startFailureHint(&buf, fixtureSID, `step start: conflict: destination Claude did not resume: pane shows "Not logged in"`)
+	if got := buf.String(); !strings.Contains(got, "/login") {
+		t.Errorf("a genuine login failure must still advise /login:\n%s", got)
+	}
+}

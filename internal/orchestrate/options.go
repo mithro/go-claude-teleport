@@ -119,6 +119,15 @@ type UnreachableError struct {
 func (e *UnreachableError) Error() string { return fmt.Sprintf("%s: %v", e.Host, e.Err) }
 func (e *UnreachableError) Unwrap() error { return e.Err }
 
+// sourceTrusted is a nil-safe accessor for the source session's answer to
+// Claude Code's first-run trust dialog, carried in the install extras
+// (ruling R-P3-TRUST-1). The start step relays it to the destination so a
+// destination sitting at that dialog can be answered rather than timing
+// out; without it, nothing is ever typed at the dialog.
+func (p *Plan) sourceTrusted() bool {
+	return p.Extras != nil && p.Extras.SourceTrusted
+}
+
 // sourceState is a nil-safe accessor used by the steps.
 func (p *Plan) sourceState() session.State {
 	if p.Session == nil {

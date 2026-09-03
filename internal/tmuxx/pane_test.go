@@ -17,6 +17,26 @@ import (
 // see listPanesFormat).
 const listPanesCmd = "list-panes -a -F \"#{session_name}\t#{window_id}\t#{pane_id}\""
 
+// TestCaptureScreenReadsOnlyTheVisiblePane is ruling R-P3-TRUST-1 item 2:
+// "is Claude showing its trust dialog right now" is a question about the
+// pane's CURRENT screen — the scrollback may still hold the same dialog
+// from an earlier, already-answered attempt, and answering that one again
+// would type Down+Enter at a live Claude. So the screen capture must not
+// carry -S - (the whole history) the way Capture does.
+func TestCaptureScreenReadsOnlyTheVisiblePane(t *testing.T) {
+	f := &Fake{Replies: map[string][]string{`capture-pane -epJ -t "%7"`: {"on screen", "> "}}}
+	got, err := CaptureScreen(context.Background(), f, "%7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "on screen\n> \n" {
+		t.Errorf("capture = %q", got)
+	}
+	if _, err := CaptureScreen(context.Background(), f, "7"); err == nil {
+		t.Error("a pane id without its sigil must be refused")
+	}
+}
+
 func TestCaptureJoinsLinesWithNewline(t *testing.T) {
 	f := &Fake{Replies: map[string][]string{`capture-pane -epJ -S - -t "%7"`: {"line1", "", "line3"}}}
 	got, err := Capture(context.Background(), f, "%7")
