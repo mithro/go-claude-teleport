@@ -138,6 +138,70 @@ func TestRemoteChecksSurfacesClaudeVersionErrAndListSessionsError(t *testing.T) 
 	}
 }
 
+// claudeDetailFor drives remoteChecks against a fresh remote.Local rooted at
+// home and returns the "remote claude" row's detail text — shared by the
+// two HK-3 display tests below.
+func claudeDetailFor(t *testing.T, home string) string {
+	t.Helper()
+	cfg := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(filepath.Join(cfg, "projects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	paths := session.Paths{Home: home, ConfigDir: cfg, GlobalJSON: filepath.Join(home, ".claude.json"), DataDir: filepath.Join(home, ".local", "share", "claude-teleport"), ProcRoot: "/proc"}
+	ep := remote.NewLocal(paths, "x", remote.LocalOptions{ProcRoot: "/proc"})
+	cs, _, err := remoteChecks(context.Background(), ep, "bob@dest.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cs {
+		if c.name == "remote claude" {
+			return c.detail
+		}
+	}
+	t.Fatal("no \"remote claude\" row")
+	return ""
+}
+
+// TestRemoteChecksReportsSearchLocationsWhenClaudeIsNowhere pins HK-3's
+// doctor display: when claude isn't found at all (not on PATH, not under
+// any fallback resolveExe checks), the row must name every location tried
+// rather than showing a blank detail.
+func TestRemoteChecksReportsSearchLocationsWhenClaudeIsNowhere(t *testing.T) {
+	home := t.TempDir()
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", filepath.Join(t.TempDir(), "empty")) // no claude anywhere PATH reaches
+	defer os.Setenv("PATH", oldPath)
+
+	got := claudeDetailFor(t, home)
+	want := "not found (tried " + remote.ClaudeSearchLocations() + ")"
+	if got != want {
+		t.Errorf("remote claude detail = %q, want %q", got, want)
+	}
+}
+
+// TestRemoteChecksReportsClaudePathWhenFoundViaFallback pins HK-3's other
+// half: a claude found only via resolveExe's $HOME/.local/bin fallback
+// (PATH excludes it) must render its resolved path in parentheses.
+func TestRemoteChecksReportsClaudePathWhenFoundViaFallback(t *testing.T) {
+	home := t.TempDir()
+	localBin := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(localBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	claudePath := filepath.Join(localBin, "claude")
+	if err := os.WriteFile(claudePath, []byte("#!/bin/sh\necho 2.1.999\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", "/usr/bin:/bin") // deliberately excludes localBin
+	defer os.Setenv("PATH", oldPath)
+
+	got := claudeDetailFor(t, home)
+	if !strings.Contains(got, "("+claudePath+")") {
+		t.Errorf("remote claude detail = %q, want it to end with (%s)", got, claudePath)
+	}
+}
+
 // TestDoctorRemoteVersionMismatchIsUnreachable pins A12: `doctor <host>`
 // printed FAIL for a peer running a different claude-teleport and exited
 // 1 ("doctor found problems"), but spec §5 reserves exit 4 for a version

@@ -110,6 +110,65 @@ func TestClientProtocolMismatchIsUsageError(t *testing.T) {
 	}
 }
 
+// TestNewClientErrorPreservesUnderlyingErrorTypeThroughNoisyStderr is the
+// regression test for review finding R-1: NewClient's stderr-replacement
+// path used to build a brand-new error from the captured stderr text
+// alone, discarding the underlying error entirely — so a genuine *Error
+// (e.g. Hello's protocol-mismatch usage error) reaching the client
+// alongside ANY stderr noise (an rc-file banner, a stray warning, ...) lost
+// its type, and remotecfg.go's `errors.As(err, &pe)` check — which reads
+// pe.Code to pick an exit code — could never see it, and its own message
+// text was discarded too. The wrapped error must survive both ways.
+func TestNewClientErrorPreservesUnderlyingErrorTypeThroughNoisyStderr(t *testing.T) {
+	home := t.TempDir()
+	os.MkdirAll(filepath.Join(home, ".ssh"), 0o700)
+	_, signer := sshtest.WriteKeyFile(t, filepath.Join(home, ".ssh"), "id_ed25519", "")
+	exec := func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		// Noise unrelated to the real failure — stands in for anything a
+		// remote shell might write to stderr before the protocol takes
+		// over (a warning, a banner, ...), which must never mask the real
+		// error the wire protocol goes on to report.
+		io.WriteString(stderr, "sh: warning: setlocale: LC_ALL: cannot change locale\n")
+		ep := stubEndpoint{hello: func() (HostInfo, error) {
+			return HostInfo{Protocol: version.Protocol + 1, Version: "v9.9"}, nil
+		}}
+		if err := Serve(context.Background(), stdin, stdout, ep); err != nil {
+			io.WriteString(stderr, err.Error())
+			return 1
+		}
+		return 0
+	}
+	srv := sshtest.New(t, sshtest.Options{Authorized: []ssh.PublicKey{signer.PublicKey()}, Exec: exec})
+	host, portStr, err := net.SplitHostPort(srv.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+	os.WriteFile(kh, []byte(sshtest.KnownHostsLine("["+host+"]:"+portStr, srv.HostKey)), 0o600)
+	sc, err := sshx.Dial(context.Background(), sshx.Resolved{Target: sshx.Target{User: "bob", Host: host, Port: port}, HostName: host}, nil, nil,
+		sshx.Options{KnownHostsFile: kh, Home: home, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sc.Close() })
+
+	_, err = NewClient(context.Background(), sc, "claude-teleport", t.Logf)
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	var pe *Error
+	if !errors.As(err, &pe) || pe.Code != "usage" {
+		t.Fatalf("err = %v, want it to unwrap (errors.As) to a *remote.Error{Code:\"usage\"} despite the stderr noise", err)
+	}
+	if !strings.Contains(err.Error(), "protocol mismatch") {
+		t.Errorf("err = %v, want the protocol-mismatch message text preserved too", err)
+	}
+}
+
 // newSSHTestClient wires a Client to a fresh Local ("dest") through an
 // in-process sshd whose exec handler runs `<exe> remote serve` and
 // `<exe> remote stream ...` in-process — the same harness
@@ -338,10 +397,24 @@ func TestNewClientFindsRemoteExeUnderHomeLocalBinWhenPATHLacksIt(t *testing.T) {
 
 // TestNewClientReportsClearErrorWhenRemoteExeIsNowhere is HK-2's negative
 // case: no claude-teleport anywhere the fallback looks. NewClient must fail
-// with a message naming the binary and that it was not found — never the
-// bare "connection closed: EOF" the bug report actually saw, which gave no
-// hint the problem was PATH-related at all.
+// with a message naming the binary and that it was not found LEADING the
+// message, never a bare "connection closed: EOF" up front the way the bug
+// report actually saw it (which gave no hint the problem was PATH-related
+// at all). readLoop's underlying error text is still chained on afterward
+// via %w (R-1: errors.As must keep working, see
+// TestNewClientErrorPreservesUnderlyingErrorTypeThroughNoisyStderr) — the
+// fix is that it no longer REPLACES the explanation, not that it disappears.
 func TestNewClientReportsClearErrorWhenRemoteExeIsNowhere(t *testing.T) {
+	// Hermetic: swap the two absolute fallbacks (the real /usr/local/bin,
+	// /usr/bin — outside this test's control, and a real claude-teleport
+	// COULD theoretically live there) for fresh, guaranteed-empty temp
+	// dirs, so "not found" can never depend on the test machine's actual
+	// filesystem. The $HOME-based fallbacks are already hermetic (remoteHome
+	// below is a fresh t.TempDir()).
+	origFallbacks := remoteBinFallbacks
+	remoteBinFallbacks = []string{"$HOME/.local/bin", "$HOME/bin", filepath.Join(t.TempDir(), "usr-local-bin"), filepath.Join(t.TempDir(), "usr-bin")}
+	t.Cleanup(func() { remoteBinFallbacks = origFallbacks })
+
 	remoteHome := t.TempDir()
 	noTmux := filepath.Join(t.TempDir(), "no-tmux-here")
 	remoteEnv := []string{"HOME=" + remoteHome, "PATH=/usr/bin:/bin", "TMUX_TMPDIR=" + noTmux}
@@ -353,13 +426,14 @@ func TestNewClientReportsClearErrorWhenRemoteExeIsNowhere(t *testing.T) {
 	if err == nil {
 		t.Fatal("want an error naming the missing binary and the paths tried")
 	}
+	msg := err.Error()
 	for _, want := range []string{"claude-teleport", "not found", ".local/bin"} {
-		if !strings.Contains(err.Error(), want) {
+		if !strings.Contains(msg, want) {
 			t.Errorf("err = %v, missing %q", err, want)
 		}
 	}
-	if strings.Contains(err.Error(), "connection closed: EOF") {
-		t.Errorf("err = %v: must not be the bare EOF the bug report saw", err)
+	if i, j := strings.Index(msg, "not found"), strings.Index(msg, "connection closed"); i < 0 || (j >= 0 && j < i) {
+		t.Errorf("err = %v: the clear explanation must lead, not follow, any bare connection-closed text", err)
 	}
 }
 

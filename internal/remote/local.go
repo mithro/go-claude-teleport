@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,8 +89,11 @@ func (l *Local) Hello(ctx context.Context) (HostInfo, error) {
 	}
 	_, err := exec.LookPath("tmux")
 	info.HasTmux = err == nil
-	_, err = exec.LookPath("claude-resume")
-	info.HasClaudeResume = err == nil
+	// claude-resume (go-tmux-saver) ships alongside claude-teleport itself
+	// and can land in the same install locations, so it is as exposed to
+	// HK-3's stripped-PATH problem as `claude` is; resolve it the same way.
+	_, ok := resolveExe("claude-resume", l.paths.Home)
+	info.HasClaudeResume = ok
 	if claudePath, ok := resolveExe("claude", l.paths.Home); ok {
 		info.HasClaude = true
 		info.ClaudePath = claudePath
@@ -107,15 +111,26 @@ func (l *Local) Hello(ctx context.Context) (HostInfo, error) {
 }
 
 // remoteExeFallbacks lists the well-known locations checked, in order,
-// when exec.LookPath does not find a binary on the CURRENT process's PATH.
-// HK-3 (real-world bug): `doctor ten64` reported "FAIL remote claude"
-// because the remote `claude-teleport remote serve` process itself runs
-// with the ssh session's non-interactive PATH (HK-2's fix gets
-// claude-teleport ITSELF started despite that PATH, but does not change
-// it), and Claude Code's native installer places `claude` under
-// $HOME/.local/bin — on PATH for interactive shells only in many default
-// zsh/bash configs.
-var remoteExeFallbacks = []string{".local/bin", "bin"}
+// when exec.LookPath does not find a binary on the CURRENT process's PATH:
+// two relative to $HOME, then remoteExeAbsoluteFallbacks. HK-3 (real-world
+// bug): `doctor ten64` reported "FAIL remote claude" because the remote
+// `claude-teleport remote serve` process itself runs with the ssh
+// session's non-interactive PATH (HK-2's fix gets claude-teleport ITSELF
+// started despite that PATH, but does not change it), and Claude Code's
+// native installer places `claude` under $HOME/.local/bin — on PATH for
+// interactive shells only in many default zsh/bash configs.
+//
+// Deliberately separate from client.go's remoteBinFallbacks (HK-2, same
+// four locations conceptually): that one is literal shell syntax embedded
+// in a script run BY the far side; this one is walked here in Go, on
+// whichever side is running Local. ClaudeSearchLocations below renders
+// THIS list (the one actually driving resolveExe) for display, so that
+// message can never drift from what resolveExe does even though the two
+// lists themselves stay separate.
+var (
+	remoteExeFallbacks         = []string{".local/bin", "bin"} // relative to $HOME
+	remoteExeAbsoluteFallbacks = []string{"/usr/local/bin", "/usr/bin"}
+)
 
 // resolveExe finds name via exec.LookPath first (the ordinary case), then
 // checks $HOME/.local/bin, $HOME/bin, /usr/local/bin and /usr/bin in turn,
@@ -127,18 +142,34 @@ func resolveExe(name, home string) (path string, ok bool) {
 		return p, true
 	}
 	var candidates []string
-	for _, dir := range remoteExeFallbacks {
-		if home != "" {
+	if home != "" {
+		for _, dir := range remoteExeFallbacks {
 			candidates = append(candidates, filepath.Join(home, dir, name))
 		}
 	}
-	candidates = append(candidates, filepath.Join("/usr/local/bin", name), filepath.Join("/usr/bin", name))
+	for _, dir := range remoteExeAbsoluteFallbacks {
+		candidates = append(candidates, filepath.Join(dir, name))
+	}
 	for _, cand := range candidates {
 		if fi, err := os.Stat(cand); err == nil && !fi.IsDir() && fi.Mode()&0o111 != 0 {
 			return cand, true
 		}
 	}
 	return "", false
+}
+
+// ClaudeSearchLocations renders, for display (doctor's "remote claude"
+// row when it's not found at all), every place resolveExe looks after
+// exec.LookPath — built from the very lists resolveExe itself walks, so
+// the message can never drift out of sync with the actual search order.
+func ClaudeSearchLocations() string {
+	parts := make([]string, 0, 1+len(remoteExeFallbacks)+len(remoteExeAbsoluteFallbacks))
+	parts = append(parts, "PATH")
+	for _, dir := range remoteExeFallbacks {
+		parts = append(parts, "$HOME/"+dir)
+	}
+	parts = append(parts, remoteExeAbsoluteFallbacks...)
+	return strings.Join(parts, ", ")
 }
 
 func firstLine(s string) string {

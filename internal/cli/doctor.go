@@ -103,8 +103,14 @@ func remoteChecks(ctx context.Context, ep remote.Endpoint, host string) ([]check
 	// binary was found) must be surfaced, not swallowed by only checking
 	// HasClaude.
 	claudeDetail := hi.ClaudeVersion
-	if hi.ClaudeVersionErr != "" {
+	switch {
+	case hi.ClaudeVersionErr != "":
 		claudeDetail = fmt.Sprintf("found but --version failed: %s", hi.ClaudeVersionErr)
+	case !hi.HasClaude:
+		// HK-3: name every location resolveExe tried (remote.ClaudeSearchLocations,
+		// built from the same lists resolveExe itself walks) rather than
+		// leaving this row blank.
+		claudeDetail = "not found (tried " + remote.ClaudeSearchLocations() + ")"
 	}
 	// HK-3: name which path resolveExe used, so a claude found only via a
 	// $HOME/.local/bin (etc.) fallback — rather than the remote process's

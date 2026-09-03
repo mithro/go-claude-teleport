@@ -80,7 +80,26 @@ func (s sshConn) Close() error                { s.p.Stdin.Close(); return s.p.Cl
 // binary under $HOME/.local/bin, which a non-interactive shell's PATH often
 // lacks (only the interactive rc file adds it, and ssh exec always runs
 // `<login-shell> -c <command>` non-interactively, whichever shell that is).
+//
+// This is deliberately a SEPARATE list from local.go's remoteExeFallbacks
+// (HK-3, same four locations conceptually): this one is embedded as literal
+// shell syntax in a script that runs on the far side ("$HOME" expanded by
+// the remote shell), that one is walked in Go via os.Stat against
+// l.paths.Home on whichever side is running Local — different consumer,
+// different representation, so keeping them separate avoids forcing one
+// shape to serve both.
 var remoteBinFallbacks = []string{"$HOME/.local/bin", "$HOME/bin", "/usr/local/bin", "/usr/bin"}
+
+// dquoteEscape escapes s for embedding inside a double-quoted POSIX shell
+// string: backslash, double-quote, `$` and backtick are the characters
+// double-quoting still leaves active. exe is always a hardcoded literal
+// ("claude-teleport") in every caller today, never attacker input, but
+// every embedding of it in remoteCommand's generated script stays safe
+// this way regardless.
+func dquoteEscape(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `$`, `\$`, "`", "\\`")
+	return r.Replace(s)
+}
 
 // remoteCommand builds the ssh exec payload that starts exe with argv on
 // the far side. It always runs through `/bin/sh -c`, never the account's
@@ -99,13 +118,25 @@ func remoteCommand(exe string, argv []string) string {
 	fmt.Fprintf(&b, "if command -v %s >/dev/null; then exec %s %s; fi; ", exeQ, exeQ, rest)
 	var tried []string
 	for _, dir := range remoteBinFallbacks {
-		cand := dir + "/" + exe
-		tried = append(tried, cand)
-		fmt.Fprintf(&b, `if [ -x "%s" ]; then exec "%s" %s; fi; `, cand, cand, rest)
+		tried = append(tried, dir+"/"+exe)
+		// dir (e.g. "$HOME/.local/bin") stays inside double quotes so the
+		// remote shell expands $HOME; exeQ is concatenated immediately
+		// after with no separating space, so the two form one shell word —
+		// exe itself never sits inside the double-quoted segment, so it
+		// can't break out of it or trigger $-expansion/command substitution.
+		cand := `"` + dir + `/"` + exeQ
+		fmt.Fprintf(&b, `if [ -x %s ]; then exec %s %s; fi; `, cand, cand, rest)
 	}
-	fmt.Fprintf(&b, `echo "claude-teleport: %s not found on PATH or in %s" 1>&2; exit 127`, exe, strings.Join(tried, ", "))
+	fmt.Fprintf(&b, `echo "claude-teleport: %s not found on PATH or in %s" 1>&2; exit 127`, dquoteEscape(exe), strings.Join(tried, ", "))
 	return "/bin/sh -c " + sshx.Quote([]string{b.String()})
 }
+
+// maxCapturedStderrLines bounds how much of the remote helper's stderr
+// NewClient keeps in memory while a dial is in flight (below): enough to
+// show a real failure (remoteCommand's own message is one line), not
+// enough for a long-lived, successful connection's incidental stderr chatter
+// to grow without bound.
+const maxCapturedStderrLines = 10
 
 // NewClient runs `<exe> remote serve` over ssh (via remoteCommand's PATH
 // fallback, HK-2) and performs hello.
@@ -121,12 +152,17 @@ func NewClient(ctx context.Context, ssh *sshx.Client, remoteExe string, logf fun
 	// helper — the HK-2 "binary not found anywhere" case chief among them —
 	// can surface its one explanatory stderr line as the actual returned
 	// error below, rather than leaving the caller to infer a PATH problem
-	// from readLoop's bare "connection closed: EOF". stderrDone is closed
-	// once the pipe reports EOF, which p.Close() below forces; waiting on
-	// it (only on the error path) avoids a race between reading the buffer
-	// and the scanner goroutine still filling it in.
+	// from readLoop's bare "connection closed: EOF". Every line is always
+	// logged; capturing into stderrLines stops once collecting flips false
+	// (right after NewClientConn succeeds, below) or maxCapturedStderrLines
+	// is reached, so a long-lived successful connection's stderr chatter
+	// can't grow this buffer without bound. stderrDone is closed once the
+	// pipe reports EOF, which p.Close() below forces on the error path;
+	// waiting on it there (bounded — see the select below) avoids a race
+	// between reading the buffer and the scanner goroutine still filling it.
 	var stderrMu sync.Mutex
 	var stderrLines []string
+	collecting := true
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
@@ -135,7 +171,9 @@ func NewClient(ctx context.Context, ssh *sshx.Client, remoteExe string, logf fun
 			line := sc.Text()
 			logf("remote %s: %s", ssh, line)
 			stderrMu.Lock()
-			stderrLines = append(stderrLines, line)
+			if collecting && len(stderrLines) < maxCapturedStderrLines {
+				stderrLines = append(stderrLines, line)
+			}
 			stderrMu.Unlock()
 		}
 	}()
@@ -175,7 +213,14 @@ func NewClient(ctx context.Context, ssh *sshx.Client, remoteExe string, logf fun
 	c, err := NewClientConn(ctx, sshConn{p}, openStream, logf)
 	if err != nil {
 		p.Close()
-		<-stderrDone
+		// Bounded: p.Close() normally forces the stderr pipe to EOF
+		// promptly (closing the ssh session), but must never be trusted to
+		// do so instantly — a caller waiting on THIS error must not itself
+		// hang because that goroutine is slow to notice.
+		select {
+		case <-stderrDone:
+		case <-time.After(2 * time.Second):
+		}
 		stderrMu.Lock()
 		tail := strings.Join(stderrLines, "; ")
 		stderrMu.Unlock()
@@ -183,12 +228,23 @@ func NewClient(ctx context.Context, ssh *sshx.Client, remoteExe string, logf fun
 			// The remote helper never started (HK-2's not-found case, or
 			// any other early stderr): that one line explains the failure
 			// far better than err's own text (readLoop's generic
-			// "connection closed: EOF"), so it replaces it here rather
-			// than being appended alongside it.
-			return nil, fmt.Errorf("start remote helper on %s: %s", ssh, tail)
+			// "connection closed: EOF") alone would, so it leads the
+			// message here — but err is still wrapped with %w, not
+			// discarded, so a genuine *Error (e.g. Hello's protocol-
+			// mismatch usage error) reaching the client ALONGSIDE unrelated
+			// stderr noise keeps its type: errors.As callers (remotecfg.go)
+			// still see it, and its own message text still appears too.
+			return nil, fmt.Errorf("start remote helper on %s: %s: %w", ssh, tail, err)
 		}
 		return nil, err
 	}
+	// The connection is up: nothing captured from here on is ever going to
+	// explain a start-up failure, so stop growing the buffer and release
+	// what's there.
+	stderrMu.Lock()
+	collecting = false
+	stderrLines = nil
+	stderrMu.Unlock()
 	c.wait = p.Wait
 	return c, nil
 }
