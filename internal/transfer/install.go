@@ -40,6 +40,12 @@ type InstallReport struct {
 	// re-extended on a retry, never a destination file this job is
 	// meeting for the first time.
 	FastForwardedIDs []int
+	// ForceOverwritten counts entries replaced wholesale under --force
+	// (spec §7.3's non-prefix case, same session id only). Like a
+	// fast-forward, and for the same reason, these ids are NOT recorded:
+	// the destination file existed before this job touched it, so
+	// abandon --delete-destination-files must never remove it.
+	ForceOverwritten int
 }
 
 type InstallExtras struct {
@@ -54,6 +60,12 @@ type InstallExtras struct {
 	// Memory entry whose ID belongs to a different manifest or a different
 	// Dst under a reused ID.
 	Memory []Entry
+	// Force is the driver's --force, relayed to the destination (spec
+	// §7.3): it permits replacing a destination file that belongs to THIS
+	// session but is not a prefix of the incoming one. It is the user's
+	// consent, so the destination refuses the overwrite without it even
+	// though preflight's Blocking() already applied the same gate.
+	Force bool `json:"force,omitempty"`
 }
 
 func parentMode(e Entry) os.FileMode {
@@ -187,6 +199,24 @@ func validateDst(e Entry, p session.Paths) error {
 	return nil
 }
 
+// checkForceOverwrite is the destination's gate on spec §7.3's forced
+// (non-fast-forward) replacement. FFAllowed travels from the source, so it
+// is corroborated — never simply believed — by re-deriving from Dst whether
+// the file belongs to the session this manifest names; a regular file is
+// the only shape this path can replace.
+func checkForceOverwrite(m *Manifest, e Entry, force bool) error {
+	if !force {
+		return fmt.Errorf("install %s: status %s — refusing (pass --force to replace a diverged copy of this session)", e.Dst, PresentDifferent)
+	}
+	if !e.IsRegular() {
+		return fmt.Errorf("install %s: refusing to force-overwrite a directory or symlink", e.Dst)
+	}
+	if !e.FFAllowed || e.Category != session.CatSession || !ffAllowed(e.Dst, session.ID(m.SessionID)) {
+		return fmt.Errorf("install %s: refusing to force-overwrite a file that does not belong to session %s", e.Dst, m.SessionID)
+	}
+	return nil
+}
+
 // Install moves staged entries into place per spec §7.5 and performs the merges.
 func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir string, p session.Paths, extra InstallExtras) (*InstallReport, error) {
 	rep := &InstallReport{}
@@ -265,6 +295,32 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			rep.FastForwarded++
 			installed[e.Dst] = true
 			rep.FastForwardedIDs = append(rep.FastForwardedIDs, e.ID)
+		case PresentDifferent:
+			// Spec §7.3: --force extends the fast-forward exception to the
+			// non-prefix case "for the same session id only; it never
+			// allows overwriting unrelated files". Both halves are checked
+			// here, on the destination: the caller's explicit consent, and
+			// session ownership re-derived from Dst itself rather than
+			// trusted from the source-computed FFAllowed flag.
+			if err := checkForceOverwrite(m, e, extra.Force); err != nil {
+				return rep, err
+			}
+			staged := StagedPath(stagingDir, e.ID)
+			sum, _, err := HashFile(staged)
+			if err != nil {
+				return rep, fmt.Errorf("install %s: force overwrite: %w", e.Dst, err)
+			}
+			if sum != e.SHA256 {
+				return rep, fmt.Errorf("install %s: force overwrite: staged copy does not match the manifest hash", e.Dst)
+			}
+			if err := os.Remove(e.Dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return rep, fmt.Errorf("install %s: force overwrite: %w", e.Dst, err)
+			}
+			if err := placeFile(stagingDir, e); err != nil {
+				return rep, err
+			}
+			rep.ForceOverwritten++
+			installed[e.Dst] = true
 		default:
 			return rep, fmt.Errorf("install %s: status %s — refusing (nothing after this entry was touched)", e.Dst, st[e.ID])
 		}

@@ -200,6 +200,10 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 	if p.Extras, err = src.SessionExtras(ctx, sess.ID, p.PathMap); err != nil {
 		return nil, err
 	}
+	// Relay the user's --force to the destination: transfer.Install needs
+	// it to replace a diverged copy of this session (spec §7.3), the same
+	// consent Blocking() applies just below (B12).
+	p.Extras.Force = o.Force
 	p.Files = append(append(append([]session.FileEntry{}, inv.Files...), inv.Memory...), gitFiles...)
 	m, err := src.BuildManifest(ctx, jobID, sess.ID, p.SourceInfo.Hostname, p.DestInfo.Hostname, p.Files, p.PathMap)
 	if err != nil {

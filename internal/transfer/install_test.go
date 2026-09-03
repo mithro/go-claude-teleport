@@ -503,3 +503,84 @@ func TestInstallRefusesSmuggledDeferredEntry(t *testing.T) {
 		}
 	}
 }
+
+// TestInstallForceOverwritesDivergedSessionFile covers B12. Spec §7.3:
+// --force extends the fast-forward exception to the NON-prefix case, for
+// the same session id only. Diff classifies such an entry
+// present-different; Blocking(force=true) lets it through and Pending
+// reports nothing outstanding, so preflight and the transfer step both say
+// "go" — but Install's switch had no present-different arm and failed the
+// whole job at step 8. It must overwrite instead, from a hash-verified
+// staged copy, and only with the caller's explicit consent.
+func TestInstallForceOverwritesDivergedSessionFile(t *testing.T) {
+	setup := func(t *testing.T) (*Manifest, string, session.Paths, map[int]Status, []byte) {
+		t.Helper()
+		m, staging, p := staged(t)
+		full, err := os.ReadFile(StagedPath(staging, 1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !m.Entries[1].FFAllowed {
+			t.Fatalf("fixture entry 1 is not a session file: %+v", m.Entries[1])
+		}
+		// A diverged transcript: same session, but NOT a prefix of the
+		// incoming one, so no fast-forward is possible.
+		os.MkdirAll(filepath.Dir(m.Entries[1].Dst), 0o700)
+		if err := os.WriteFile(m.Entries[1].Dst, []byte(`{"type":"user","text":"a different branch of history"}`+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		st, err := Diff(context.Background(), m, staging)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st[1] != PresentDifferent {
+			t.Fatalf("status = %s, want %s", st[1], PresentDifferent)
+		}
+		if b := Blocking(m, st, true); len(b) != 0 {
+			t.Fatalf("Blocking(force) = %+v, want nothing (this is the case --force allows)", b)
+		}
+		if ids := Pending(m, st); len(ids) != 0 {
+			t.Fatalf("Pending = %v, want nothing outstanding", ids)
+		}
+		return m, staging, p, st, full
+	}
+
+	t.Run("with force", func(t *testing.T) {
+		m, staging, p, st, full := setup(t)
+		rep, err := Install(context.Background(), m, st, staging, p, InstallExtras{Force: true})
+		if err != nil {
+			t.Fatalf("Install: %v", err)
+		}
+		if rep.ForceOverwritten != 1 {
+			t.Errorf("report = %+v, want ForceOverwritten 1", rep)
+		}
+		got, _ := os.ReadFile(m.Entries[1].Dst)
+		if !bytes.Equal(got, full) {
+			t.Errorf("destination not overwritten with the incoming copy")
+		}
+		for _, id := range rep.InstalledIDs {
+			if id == 1 {
+				t.Errorf("a force-overwritten entry pre-existed on the destination and must not be in InstalledIDs")
+			}
+		}
+	})
+
+	t.Run("without force", func(t *testing.T) {
+		m, staging, p, st, _ := setup(t)
+		_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
+		if err == nil || !strings.Contains(err.Error(), "present-different") {
+			t.Fatalf("err = %v, want a refusal naming the status", err)
+		}
+	})
+
+	t.Run("force does not extend to another session's file", func(t *testing.T) {
+		m, staging, p, st, _ := setup(t)
+		// FFAllowed is a SOURCE-computed field; the destination must
+		// re-derive session ownership from Dst itself.
+		m.SessionID = "00000000-0000-4000-8000-000000000000"
+		_, err := Install(context.Background(), m, st, staging, p, InstallExtras{Force: true})
+		if err == nil || !strings.Contains(err.Error(), m.Entries[1].Dst) {
+			t.Fatalf("err = %v, want a refusal naming %s", err, m.Entries[1].Dst)
+		}
+	})
+}
