@@ -73,20 +73,17 @@ func init() {
 //     having CLAUDE_CONFIG_DIR exported (any value) makes it read/write
 //     $CLAUDE_CONFIG_DIR/.claude.json instead — confirmed in isolation
 //     (identical run, only the presence of that one env var changed the
-//     file claude touched). internal/remote/local_pty.go's RunPtyResume
-//     (used by every --state idle "start" step, no-tmux or not, since idle
-//     still confirms-then-exits under a pty) always exports
-//     CLAUDE_CONFIG_DIR explicitly, so the tool's own "start" step needs
-//     the seed at $CLAUDE_CONFIG_DIR/.claude.json; a plain `claude -p` or
-//     `claude --resume` this test types directly (docker-compose.yml
-//     deliberately never sets CLAUDE_CONFIG_DIR at the container level —
-//     see its own comment) needs it at plain $HOME/.claude.json. Both are
-//     seeded so either path works. This is a real discrepancy between
-//     internal/session.Paths.GlobalJSON (always $HOME/.claude.json) and
-//     where real Claude Code actually persists this state once
-//     CLAUDE_CONFIG_DIR is explicitly set — reported, not fixed here (see
-//     task-26-report.md); not applied to internal/ per the implementer
-//     rules.
+//     file claude touched). That finding is now fixed in the tool (T26-2):
+//     session.Paths carries ConfigDirFromEnv and internal/remote's
+//     claudeEnv gives a claude it starts CLAUDE_CONFIG_DIR only when the
+//     environment is what put ConfigDir where it is — so with this
+//     harness's deliberately unset CLAUDE_CONFIG_DIR (docker-compose.yml,
+//     see its own comment), the tool's own "start" step and a plain
+//     `claude -p`/`claude --resume` this test types directly now agree on
+//     plain $HOME/.claude.json. BOTH files are still seeded, cheaply, so
+//     this suite keeps working against a destination that does export
+//     CLAUDE_CONFIG_DIR (and so that a regression shows up as a tool test
+//     failure, not as a mystery hang here).
 //
 // The real precondition this harness is meant to model is the README's own:
 // "Claude Code must already be installed and logged in on the destination;
