@@ -110,3 +110,40 @@ func TestProbeSocketClassifies(t *testing.T) {
 		t.Errorf("live socket: %v, want nil", err)
 	}
 }
+
+// TestUTF8Env pins the locale rule the spawned control client depends on:
+// tmux only keeps the literal tab this package parses on as a field
+// separator for clients whose LC_ALL/LC_CTYPE/LANG name a UTF-8 locale.
+func TestUTF8Env(t *testing.T) {
+	const forced = "LC_ALL=C.UTF-8"
+	for _, tc := range []struct {
+		name  string
+		env   []string
+		force bool
+	}{
+		{"nothing set", []string{"HOME=/home/alice"}, true},
+		{"C locale", []string{"LC_ALL=C"}, true},
+		{"POSIX via LANG", []string{"LANG=POSIX"}, true},
+		{"empty LC_ALL falls through to LANG", []string{"LC_ALL=", "LANG=C"}, true},
+		{"non-UTF-8 LC_ALL beats a UTF-8 LANG", []string{"LC_ALL=C", "LANG=en_US.UTF-8"}, true},
+		{"already C.UTF-8", []string{"LC_ALL=C.UTF-8"}, false},
+		{"already utf8 spelling", []string{"LC_CTYPE=en_US.utf8"}, false},
+		{"LANG only", []string{"LANG=en_AU.UTF-8"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := utf8Env(tc.env)
+			last := ""
+			for _, kv := range got {
+				if strings.HasPrefix(kv, "LC_ALL=") {
+					last = kv
+				}
+			}
+			if tc.force && last != forced {
+				t.Errorf("utf8Env(%v) LC_ALL = %q, want %q", tc.env, last, forced)
+			}
+			if !tc.force && len(got) != len(tc.env) {
+				t.Errorf("utf8Env(%v) = %v, want it unchanged", tc.env, got)
+			}
+		})
+	}
+}

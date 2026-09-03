@@ -11,9 +11,11 @@ x-common: &common
     - ./keys:/run/keys:ro
     - ../../dist/claude-teleport:/usr/local/bin/claude-teleport:ro
   environment:
-    # LC_ALL: entrypoint.sh's ~/.ssh/environment covers real ssh sessions
-    # (where the tool's own dial lands); this covers `docker compose exec`
-    # (the tests' own invocations) the same way, for the same tmux reason.
+    # LC_ALL is for the TESTS' own `docker compose exec` tmux clients
+    # (capture-pane/list-panes output they parse), not for the tool: the
+    # tool's own `tmux -C` control client sets it for itself
+    # (internal/tmuxx.utf8Env) and its ssh sessions deliberately get no
+    # LC_ALL at all (entrypoint.sh), so a C-locale host is exercised.
     LC_ALL: C.UTF-8
     # No CLAUDE_CONFIG_DIR here: it must default to $HOME/.claude per-user
     # (alice vs bob) rather than being pinned to one user for the whole

@@ -12,15 +12,17 @@ for u in alice bob; do
   fi
 done
 ssh-keygen -A >/dev/null
-# tmux (verified on 3.5a and next-3.8 alike) vis-encodes control characters
-# -- including the literal tab byte internal/tmuxx uses as its -F list-panes
-# field separator -- into "_" when the process locale isn't UTF-8-aware;
-# this container's default is POSIX/C. glibc's built-in C.UTF-8 needs no
-# locale-gen. AcceptEnv (sshd_config) does not forward LC_ALL, so every ssh
-# session (this is where claude-teleport's own dial lands, on jump and
-# dest) needs it via PermitUserEnvironment + ~/.ssh/environment instead.
+# ~/.ssh/environment (with PermitUserEnvironment below) is the only way to
+# put a variable into the tool's own non-interactive ssh sessions: sshd's
+# AcceptEnv does not forward LC_ALL, and no login shell is ever run there.
+# Layer 2 needs PATH here (below). LC_ALL is deliberately NOT set: real
+# tmux (3.5a, 3.6b) mangles the tab-separated `-F` output it sends a
+# control client whose LC_ALL/LC_CTYPE/LANG name no UTF-8 locale, and
+# internal/tmuxx now sets LC_ALL=C.UTF-8 on the `tmux -C` client it spawns
+# itself (tmuxx.utf8Env) — the tool must work on a plain C-locale host, so
+# the harness must not paper over it.
 for u in alice bob; do
-  echo 'LC_ALL=C.UTF-8' > /home/$u/.ssh/environment
+  : > /home/$u/.ssh/environment
   chown $u:$u /home/$u/.ssh/environment
   chmod 600 /home/$u/.ssh/environment
 done

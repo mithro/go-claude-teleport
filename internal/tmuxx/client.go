@@ -18,6 +18,40 @@ import (
 	"syscall"
 )
 
+// utf8Env returns env with LC_ALL forced to a UTF-8 value unless it already
+// names one.
+//
+// tmux decides whether a client is UTF-8-capable by string-matching
+// "UTF-8"/"UTF8" in LC_ALL, then LC_CTYPE, then LANG (tmux.c) — the locale
+// itself is never looked up, so the value need not exist on the host. A
+// client without that flag has every line the server sends it run through
+// utf8_sanitize(), which replaces each non-printable byte — the literal tab
+// this package uses as its `-F` field separator included — with "_" (seen on
+// tmux 3.5a and 3.6b). Under the plain C/POSIX locale of a container or a
+// non-interactive ssh session, list-panes output then comes back as
+// "main__@0_0_claude_%0_..." and every Describe/Prober parse fails with
+// "malformed list-panes line".
+//
+// Appending wins: os/exec keeps the LAST value of a duplicated key.
+func utf8Env(env []string) []string {
+	for _, key := range []string{"LC_ALL", "LC_CTYPE", "LANG"} {
+		v := ""
+		for _, kv := range env {
+			if strings.HasPrefix(kv, key+"=") {
+				v = kv[len(key)+1:]
+			}
+		}
+		if v == "" {
+			continue // unset/empty: tmux falls through to the next one
+		}
+		if strings.Contains(strings.ToUpper(v), "UTF-8") || strings.Contains(strings.ToUpper(v), "UTF8") {
+			return env
+		}
+		break // set but not UTF-8: tmux stops here, so LC_ALL must override
+	}
+	return append(append([]string(nil), env...), "LC_ALL=C.UTF-8")
+}
+
 // Client is a live control-mode connection to one tmux server.
 type Client struct {
 	cmd           *exec.Cmd
@@ -48,6 +82,7 @@ func DialControl(ctx context.Context, socketPath string) (Transport, error) {
 		return nil, err
 	}
 	cmd := exec.Command("tmux", "-S", socketPath, "-C", "attach-session", "-f", "no-output")
+	cmd.Env = utf8Env(os.Environ())
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
