@@ -381,7 +381,8 @@ func (l *Local) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {
 }
 
 // restoreForeground gives the frozen job the pty back by asking the pane's
-// own shell to `fg` it — which continues it as well — see tmuxx.RestoreForeground, which is the single
+// own shell to `fg` it — which continues it as well, and is why this runs
+// before the freezer is released. See tmuxx.RestoreForeground, the single
 // implementation of that dance, shared with the freezer helper's
 // owner-died path (ruling R-P3-F1). Local's part is the dialling, the
 // injected /proc root, sleep and logger, and turning the "never came back"
