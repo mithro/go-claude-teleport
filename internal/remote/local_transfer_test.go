@@ -2,6 +2,8 @@ package remote
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,7 +13,55 @@ import (
 
 	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
+
+// TestLocalDeleteInstalledOnlyNamedIDs covers abandon's destination-side
+// deletion (Task 23, ruling E): DeleteInstalled must remove only the
+// manifest entries named by ids, never an entry that happens to match the
+// manifest hash but was not named — the id list is how abandon restricts
+// deletion to files THIS job actually installed (preflight status Absent).
+func TestLocalDeleteInstalledOnlyNamedIDs(t *testing.T) {
+	p := testPaths(t)
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc"})
+	dir := filepath.Join(p.ConfigDir, "projects", "-home-alice-proj")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(dir, "keep.jsonl")
+	gone := filepath.Join(dir, "gone.jsonl")
+	if err := os.WriteFile(keep, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gone, []byte("gone\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sha := func(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
+	m := &transfer.Manifest{Version: 1, Entries: []transfer.Entry{
+		{ID: 0, Category: session.CatSession, Dst: dir, Mode: uint32(os.ModeDir | 0o700)},
+		{ID: 1, Category: session.CatSession, Dst: keep, Size: 5, Mode: 0o600, SHA256: sha("keep\n")},
+		{ID: 2, Category: session.CatSession, Dst: gone, Size: 5, Mode: 0o600, SHA256: sha("gone\n")},
+	}}
+	deleted, err := l.DeleteInstalled(context.Background(), m, []int{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(gone); !os.IsNotExist(err) {
+		t.Errorf("named entry must be removed")
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("unnamed entry must survive: %v", err)
+	}
+	var found bool
+	for _, d := range deleted {
+		if d == gone {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("deleted = %v, want it to include %s", deleted, gone)
+	}
+}
 
 func TestLocalCleanupRemovesStaging(t *testing.T) {
 	p := testPaths(t)

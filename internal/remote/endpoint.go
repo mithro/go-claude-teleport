@@ -41,6 +41,11 @@ type Endpoint interface {
 	Install(ctx context.Context, m *transfer.Manifest, jobID string) (*transfer.InstallReport, error)
 	GitAttach(ctx context.Context, plan *gitx.Plan, jobID string) error
 	Cleanup(ctx context.Context, jobID string) error
+	// DeleteInstalled removes the manifest entries named by ids from this
+	// host when their current content still matches the manifest hash
+	// (spec §7.4/abandon --delete-destination-files); see
+	// transfer.UninstallIDs for the containment and hash-check semantics.
+	DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids []int) ([]string, error)
 
 	// processes and panes
 	Freeze(ctx context.Context, pid int, startTime string) error

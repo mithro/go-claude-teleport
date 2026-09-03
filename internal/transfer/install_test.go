@@ -374,6 +374,33 @@ func TestUninstallRemovesOnlyMatching(t *testing.T) {
 	}
 }
 
+// TestUninstallIDsOnlyNamedEntries covers Task 23 (abandon's
+// destination-side deletion): UninstallIDs must restrict deletion to the
+// given ids even when another, unnamed entry's current content also still
+// matches the manifest hash.
+func TestUninstallIDsOnlyNamedEntries(t *testing.T) {
+	m, staging, p := staged(t)
+	st, _ := Diff(context.Background(), m, staging)
+	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := UninstallIDs(m, p, []int{m.Entries[1].ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(m.Entries[1].Dst); !os.IsNotExist(err) {
+		t.Errorf("named entry should be removed")
+	}
+	if _, err := os.Stat(m.Entries[3].Dst); err != nil {
+		t.Errorf("entry not named in ids must survive: %v", err)
+	}
+	for _, r := range removed {
+		if r == m.Entries[3].Dst {
+			t.Errorf("unnamed entry must not be reported removed")
+		}
+	}
+}
+
 // TestUninstallRemovesEmptiedNestedDirs covers controller ruling 2: a
 // manifest whose dir entries include a nested "<sid>/subagents/" tree must
 // leave no empty directories behind once every file under it is removed —

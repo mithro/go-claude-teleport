@@ -42,15 +42,16 @@ const (
 	// Plan 03 additions (arg/result shapes in ops_plan03.go). Both the
 	// handler table and the Client method for each op use these constants,
 	// so a typo cannot make the two sides disagree silently.
-	OpGitFiles       = "git-files"
-	OpGitSourceFacts = "git-source-facts"
-	OpTmuxSessions   = "tmux-sessions"
-	OpKillWindow     = "tmux-kill"
-	OpClaudeStatus   = "claude-status"
-	OpBuildManifest  = "build-manifest"
-	OpSessionExtras  = "session-extras"
-	OpCleanup        = "cleanup"
-	OpListSessions   = "list-sessions"
+	OpGitFiles        = "git-files"
+	OpGitSourceFacts  = "git-source-facts"
+	OpTmuxSessions    = "tmux-sessions"
+	OpKillWindow      = "tmux-kill"
+	OpClaudeStatus    = "claude-status"
+	OpBuildManifest   = "build-manifest"
+	OpSessionExtras   = "session-extras"
+	OpCleanup         = "cleanup"
+	OpListSessions    = "list-sessions"
+	OpDeleteInstalled = "delete-installed"
 )
 
 type HelloArgs struct {

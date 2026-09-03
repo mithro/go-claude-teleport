@@ -62,6 +62,13 @@ type (
 	sessionsResult struct {
 		Sessions []SessionSummary `json:"sessions"`
 	}
+	deleteInstalledArgs struct {
+		Manifest *transfer.Manifest `json:"manifest"`
+		IDs      []int              `json:"ids"`
+	}
+	deleteInstalledResult struct {
+		Deleted []string `json:"deleted"`
+	}
 	tmuxSessionsResult struct {
 		Sessions []tmuxx.SessionInfo `json:"sessions"`
 	}
@@ -142,6 +149,14 @@ var plan03Ops = map[string]handler{
 		s, err := ep.ListSessions(ctx)
 		return sessionsResult{Sessions: s}, err
 	},
+	OpDeleteInstalled: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
+		v, err := decode[deleteInstalledArgs](a)
+		if err != nil {
+			return nil, err
+		}
+		deleted, err := ep.DeleteInstalled(ctx, v.Manifest, v.IDs)
+		return deleteInstalledResult{Deleted: deleted}, err
+	},
 }
 
 // ---- Client side -------------------------------------------------------
@@ -208,4 +223,12 @@ func (c *Client) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 		return nil, err
 	}
 	return out.Sessions, nil
+}
+
+func (c *Client) DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids []int) ([]string, error) {
+	var out deleteInstalledResult
+	if err := c.call(ctx, OpDeleteInstalled, deleteInstalledArgs{Manifest: m, IDs: ids}, &out); err != nil {
+		return nil, err
+	}
+	return out.Deleted, nil
 }

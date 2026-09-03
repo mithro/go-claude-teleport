@@ -78,6 +78,15 @@ func (l *Local) Cleanup(ctx context.Context, jobID string) error {
 	return os.RemoveAll(l.stagingDir(jobID))
 }
 
+// DeleteInstalled removes the manifest entries named by ids from this
+// host's filesystem when their current content still matches the
+// manifest's hash (transfer.UninstallIDs) — the destination side of
+// `abandon --delete-destination-files`, manifest-bounded exactly like
+// Install/Uninstall.
+func (l *Local) DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids []int) ([]string, error) {
+	return transfer.UninstallIDs(m, l.paths, ids)
+}
+
 // ListSessions scans the projects tree and the registry (spec §5 `list`).
 func (l *Local) ListSessions(ctx context.Context) ([]SessionSummary, error) {
 	regs, err := session.ReadRegistry(l.paths.SessionsDir())
