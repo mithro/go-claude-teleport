@@ -188,7 +188,15 @@ job's own manifest is left untouched.`,
 				// inspect's own exit code.
 				defer func() {
 					if cerr := dst.Cleanup(ctx, jobID); cerr != nil {
-						a.logf("inspect --host: destination clean-up of throwaway job %s: %v", jobID, cerr)
+						a.logf("inspect --host: destination staging clean-up of throwaway job %s: %v", jobID, cerr)
+					}
+					// R-P3-23i: Cleanup above only removes staging — the
+					// job dir itself (manifest.json, ...) needs its own
+					// removal, which only inspect's own throwaway
+					// "inspect-"-prefixed ids are ever allowed to reach
+					// (the wire dispatch handler refuses anything else).
+					if jerr := dst.RemoveJob(ctx, jobID); jerr != nil {
+						a.logf("inspect --host: destination job-dir clean-up of throwaway job %s: %v", jobID, jerr)
 					}
 					if rerr := os.RemoveAll(job.Dir(a.paths.DataDir, jobID)); rerr != nil {
 						a.logf("inspect --host: local clean-up of throwaway job %s: %v", jobID, rerr)

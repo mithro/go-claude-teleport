@@ -524,3 +524,120 @@ func TestAbandonCompletesLocalSideWhenDestinationUnreachable(t *testing.T) {
 		t.Errorf("retry must not re-mark the already-abandoned local side: %s", out2)
 	}
 }
+
+// TestAbandonNonUnreachableEndpointsFailureKeepsItsOwnExitCode is ruling
+// R-P3-23k: not every a.endpoints failure is "the destination is
+// unreachable" — a stored target that no longer even parses (a usage
+// error) must keep its OWN classification (exit 2, matching every other
+// command's a.fail), never get flattened to ExitUnreachable, and must
+// NOT trigger R-P3-23f's "mark abandoned locally, clean-up pending"
+// special case (which is reserved for a genuine dial/UnreachableError).
+func TestAbandonNonUnreachableEndpointsFailureKeepsItsOwnExitCode(t *testing.T) {
+	env, home := testEnv(t)
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+
+	j, err := job.New(dataDir, tsid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.SessionID, j.Direction = tsid, "to"
+	j.SourceHost, j.DestHost = "src.example", "dest.example"
+	m := &transfer.Manifest{Version: 1, JobID: tsid, SessionID: tsid}
+	if err := m.Save(j.ManifestPath()); err != nil {
+		t.Fatal(err)
+	}
+	plan := &orchestrate.Plan{
+		JobID: tsid, Session: &session.Session{ID: session.ID(tsid)},
+		DestInfo: remote.HostInfo{Hostname: "dest.example"}, ManifestPath: j.ManifestPath(),
+		Options: orchestrate.Options{
+			// An empty Target fails sshx.ParseTarget ("ssh target: empty")
+			// before any dial is even attempted — a usage error, not an
+			// unreachable one.
+			Direction: "to", Target: "",
+			Selector: session.Selector{ID: session.ID(tsid)}, State: "auto",
+			ExitTimeout: 5 * time.Second, StartTimeout: 5 * time.Second,
+		},
+	}
+	if j.Plan, err = plan.ToJSON(); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, stderr := run(t, env, "abandon", tsid)
+	if code != ExitUsage {
+		t.Fatalf("exit %d, want ExitUsage; stdout %s stderr %s", code, out, stderr)
+	}
+	if strings.Contains(out, "abandoned locally") || strings.Contains(stderr, "clean-up is pending") {
+		t.Errorf("a non-unreachable failure must not trigger the R-P3-23f local-abandon/clean-up-pending path: stdout %q stderr %q", out, stderr)
+	}
+	got, _, err := job.Open(dataDir, tsid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Outcome == "abandoned" || got.Finished {
+		t.Errorf("journal must not be marked abandoned on a non-unreachable failure: %+v", got)
+	}
+}
+
+// TestAbandonRetryDoesNotDuplicateHistoryRecord is ruling R-P3-23l:
+// src.Record/dst.Record append a history.jsonl row each — running abandon
+// a second time (retrying, say, the destination side) on an
+// already-abandoned job must not append a second "abandoned" row.
+func TestAbandonRetryDoesNotDuplicateHistoryRecord(t *testing.T) {
+	env, home := testEnv(t)
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+
+	dstHome := filepath.Join(t.TempDir(), "home", "bob")
+	dstPaths := session.Paths{Home: dstHome, ConfigDir: filepath.Join(dstHome, ".claude"), GlobalJSON: filepath.Join(dstHome, ".claude.json"), DataDir: filepath.Join(dstHome, ".local", "share", "claude-teleport"), ProcRoot: "/proc"}
+	if err := os.MkdirAll(dstPaths.ConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	j, err := job.New(dataDir, tsid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.SessionID, j.Direction = tsid, "to"
+	j.SourceHost, j.DestHost = "src.example", "dest.example"
+	m := &transfer.Manifest{Version: 1, JobID: tsid, SessionID: tsid}
+	if err := m.Save(j.ManifestPath()); err != nil {
+		t.Fatal(err)
+	}
+	plan := &orchestrate.Plan{
+		JobID: tsid, Session: &session.Session{ID: session.ID(tsid)},
+		DestInfo: remote.HostInfo{Hostname: "dest.example"}, ManifestPath: j.ManifestPath(),
+		Options: orchestrate.Options{
+			Direction: "to", Selector: session.Selector{ID: session.ID(tsid)}, State: "auto",
+			LocalDest: &dstPaths, ExitTimeout: 10 * time.Second, StartTimeout: 10 * time.Second,
+		},
+	}
+	if j.Plan, err = plan.ToJSON(); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if code, out, stderr := run(t, env, "abandon", tsid); code != ExitOK {
+		t.Fatalf("first abandon: exit %d\nstdout: %s\nstderr: %s", code, out, stderr)
+	}
+	if code, out, stderr := run(t, env, "abandon", tsid); code != ExitOK {
+		t.Fatalf("second abandon (retry): exit %d\nstdout: %s\nstderr: %s", code, out, stderr)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(job.Dir(dataDir, tsid), "history.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := 0
+	for _, l := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(l) != "" {
+			lines++
+		}
+	}
+	if lines != 1 {
+		t.Errorf("history.jsonl has %d line(s) after abandon ran twice, want exactly 1:\n%s", lines, raw)
+	}
+}

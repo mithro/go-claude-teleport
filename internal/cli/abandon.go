@@ -63,18 +63,25 @@ func newAbandonCmd(a *app) *cobra.Command {
 
 			src, dst, closeFn, err := a.endpoints(ctx, p.Options)
 			if err != nil {
-				// R-P3-23f: an unreachable destination must not block the
-				// local side — mark the journal abandoned (unless a prior
-				// run already did) and report that destination clean-up
-				// is pending; re-running abandon later retries only that.
-				if !alreadyAbandoned {
-					j.Outcome, j.Finished = "abandoned", true
-					if serr := j.Save(); serr != nil {
-						return fail(ExitFailed, "%v", serr)
+				// R-P3-23k: classify via a.fail exactly like every other
+				// command does (protocol mismatch, a bad stored target,
+				// etc. keep their own code — usage stays usage) — only
+				// when that classification is genuinely ExitUnreachable
+				// does R-P3-23f's "local side completes, clean-up
+				// pending" special case apply; any other failure is just
+				// a normal failure, and the journal is left untouched.
+				code := a.fail(err)
+				if code == ExitUnreachable {
+					if !alreadyAbandoned {
+						j.Outcome, j.Finished = "abandoned", true
+						if serr := j.Save(); serr != nil {
+							return fail(ExitFailed, "%v", serr)
+						}
+						fmt.Fprintf(a.stdout, "job %s abandoned locally; the source session is untouched\n", id.Short())
 					}
-					fmt.Fprintf(a.stdout, "job %s abandoned locally; the source session is untouched\n", id.Short())
+					fmt.Fprintf(a.stderr, "destination clean-up is pending — re-run `abandon %s` once it is reachable\n", id.Short())
 				}
-				return fail(ExitUnreachable, "destination %s is unreachable (%v); destination clean-up is pending — re-run `abandon %s` once it is reachable", p.DestInfo.Hostname, err, id.Short())
+				return exitErr(code)
 			}
 			defer closeFn()
 
@@ -101,10 +108,22 @@ func newAbandonCmd(a *app) *cobra.Command {
 				stepErr = deleteInstalledFiles(ctx, a, p, dst)
 			}
 
+			// R-P3-23l: src.Record/dst.Record append a history row each —
+			// only run them on the transition to abandoned (never on a
+			// retry of an already-abandoned job), or every re-run of
+			// abandon (e.g. retrying destination clean-up) would append a
+			// duplicate "abandoned" row.
 			if !alreadyAbandoned {
 				j.Outcome, j.Finished = "abandoned", true
 				if err := j.Save(); err != nil {
 					return fail(ExitFailed, "%v", err)
+				}
+				rec := job.HistoryRecord{At: time.Now().UTC(), SessionID: j.ID, Direction: j.Direction, From: j.SourceHost, To: j.DestHost, Outcome: "abandoned"}
+				if err := src.Record(ctx, j.ID, rec); err != nil {
+					a.logf("abandon: record on source: %v", err)
+				}
+				if err := dst.Record(ctx, j.ID, rec); err != nil {
+					a.logf("abandon: record on %s: %v", p.DestInfo.Hostname, err)
 				}
 			}
 			if err := src.JournalPut(ctx, j); err != nil {
@@ -112,13 +131,6 @@ func newAbandonCmd(a *app) *cobra.Command {
 			}
 			if err := dst.JournalPut(ctx, j); err != nil {
 				a.logf("abandon: journal-put on %s: %v", p.DestInfo.Hostname, err)
-			}
-			rec := job.HistoryRecord{At: time.Now().UTC(), SessionID: j.ID, Direction: j.Direction, From: j.SourceHost, To: j.DestHost, Outcome: "abandoned"}
-			if err := src.Record(ctx, j.ID, rec); err != nil {
-				a.logf("abandon: record on source: %v", err)
-			}
-			if err := dst.Record(ctx, j.ID, rec); err != nil {
-				a.logf("abandon: record on %s: %v", p.DestInfo.Hostname, err)
 			}
 			fmt.Fprintf(a.stdout, "job %s abandoned; the source session is untouched\n", id.Short())
 			if stepErr != nil {

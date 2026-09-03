@@ -352,3 +352,51 @@ func TestInspectHostRefusedOnBlockingDrift(t *testing.T) {
 		t.Errorf("output must explain the refusal:\n%s", out.String())
 	}
 }
+
+// TestInspectHostLeavesNoThrowawayJobDirBehind is ruling R-P3-23i's
+// end-to-end check: after a successful inspect --host, no jobs/inspect-*
+// directory remains on either host (the throwaway job's manifest.json,
+// via the new remove-job op on the destination and a direct os.RemoveAll
+// locally).
+func TestInspectHostLeavesNoThrowawayJobDirBehind(t *testing.T) {
+	claudeDir := harness.Build(t)
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", claudeDir+string(os.PathListSeparator)+oldPath)
+	noTmux := filepath.Join(t.TempDir(), "no-tmux-here")
+
+	remoteEnv, remoteHome := testEnv(t)
+	remoteEnv = append(remoteEnv, "TMUX_TMPDIR="+noTmux)
+	os.MkdirAll(filepath.Join(remoteHome, ".claude"), 0o700)
+	target, opts, localHome := remoteHost(t, remoteEnv)
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + noTmux}
+
+	cwd := filepath.Join(localHome, "proj")
+	os.MkdirAll(cwd, 0o755)
+	seed := exec.Command("claude", "-p", "--session-id", tsid, "hi")
+	seed.Dir = cwd
+	seed.Env = append(os.Environ(), "HOME="+localHome, "CLAUDE_CONFIG_DIR="+filepath.Join(localHome, ".claude"), "PATH="+os.Getenv("PATH"))
+	if out, err := seed.CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v\n%s", err, out)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Main(append([]string{"inspect", tsid, "--host", target}, opts...), strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitOK {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, out.String(), errOut.String())
+	}
+
+	localLeftovers, err := filepath.Glob(filepath.Join(localHome, ".local", "share", "claude-teleport", "jobs", "inspect-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(localLeftovers) != 0 {
+		t.Errorf("local throwaway job dir(s) left behind: %v", localLeftovers)
+	}
+	remoteLeftovers, err := filepath.Glob(filepath.Join(remoteHome, ".local", "share", "claude-teleport", "jobs", "inspect-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remoteLeftovers) != 0 {
+		t.Errorf("remote throwaway job dir(s) left behind: %v", remoteLeftovers)
+	}
+}
