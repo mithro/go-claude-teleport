@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/mithro/go-claude-teleport/internal/gitx"
+	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
@@ -36,6 +37,7 @@ func (p *Plan) Render(w io.Writer) {
 		p.renderGit(w)
 	}
 	p.renderTmux(w)
+	p.renderFreezeCaveat(w)
 	fmt.Fprintf(w, "End state  %s\n", p.TargetState)
 	if len(p.Drift.Diffs) > 0 {
 		fmt.Fprintln(w, "Configuration differences")
@@ -93,6 +95,20 @@ func (p *Plan) renderFileSummary(w io.Writer) {
 	if replaced > 0 {
 		fmt.Fprintf(w, "  %d destination file(s) diverged and are REPLACED (--force)\n", replaced)
 	}
+}
+
+// renderFreezeCaveat warns about the one case where the source freeze can
+// be undone under us: tmux sends SIGCONT to a stopped pane process of its
+// own accord, so a Claude that IS the pane's command (started with no
+// shell in between) can be woken mid-teleport. Claude started FROM a shell
+// in the pane — the normal case — is unaffected, and the plan cannot tell
+// the two apart without inspecting the pane's process tree, so this is
+// rendered whenever a running source is being frozen inside tmux.
+func (p *Plan) renderFreezeCaveat(w io.Writer) {
+	if p.sourceState() != session.StateRunning || p.Session == nil || p.Session.Tmux == nil {
+		return
+	}
+	fmt.Fprintln(w, "  note: if Claude is the pane's OWN command (started without a shell), tmux may SIGCONT it and the freeze will not hold")
 }
 
 func (p *Plan) renderGit(w io.Writer) {

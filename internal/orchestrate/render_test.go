@@ -158,3 +158,24 @@ func TestRenderCountsForceReplacedFiles(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderFreezeCaveat: a running source inside tmux gets the
+// SIGCONT-by-tmux warning (a Claude that is the pane's own command may not
+// stay frozen); an idle source, or one with no pane, does not.
+func TestRenderFreezeCaveat(t *testing.T) {
+	const note = "tmux may SIGCONT it"
+	running := basePlan()
+	running.Session.State = session.StateRunning
+	running.Session.Tmux = &session.TmuxRef{Session: "main", WindowID: "@1", PaneID: "%1"}
+	var buf bytes.Buffer
+	running.Render(&buf)
+	if !strings.Contains(buf.String(), note) {
+		t.Errorf("a frozen-in-tmux source must carry the freeze caveat:\n%s", buf.String())
+	}
+	idle := basePlan()
+	buf.Reset()
+	idle.Render(&buf)
+	if strings.Contains(buf.String(), note) {
+		t.Errorf("an idle source has nothing to freeze:\n%s", buf.String())
+	}
+}

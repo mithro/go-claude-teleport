@@ -21,8 +21,6 @@ import (
 // StepNames is the spec §6 order.
 var StepNames = []string{"preflight", "freeze", "capture", "transfer", "install", "git-attach", "start", "shape", "thaw+exit", "record"}
 
-var shells = map[string]bool{"bash": true, "zsh": true, "sh": true, "fish": true, "dash": true}
-
 type runner struct {
 	p        *Plan
 	j        *job.Journal
@@ -503,7 +501,7 @@ func (r *runner) runStart(ctx context.Context) error {
 			r.p.DestRef = nil
 		case err != nil:
 			return err
-		case !shells[st.Command]:
+		case !tmuxx.IsShell(st.Command):
 			return fmt.Errorf("destination pane %s we opened earlier now runs %q; refusing to type over it — wait for that command to finish (or close the pane) and re-run `claude-teleport continue %s`", r.p.DestRef.PaneID, st.Command, r.p.JobID)
 		}
 	}
@@ -570,7 +568,7 @@ func (r *runner) verifyShape(ctx context.Context) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		return !r.p.CreatedWindow && shells[st.Command], nil
+		return !r.p.CreatedWindow && tmuxx.IsShell(st.Command), nil
 	}
 	return false, fmt.Errorf("unknown target state %q", r.p.TargetState)
 }
@@ -600,7 +598,7 @@ func (r *runner) runShape(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if !shells[st.Command] {
+		if !tmuxx.IsShell(st.Command) {
 			r.logf("shape: window %s still runs %q; leaving it", r.p.DestRef.WindowID, st.Command)
 			return nil
 		}
@@ -673,7 +671,7 @@ func (r *runner) runThawExit(ctx context.Context) error {
 	if _, ok := procx.IsPlaceholderArgv(st.Argv); ok {
 		return nil
 	}
-	if !shells[st.Command] {
+	if !tmuxx.IsShell(st.Command) {
 		r.logf("exit: source pane runs %q, not typing the placeholder", st.Command)
 		return nil
 	}
