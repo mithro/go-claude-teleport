@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/procx"
@@ -34,9 +35,19 @@ type ForegroundOptions struct {
 	Sleep    func(time.Duration)  // nil = time.Sleep
 	Timeout  time.Duration        // 0 = ForegroundTimeout
 	Poll     time.Duration        // 0 = ForegroundPoll
+
+	// ClearLine sends a literal CR before the `fg`, terminating whatever
+	// the shell already has on its line.
+	//
+	// The ordinary thaw path does not need it: it types `fg` BEFORE
+	// anything continues the job, so the job has had no chance to make
+	// the terminal answer a query into the shell's input. The freezer
+	// helper's owner-died path does, because there the SIGCONT has
+	// already happened by design (ruling R-P3-PROOF-5 item 1).
+	ClearLine bool
 }
 
-// RestoreForeground gives a thawed job the pty of pane paneID back.
+// RestoreForeground gives a stopped job the pty of pane paneID back.
 //
 // An interactive shell is a job-control shell: when its foreground job
 // stops — by SIGSTOP from the freezer just as much as by ^Z — it takes the
@@ -49,6 +60,25 @@ type ForegroundOptions struct {
 // rules out the freezer, the runner and the remote helper alike — so the
 // one process that can fix it is the shell itself, and the way to ask is
 // its own `fg`.
+//
+// CALL THIS BEFORE THE SIGCONT, not after (ruling R-P3-PROOF-5 item 1).
+// `fg` hands the terminal over AND continues the job, so it needs no help
+// — and the SIGCONT-first order loses a real teleport: on SIGCONT Claude
+// re-issues its colour-scheme query (CSI ?996n), tmux answers CSI ?997;1n
+// into the pane's INPUT, the shell — still the foreground — reads that as
+// typed text, and the ` 'fg'` that arrives next lands on the polluted
+// line. The pane a real return leg was left with:
+//
+//	tim@ten64:~$ 997;1n997;1n 'fg'
+//	bash: 997: command not found
+//
+// with Claude still stopped and the shell still owning the tty. Typing
+// `fg` first leaves the query no window: by the time the job runs again
+// it is already the foreground and reads its own answer.
+//
+// The caller keeps the explicit SIGCONT as the fallback for the two cases
+// this cannot cover — the pane's process is not a job-control shell (this
+// no-ops), and `fg` did not take within the budget (ErrNotRestored).
 //
 // Nothing is typed unless the pty's foreground really has moved to a
 // process group led by the pane's own process: with job control off (or
@@ -107,6 +137,14 @@ func RestoreForeground(ctx context.Context, t Transport, paneID string, pid int,
 		return nil
 	}
 	logf("foreground: the pane process (pid %d) took the terminal back while pid %d was stopped; typing fg into pane %s", fg, pid, paneID)
+	if opts.ClearLine {
+		// The shell's line is not assumed empty: a CR of its own ends
+		// whatever is on it (at worst one "command not found") so the
+		// `fg` below starts from a fresh prompt.
+		if err := SendReturn(ctx, t, paneID); err != nil {
+			return err
+		}
+	}
 	if err := TypeCommand(ctx, t, paneID, []string{"fg"}); err != nil {
 		return err
 	}
@@ -120,6 +158,12 @@ func RestoreForeground(ctx context.Context, t Transport, paneID string, pid int,
 			return nil // restored, or the process is gone
 		}
 		if time.Now().After(deadline) {
+			// What the shell made of what it was given is the only clue
+			// to why `fg` did not take, and nobody can see the pane once
+			// a detached runner has failed on it.
+			for _, l := range paneTail(ctx, t, paneID, 10) {
+				logf("foreground: pane %s: %s", paneID, l)
+			}
 			return fmt.Errorf("%w: pid %d, pane %s, within %s", ErrNotRestored, pid, paneID, timeout)
 		}
 		sleep(poll)
@@ -151,6 +195,30 @@ func FreezerRestore(socketPath, paneID string) procx.RestoreFunc {
 		}
 		defer t.Close()
 		logf("owner died: pid %d was SIGCONT'd; checking whether pane %s's shell holds its terminal", pid, paneID)
-		return RestoreForeground(ctx, t, paneID, pid, ForegroundOptions{Logf: logf})
+		// ClearLine: this is the one path where the SIGCONT is already
+		// done before anything can type `fg`, so the shell's line may
+		// already hold the answer to a query the resumed job made.
+		return RestoreForeground(ctx, t, paneID, pid, ForegroundOptions{Logf: logf, ClearLine: true})
 	}
+}
+
+// paneTail returns the last n non-blank lines of the pane's visible
+// screen, for logging why a restore did not take. Errors are folded into
+// the returned lines: this only ever runs on a path that is already
+// failing, and a capture that fails is itself worth saying out loud.
+func paneTail(ctx context.Context, t Transport, paneID string, n int) []string {
+	screen, err := CaptureScreen(ctx, t, paneID)
+	if err != nil {
+		return []string{fmt.Sprintf("(capture failed: %v)", err)}
+	}
+	var out []string
+	for _, l := range strings.Split(string(screen), "\n") {
+		if strings.TrimSpace(l) != "" {
+			out = append(out, l)
+		}
+	}
+	if len(out) > n {
+		out = out[len(out)-n:]
+	}
+	return out
 }

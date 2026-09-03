@@ -258,14 +258,46 @@ func (f *fakeTmux) runLocked(cmd string) (out []string, err error, trig *exitTri
 		if !ok {
 			return nil, fmt.Errorf("can't find pane: %s", flag(a, "-t")), nil
 		}
+		// Flags, then keys — in whatever order: -l (literal bytes) and
+		// -H (hexadecimal bytes) are how the thaw path types now, and
+		// both put the target BETWEEN the flag and the keys.
+		literal, hexBytes := false, false
+		var keys []string
+		for i := 1; i < len(a); i++ {
+			switch a[i] {
+			case "-l":
+				literal = true
+			case "-H":
+				hexBytes = true
+			case "-t":
+				i++ // the target, already resolved above
+			default:
+				keys = append(keys, a[i])
+			}
+		}
 		var text strings.Builder
 		deliveredEnter := false
-		for _, k := range a[3:] {
-			if seq, ok := keySeq[k]; ok {
-				text.WriteString(seq)
-				deliveredEnter = deliveredEnter || k == "Enter"
-			} else {
+		for _, k := range keys {
+			switch {
+			case hexBytes:
+				v, err := strconv.ParseUint(k, 16, 8)
+				if err != nil {
+					return nil, fmt.Errorf("send-keys -H %q: %w", k, err), nil
+				}
+				text.WriteByte(byte(v))
+				// The pane below is a real pty, so ICRNL turns this CR
+				// into the newline the shell reads — exactly as a real
+				// terminal's Enter key does.
+				deliveredEnter = deliveredEnter || byte(v) == '\r'
+			case literal:
 				text.WriteString(k)
+			default:
+				if seq, ok := keySeq[k]; ok {
+					text.WriteString(seq)
+					deliveredEnter = deliveredEnter || k == "Enter"
+				} else {
+					text.WriteString(k)
+				}
 			}
 		}
 		_, werr := io.WriteString(p.stdin, text.String())

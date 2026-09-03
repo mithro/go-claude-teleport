@@ -110,14 +110,57 @@ func ShellQuote(argv []string) string {
 	return strings.Join(parts, " ")
 }
 
+// SendLiteral sends text to the pane as literal BYTES (send-keys -l): no
+// key-name lookup, no key encoding, whatever the pane's terminal modes.
+//
+// That last part is why it exists (ruling R-P3-PROOF-5 item 2). A pane
+// whose stopped Claude left the terminal in extended-keys mode makes tmux
+// next-3.8 encode named keys with modifiers the modifyOtherKeys way (C-u
+// becomes CSI 27;5;117~), which the shell that inherited the terminal
+// cannot parse — so a restore must never rely on key names.
+func SendLiteral(ctx context.Context, t Transport, paneID, text string) error {
+	if err := checkTargetID("send-keys", paneSigil, paneID); err != nil {
+		return err
+	}
+	if _, err := t.Run(ctx, fmt.Sprintf("send-keys -l -t %s %s", Quote(paneID), Quote(text))); err != nil {
+		return fmt.Errorf("send-keys -l %s: %w", paneID, err)
+	}
+	return nil
+}
+
+// SendReturn sends ONE literal carriage return (send-keys -H 0d), the
+// byte a terminal's Enter actually produces.
+//
+// It is the newline half of SendLiteral's rule: the "Enter" key name goes
+// through tmux's key encoding, and a pane left in extended-keys mode by
+// the stopped Claude is exactly where that encoding stops meaning \r.
+// Sent alone it also terminates whatever line the shell already has — the
+// one safe way to clear a polluted line, since C-u and C-c are key names.
+func SendReturn(ctx context.Context, t Transport, paneID string) error {
+	if err := checkTargetID("send-keys", paneSigil, paneID); err != nil {
+		return err
+	}
+	if _, err := t.Run(ctx, fmt.Sprintf("send-keys -H -t %s 0d", Quote(paneID))); err != nil {
+		return fmt.Errorf("send-keys -H %s: %w", paneID, err)
+	}
+	return nil
+}
+
 // TypeCommand types argv into the pane's shell and presses Enter. The
 // leading space keeps it out of history-ignore-space shells' history.
+//
+// Both halves go in as literal bytes (SendLiteral + SendReturn) rather
+// than as text plus the "Enter" key name: the pane may have inherited
+// Claude's terminal modes, and nothing typed to recover a pane may depend
+// on tmux's key encoding still meaning what it usually means.
 func TypeCommand(ctx context.Context, t Transport, paneID string, argv []string) error {
 	if err := checkTargetID("type command", paneSigil, paneID); err != nil {
 		return err
 	}
-	cmd := fmt.Sprintf("send-keys -t %s %s Enter", Quote(paneID), Quote(" "+ShellQuote(argv)))
-	if _, err := t.Run(ctx, cmd); err != nil {
+	if err := SendLiteral(ctx, t, paneID, " "+ShellQuote(argv)); err != nil {
+		return fmt.Errorf("type command into %s: %w", paneID, err)
+	}
+	if err := SendReturn(ctx, t, paneID); err != nil {
 		return fmt.Errorf("type command into %s: %w", paneID, err)
 	}
 	return nil
