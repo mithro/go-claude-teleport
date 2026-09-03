@@ -106,6 +106,16 @@ func TestLiveOpenCaptureTypeKill(t *testing.T) {
 // prober.ListPanes and both OpenWindow branches. Before the I1/I2 fix the
 // backslash session's group-reuse target was undecodable ("can't find
 // session") and the space session's panes vanished from ListPanes.
+//
+// PR #8 CI (ubuntu-latest, tmux 3.4) found a second version dependency:
+// that tmux vis-encodes session names but stores window names raw (`w\x`
+// stays `w\x`, never re-encoded to `w\\x`) — the opposite of next-3.8/3.5a,
+// which encode both. So nothing here pins a specific vis(3) encoding; every
+// "stored spelling" is read back from this server (list-sessions /
+// list-windows), and the assertions are the round-trip properties that
+// hold regardless: ListSessions/ListPanes report the stored spelling,
+// OpenWindow (both branches) targets/creates it and UnvisName decodes it
+// back to the name a human typed.
 func TestLiveVisNames(t *testing.T) {
 	sock, _ := StartTestServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -117,15 +127,14 @@ func TestLiveVisNames(t *testing.T) {
 	defer tr.Close()
 	cwd := t.TempDir()
 
-	// Names as a human writes them, and the spelling tmux stores for each.
-	cases := []struct{ decoded, stored string }{
-		{`a b`, `a b`},  // space is printable: vis leaves it alone
-		{`a\b`, `a\\b`}, // backslash is always doubled
-		{`a"b`, `a"b`},  // a literal quote passes through
-	}
-	for _, c := range cases {
-		if _, err := tr.Run(ctx, `new-session -d -s `+Quote(c.decoded)+` "tail -f /dev/null"`); err != nil {
-			t.Fatalf("create session %q: %v", c.decoded, err)
+	// Names as a human writes them; the stored spelling for each is
+	// whatever this server actually reports back.
+	names := []string{`a b`, `a\b`, `a"b`}
+	stored := make(map[string]string, len(names))
+	for _, name := range names {
+		stored[name] = deriveSessionStored(t, ctx, tr, name)
+		if got := UnvisName(stored[name]); got != name {
+			t.Errorf("UnvisName(%q) = %q, want the original %q", stored[name], got, name)
 		}
 	}
 
@@ -137,12 +146,9 @@ func TestLiveVisNames(t *testing.T) {
 	for _, s := range sessions {
 		got[s.Name] = true
 	}
-	for _, c := range cases {
-		if !got[c.stored] {
-			t.Errorf("ListSessions has no session stored as %q; got %v", c.stored, got)
-		}
-		if UnvisName(c.stored) != c.decoded {
-			t.Errorf("UnvisName(%q) = %q, want %q", c.stored, UnvisName(c.stored), c.decoded)
+	for _, name := range names {
+		if !got[stored[name]] {
+			t.Errorf("ListSessions has no session stored as %q; got %v", stored[name], got)
 		}
 	}
 
@@ -158,46 +164,116 @@ func TestLiveVisNames(t *testing.T) {
 	for _, p := range panes {
 		seen[p.Session] = true
 	}
-	for _, c := range cases {
-		if !seen[c.stored] {
-			t.Errorf("ListPanes dropped session %q; got %v", c.stored, seen)
+	for _, name := range names {
+		if !seen[stored[name]] {
+			t.Errorf("ListPanes dropped session %q; got %v", stored[name], seen)
 		}
 	}
 
 	// Group reuse: the stored name goes into the -t target verbatim. The
 	// backslash name is the one that regressed, so assert on it explicitly;
 	// the others prove the convention is not backslash-specific.
-	for _, c := range cases {
-		ref, err := OpenWindow(ctx, tr, &Plan{SocketPath: sock, Group: c.stored, WindowName: "claude", AutoRename: true, Cwd: cwd})
+	for _, name := range names {
+		grp := stored[name]
+		ref, err := OpenWindow(ctx, tr, &Plan{SocketPath: sock, Group: grp, WindowName: "claude", AutoRename: true, Cwd: cwd})
 		if err != nil {
-			t.Fatalf("OpenWindow into existing session %q: %v", c.stored, err)
+			t.Fatalf("OpenWindow into existing session %q: %v", grp, err)
 		}
-		if ref.Session != c.stored {
-			t.Errorf("ref.Session = %q, want the stored spelling %q", ref.Session, c.stored)
+		if ref.Session != grp {
+			t.Errorf("ref.Session = %q, want the stored spelling %q", ref.Session, grp)
 		}
 		facts, err := Describe(ctx, tr, ref.PaneID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if facts.SessionName != c.stored || facts.WindowName != "claude" {
-			t.Errorf("new window landed in %+v, want session %q", facts, c.stored)
+		if facts.SessionName != grp || facts.WindowName != "claude" {
+			t.Errorf("new window landed in %+v, want session %q", facts, grp)
 		}
 	}
 
-	// Creation branch: a group with no session yet. Group carries the STORED
-	// spelling, so OpenWindow must decode it for -s or tmux double-encodes.
-	ref, err := OpenWindow(ctx, tr, &Plan{SocketPath: sock, Group: `n\\g`, WindowName: `w\\x`, AutoRename: false, Cwd: cwd, CreateSession: true})
+	// Creation branch: a group with no session yet, and a window name that
+	// also carries a backslash. Group/WindowName carry the STORED spelling
+	// per the Plan contract, so OpenWindow must decode both for -s/-n or
+	// a tmux that does re-encode would double-encode. Derive the expected
+	// stored spelling for each from this server directly (a throwaway
+	// session, and a throwaway window in an already-live session) instead
+	// of assuming any one tmux version's encoding rule.
+	groupDecoded := `n\g`
+	groupStored := deriveSessionStored(t, ctx, tr, groupDecoded)
+	if got := UnvisName(groupStored); got != groupDecoded {
+		t.Errorf("UnvisName(%q) = %q, want %q", groupStored, got, groupDecoded)
+	}
+	if _, err := tr.Run(ctx, `kill-session -t `+Quote("="+groupStored)); err != nil {
+		t.Fatalf("kill throwaway group session %q: %v", groupStored, err)
+	}
+
+	windowDecoded := `w\x`
+	windowStored := deriveWindowStored(t, ctx, tr, stored[`a b`], windowDecoded)
+	if got := UnvisName(windowStored); got != windowDecoded {
+		t.Errorf("UnvisName(%q) = %q, want %q", windowStored, got, windowDecoded)
+	}
+
+	ref, err := OpenWindow(ctx, tr, &Plan{SocketPath: sock, Group: groupStored, WindowName: windowStored, AutoRename: false, Cwd: cwd, CreateSession: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ref.Session != `n\\g` {
-		t.Errorf("created session stored as %q, want %q (a double-encode would give %q)", ref.Session, `n\\g`, `n\\\\g`)
+	if ref.Session != groupStored {
+		t.Errorf("created session stored as %q, want the observed spelling %q", ref.Session, groupStored)
 	}
 	facts, err := Describe(ctx, tr, ref.PaneID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if facts.WindowName != `w\\x` {
-		t.Errorf("created window stored as %q, want %q", facts.WindowName, `w\\x`)
+	if facts.WindowName != windowStored {
+		t.Errorf("created window stored as %q, want the observed spelling %q", facts.WindowName, windowStored)
 	}
+}
+
+// deriveSessionStored creates a throwaway session named decoded and returns
+// whatever spelling tmux actually stored it as — the ground truth for this
+// tmux binary's session-name vis-encoding, read back rather than assumed
+// (see TestLiveVisNames).
+func deriveSessionStored(t *testing.T, ctx context.Context, tr Transport, decoded string) string {
+	t.Helper()
+	before, err := ListSessions(ctx, tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, s := range before {
+		seen[s.Name] = true
+	}
+	if _, err := tr.Run(ctx, `new-session -d -s `+Quote(decoded)+` "tail -f /dev/null"`); err != nil {
+		t.Fatalf("create session %q: %v", decoded, err)
+	}
+	after, err := ListSessions(ctx, tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range after {
+		if !seen[s.Name] {
+			return s.Name
+		}
+	}
+	t.Fatalf("no new session appeared after creating %q; before=%v after=%v", decoded, before, after)
+	return ""
+}
+
+// deriveWindowStored creates a throwaway window (named decoded) in the
+// already-live baseSession and returns whatever spelling tmux actually
+// stored the window name as.
+func deriveWindowStored(t *testing.T, ctx context.Context, tr Transport, baseSession, decoded string) string {
+	t.Helper()
+	lines, err := tr.Run(ctx, `new-window -d -t `+Quote("="+baseSession+":")+` -n `+Quote(decoded)+` -P -F "#{window_id}\t#{window_name}"`)
+	if err != nil {
+		t.Fatalf("create window %q in session %q: %v", decoded, baseSession, err)
+	}
+	if len(lines) == 0 {
+		t.Fatalf("create window %q: empty reply", decoded)
+	}
+	f := strings.SplitN(lines[0], "\t", 2)
+	if len(f) != 2 {
+		t.Fatalf("create window %q: unexpected reply %q", decoded, lines[0])
+	}
+	return f[1]
 }

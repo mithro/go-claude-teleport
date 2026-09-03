@@ -191,8 +191,10 @@ func TestFindWindowAmbiguousBetweenSpellings(t *testing.T) {
 func TestFindWindowAmbiguityNamesStoredSpellings(t *testing.T) {
 	tb := fakeProc(t, nil)
 	f := &Fake{Replies: map[string][]string{
-		// Two different vis encodings of the same text, "a b".
-		listSessionsCmd: {`a\040b` + "\tg1", `a\sb` + "\tg2"},
+		// Two different vis octal encodings of the same text, "a b"
+		// (3-digit and 2-digit octal for the space both decode the same
+		// way; UnvisName does not require a fixed digit count).
+		listSessionsCmd: {`a\040b` + "\tg1", `a\40b` + "\tg2"},
 	}}
 	p := Prober(context.Background(), f, tb, "/tmp/tmux-1000/default")
 	_, err := p.FindWindow("a b", "2")
@@ -203,7 +205,7 @@ func TestFindWindowAmbiguityNamesStoredSpellings(t *testing.T) {
 	if !ok {
 		t.Fatalf("err = %v, want it to list the candidate sessions", err)
 	}
-	if list != `a\040b, a\sb` {
+	if list != `a\040b, a\40b` {
 		t.Errorf("candidate list = %q, want the two stored spellings", list)
 	}
 }

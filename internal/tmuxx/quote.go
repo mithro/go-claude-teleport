@@ -59,9 +59,18 @@ func Quote(s string) string {
 // confirms the stored spelling). Handing a stored name back to
 // `new-session -s` / `new-window -n` verbatim would re-encode it (\\ →
 // \\\\), so restore decodes first; tmux's own re-encoding then reproduces
-// the stored spelling exactly. Raw backslashes are always doubled by the
-// encoder, so every backslash in a stored name begins an escape — an
-// unrecognised escape is preserved literally as the safe fallback.
+// the stored spelling exactly.
+//
+// Not every tmux vis-encodes at all: ubuntu-latest's tmux 3.4 stores window
+// names raw (issue seen on PR #8 CI — `w\x` stays `w\x`, never `w\\x`), so a
+// stored name's backslash does not always begin a real escape. UnvisName
+// therefore only recognises the two forms actually probe-verified above —
+// `\\` (a doubled backslash) and `\t`/`\n`/`\ooo` (VIS_TAB/VIS_NL/VIS_OCTAL)
+// — everything else, including vis(3) mnemonics never observed from a real
+// tmux here (`\r`, `\a`, `\b`, `\f`, `\v`, `\s`), is preserved literally.
+// That keeps UnvisName the identity on a name an older tmux stored raw: a
+// literal `a\b` (backslash then the letter b, never encoded) survives
+// unchanged instead of being misread as a vis(3) backspace escape.
 func UnvisName(s string) string {
 	if !strings.Contains(s, `\`) {
 		return s
@@ -82,18 +91,6 @@ func UnvisName(s string) string {
 			b.WriteByte('\n')
 		case n == 't':
 			b.WriteByte('\t')
-		case n == 'r':
-			b.WriteByte('\r')
-		case n == 'a':
-			b.WriteByte('\a')
-		case n == 'b':
-			b.WriteByte('\b')
-		case n == 'f':
-			b.WriteByte('\f')
-		case n == 'v':
-			b.WriteByte('\v')
-		case n == 's':
-			b.WriteByte(' ')
 		case n >= '0' && n <= '7':
 			v, j := 0, 0
 			for ; j < 3 && i+j < len(s) && s[i+j] >= '0' && s[i+j] <= '7'; j++ {
