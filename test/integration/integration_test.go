@@ -217,18 +217,32 @@ func TestKilledRunnerThenContinueCompletes(t *testing.T) {
 	if procState(t, "source", "alice", pid) == "" {
 		t.Fatalf("source claude (pid %s) died when the runner was killed; it must survive to be continued", pid)
 	}
-	// Measured residue, deliberately not asserted away (reproduced by hand
-	// against this harness): the SIGCONT above does resume the process, but
-	// an interactive shell took the pty back the moment its foreground job
-	// stopped, so the resumed Claude re-stops on SIGTTIN at its next read
-	// and /proc reports "T" again (state do_signal_stop, tpgid naming the
-	// shell's group). Only tcsetpgrp — in practice the shell's own `fg`,
-	// which remote.Local.Thaw types into the pane — gives the terminal
-	// back, and no such caller exists once the runner is dead. The session
-	// is not lost: `continue` below re-freezes and thaws it properly, and
-	// a user could type fg. Logged so a change in this behaviour is
-	// visible in the run output.
-	t.Logf("C5: after the runner was killed the freezer is gone; source claude (pid %s) /proc state is %q", pid, procState(t, "source", "alice", pid))
+	// ...and it is RUNNING, not merely alive (ruling R-P3-F1). A bare
+	// SIGCONT is not enough: the pane's job-control shell took the pty the
+	// moment the freeze stopped its foreground job, so a resumed Claude
+	// re-stops on SIGTTIN at its next read (state T, tpgid naming the
+	// shell's group) and everything typed at the pane afterwards lands on
+	// the shell. The freezer helper was therefore handed the source pane at
+	// freeze time and, on the EOF that its owner's death produced, types
+	// `fg` into exactly that pane after the SIGCONT. Polled, because the
+	// SIGCONT, the `fg` and the shell's tcsetpgrp are all asynchronous to
+	// pkill returning — and this must hold BEFORE `continue` runs, which is
+	// why it is asserted here rather than after.
+	deadline = time.Now().Add(30 * time.Second)
+	for {
+		st := procState(t, "source", "alice", pid)
+		if st == "" {
+			t.Fatalf("source claude (pid %s) died while waiting for the freezer to restore its terminal", pid)
+		}
+		if st != "T" {
+			t.Logf("C5: after the runner was killed the freezer thawed source claude (pid %s) AND gave it the terminal back; /proc state is %q", pid, st)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("source claude (pid %s) is still stopped (state T) 30s after the runner was killed: the freeze was released but the pane's shell kept the terminal, so it re-stopped on SIGTTIN", pid)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 	out, code := shCode(t, "source", "alice", "claude-teleport continue "+sid)
 	if code != 0 {
 		t.Fatalf("continue: %d\n%s", code, out)
