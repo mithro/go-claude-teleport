@@ -183,9 +183,20 @@ dialling hop *n+1* through hop *n*'s connection (`client.Dial("tcp",
 "next:port")`), so **the final hostname is resolved by the last jump host**,
 never locally. `ProxyCommand` is not supported: a clear error names the
 host and suggests `--via`. One ssh connection is opened per remote endpoint
-and every channel (control, file streams) is multiplexed over it; a lost
-connection is re-dialled (bounded retries with backoff) and the step
-re-verified.
+and every channel (control, file streams) is multiplexed over it.
+
+Keepalives are ON by default (`ServerAliveInterval` 15s,
+`ServerAliveCountMax` 3, both overridable by `-o` or `~/.ssh/config`,
+`ServerAliveInterval=0` disabling them), so a half-open link fails rather
+than hanging a job that nobody is watching.
+
+**Automatic mid-run re-dial is NOT implemented.** The initial dial retries
+(bounded attempts with backoff), but a connection lost *during* a run is a
+loud failure: the step is marked failed, the source is thawed, the journal
+records exactly where the job stopped and the runner exits non-zero.
+`claude-teleport continue <sid>` then re-dials and re-verifies from that
+step — every step re-checks reality first, so nothing is redone blindly.
+(Transparent mid-run re-dial with bounded backoff is a follow-up.)
 
 ### 4.3 Remote helper protocol
 
@@ -312,11 +323,24 @@ pipe; when the runner writes `thaw` *or dies* (pipe EOF), it sends `SIGCONT`
 and exits. `procStart` from `/proc/<pid>/stat` is checked before every signal
 so a reused pid can never be signalled.
 
-While the parent is stopped, a `!`-mode foreground process must not write
-more than the pipe buffer to stdout (the parent is not reading). The
-foreground therefore prints nothing until the runner has reached step 9 (or
-failed); progress goes to `log.txt`, and the tail of the log is printed once
-at the end.
+The freeze moves Claude's whole **process group**, not just its pid: an
+interactive shell puts Claude in its own process group and gives that group
+the terminal, so stopping the leader alone would leave the rest of the group
+running (and still appending to the transcript being copied). Freeze and
+thaw therefore both signal `-pgid`, after re-checking `procStart` for the
+pid that names the group; when the group cannot be determined, or would be
+the freezer's or the runner's own group, the bare pid is signalled instead
+and the degradation is warned into `log.txt`.
+
+That has a direct consequence for `!`-mode: the foreground
+`claude-teleport` is Claude's own child, in Claude's process group, so it is
+stopped by the very freeze it started. It therefore prints nothing, and can
+do nothing, until the group is thawed. Nothing about the job depends on it:
+the runner is spawned into its own session (`setsid`), so the `SIGSTOP`
+never reaches it, and it is the runner that thaws the group at step 9 —
+after which the foreground resumes, prints the tail of `log.txt` and exits,
+letting the parent Claude record the command's result before being asked to
+exit. Progress in the meantime goes to `log.txt` only.
 
 ### 6.2 Confirming the destination resumed
 

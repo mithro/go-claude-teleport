@@ -317,6 +317,11 @@ transferred without needing a destination; `inspect [<session>] --host
 and drift table `--dry-run` would show (or the refusal, exit 3), against a
 throwaway job id that never touches this session's own journal.
 
+`inspect --host <host>` inspects a LOCAL session and preflights it TOWARD
+that host — it never inspects a session living there. To see what is on
+another machine, use `claude-teleport list --host <host>` (and teleport it
+here with `--from <host>` to inspect it locally).
+
 ## Caveats / known limitations
 
 - **Staged deletions do not travel.** Only staged blobs and dirty
@@ -336,6 +341,14 @@ throwaway job id that never touches this session's own journal.
 - **Memory files are copied only if absent** on the destination; if one
   already exists with different content it is left alone and reported, and
   `abandon --delete-destination-files` never removes it either way.
+- **A Claude that IS the pane's own command may not stay frozen.** The
+  freeze is a `SIGSTOP` on the process group, and tmux sends `SIGCONT` to
+  a stopped pane process of its own accord — so when Claude was started as
+  the pane's command (`tmux new-window claude …`, no shell in between) it
+  can be woken up again mid-teleport. Running Claude from a shell inside
+  the pane — the normal case — is unaffected. The teleport still completes:
+  the source is re-frozen only until step 9, which thaws it and asks it to
+  exit.
 - **`-p` (print) session confirmation is best-effort.** Non-interactive
   runs are confirmed via the registry's `status` turning `busy` after a
   turn rather than a prompt actually being reached on screen.
@@ -351,9 +364,13 @@ throwaway job id that never touches this session's own journal.
   being used as filesystem paths.
 - Nothing from either machine's Claude configuration or transcript is ever
   sent to any Claude API.
-- New ssh host keys are accepted the same way `ssh -o
-  StrictHostKeyChecking=accept-new` does, recorded into a plain
-  (non-hashed) `known_hosts`.
+- **An unknown ssh host key is refused**, like `ssh -o
+  StrictHostKeyChecking=yes`: the host must already be in `known_hosts`.
+  Pass `-o StrictHostKeyChecking=accept-new` for that one invocation to
+  accept and record a first-time key — it is appended to `known_hosts` in
+  plain (non-hashed) form. A key that CHANGED is refused under both of
+  those settings (`-o StrictHostKeyChecking=no` skips host verification
+  altogether — it is honoured, and it is not a default).
 
 ## Requirements
 
@@ -361,9 +378,17 @@ throwaway job id that never touches this session's own journal.
   thaw, registry liveness), so this is a hard requirement, not a portability
   gap; tmux ≥ 3.3 where tmux is used, but tmux is optional — `--no-tmux`/
   `--state idle` needs none.
-- ssh reachable with keys (agent or `~/.ssh/id_*`), host keys accepted into
-  `known_hosts` (or `-o StrictHostKeyChecking=accept-new`). `ProxyJump` is
-  honoured; `ProxyCommand` is not — use `--via`.
+- ssh reachable with keys (agent or `~/.ssh/id_*`), and each host already
+  in `known_hosts` — an unknown key is refused unless that invocation
+  passes `-o StrictHostKeyChecking=accept-new`, which records it. The link
+  is kept honest with keepalives — `ServerAliveInterval` 15s and
+  `ServerAliveCountMax` 3 by default, unlike OpenSSH's off-by-default,
+  because a teleport runs unattended and a half-open link would hang it
+  instead of failing it into a continuable job. Both keywords are read
+  from `-o` and from `~/.ssh/config`; `ServerAliveInterval=0` turns
+  keepalives off, while `ServerAliveCountMax=0` is a hard error (it reads
+  like "tolerate no misses" but would silently mean the default 3).
+  `ProxyJump` is honoured; `ProxyCommand` is not — use `--via`.
 - The same `claude-teleport` version on both ends (`claude-teleport doctor
   <host>` checks this, plus `claude` on `PATH`, the config directory, and
   more) and a logged-in Claude Code on the destination.
@@ -372,10 +397,15 @@ throwaway job id that never touches this session's own journal.
 
 ```sh
 go vet ./... && go test -race ./...                                # unit tests
-go test -race -tags tmuxlive ./internal/...                        # against a throwaway tmux server
+go test -race -tags tmuxlive ./internal/...                        # opt-in: a throwaway tmux server
 test/integration/build.sh && go test -tags integration ./test/integration/ -v   # docker: source, jump, dest
 python3 -m unittest discover -s packaging -p 'version_test.py'
 ```
+
+The `tmuxlive`, `integration` and `realclaude` suites are all opt-in build
+tags: a plain `go test ./...` never starts a tmux server, a container or a
+real Claude. CI runs `tmuxlive` over the same `./internal/...` as above on
+every push, and the tagged docker suites on their own schedule.
 
 The tmux control-mode client is copied from
 [go-tmux-saver](https://github.com/mithro/go-tmux-saver) (same author).
