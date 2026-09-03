@@ -158,7 +158,7 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 			last = fmt.Sprintf("registry pane %q is not our pane %q", reg.Tmux, wantTmux)
 		case reg.Status == "idle":
 			return reg, nil
-		case reg.Status == "busy" && strings.EqualFold(reg.Entrypoint, "sdk-cli"):
+		case reg.Status == "busy" && strings.EqualFold(reg.Entrypoint, "sdk-cli"): // real `claude -p` (2.1.247/2.1.259) was never observed with a status field while alive; the entrypoint check plus transcript growth below is what actually fires this arm
 			lastPrintReg = reg
 			if n, terr := l.transcriptSize(id); terr == nil {
 				if transcriptBaseline < 0 {
