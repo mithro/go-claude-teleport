@@ -652,7 +652,7 @@ func (r *runner) runThawExit(ctx context.Context) error {
 		return err
 	}
 	if alive {
-		if err := r.src.Thaw(ctx, reg.PID); err != nil && !isCode(err, "not-found") {
+		if err := r.src.Thaw(ctx, reg.PID, r.p.Session.Tmux); err != nil && !isCode(err, "not-found") {
 			return err
 		}
 		r.logf("thaw: SIGCONT pid %d", reg.PID)

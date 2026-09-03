@@ -111,6 +111,13 @@ func TestRunnerKilledMidTransferThawsAndContinues(t *testing.T) {
 	// An open, never-closed pipe blocks Scan() on the empty read instead,
 	// exactly like a real interactive terminal with nothing typed yet.
 	claude := exec.Command("claude", "--resume", sid)
+	// Its own process group, as any shell would give a job it starts —
+	// and as this test REQUIRES: freeze/thaw SIGSTOP the target's whole
+	// process group (spec §6.1), and the runner that does it is detached
+	// (Setsid), so its "never signal my owner's group" guard cannot see
+	// this test binary. Left in the ambient group, the freeze would stop
+	// `go test` itself.
+	claude.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	claude.Dir = cwd
 	claude.Env = append(sanitizedEnviron(), "HOME="+src.paths.Home, "CLAUDE_CONFIG_DIR="+src.paths.ConfigDir)
 	claudeStdin, err := claude.StdinPipe()
@@ -129,7 +136,12 @@ func TestRunnerKilledMidTransferThawsAndContinues(t *testing.T) {
 	// when this test first ran without the goroutine below).
 	claudeWaited := make(chan struct{})
 	go func() { claude.Wait(); close(claudeWaited) }()
-	t.Cleanup(func() { claudeStdin.Close(); claude.Process.Kill(); <-claudeWaited })
+	t.Cleanup(func() {
+		claudeStdin.Close()
+		syscall.Kill(-claude.Process.Pid, syscall.SIGCONT)
+		syscall.Kill(-claude.Process.Pid, syscall.SIGKILL)
+		<-claudeWaited
+	})
 	waitRegistry(t, src, "idle")
 
 	o := baseOptions()

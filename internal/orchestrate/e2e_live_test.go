@@ -40,23 +40,18 @@ func TestLiveTeleportRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tr.Close()
-	// default-command "exec sh +m": every pane this test (or the production
+	// default-command "exec sh": every pane this test (or the production
 	// code under test, for the destination window) opens from here on gets
 	// a plain, non-rc-sourcing shell that inherits exactly the server's own
 	// environment — this desktop's interactive bash sources ~/.bashrc,
 	// which resets PATH and drops the test-built claude/claude-teleport
 	// binaries from it (observed directly: a pane run with the default
-	// $SHELL could not find `claude` at all). +m disables job control for
-	// the same reason faketmux_test.go's fakePane uses it: an interactive
-	// shell with job control ON reclaims the pty as its own foreground
-	// process the moment its foreground child is SIGSTOPped, and a later
-	// raw SIGCONT (procx.Freeze/Thaw, not a shell `fg`) never gives the pty
-	// back — so a subsequently typed "/exit" would land on the shell, not
-	// claude, and thaw+exit would time out (observed directly, in exactly
-	// this way, before adding +m here). This changes only how THIS
-	// throwaway test server's panes start; it never touches the tool's own
-	// tmux usage.
-	if _, err := tr.Run(ctx, `set-option -g default-command "exec sh +m"`); err != nil {
+	// $SHELL could not find `claude` at all). Job control is deliberately
+	// left ON (it used to be forced off with "+m"): an interactive shell
+	// reclaims the pty from a SIGSTOPped foreground job, and putting the
+	// job back in the foreground on thaw is the tool's own job now
+	// (remote.Local.restoreForeground) — not something the test may hide.
+	if _, err := tr.Run(ctx, `set-option -g default-command "exec sh"`); err != nil {
 		t.Fatal(err)
 	}
 	ref, err := tmuxx.OpenWindow(ctx, tr, &tmuxx.Plan{SocketPath: sock, Group: "work", WindowName: "claude", AutoRename: false, Cwd: cwd, CreateSession: true})

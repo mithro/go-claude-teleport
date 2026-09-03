@@ -131,6 +131,9 @@ type FreezeArgs struct {
 }
 type ThawArgs struct {
 	PID int `json:"pid"`
+	// Ref is the pane the frozen process runs in, when it is in tmux, so
+	// Thaw can put it back in the pty's foreground (see Local.Thaw).
+	Ref *session.TmuxRef `json:"ref,omitempty"`
 }
 type CaptureArgs struct {
 	Ref   *session.TmuxRef `json:"ref"`

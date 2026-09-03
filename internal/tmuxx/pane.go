@@ -109,6 +109,10 @@ func TypeCommand(ctx context.Context, t Transport, paneID string, argv []string)
 
 var shells = map[string]bool{"bash": true, "zsh": true, "sh": true, "fish": true, "dash": true}
 
+// IsShell reports whether comm (a /proc comm) is one of the interactive
+// shells a pane may run.
+func IsShell(comm string) bool { return shells[comm] }
+
 // State reports the pane's foreground process (first non-shell process in
 // the pane's subtree, else the shell) and its last 50 lines.
 func State(ctx context.Context, t Transport, paneID string, procs *procx.Table) (*PaneState, error) {

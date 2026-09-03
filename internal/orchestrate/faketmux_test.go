@@ -237,16 +237,16 @@ func (f *fakeTmux) newWindow(sess, name, cwd string) ([]string, error) {
 	f.nextW++
 	p := &fakePane{id: fmt.Sprintf("%%%d", f.nextP), windowID: w.id, cwd: cwd, out: &lockedBuffer{}}
 	f.nextP++
-	// +m: with a real pty (below), sh auto-detects itself as interactive
-	// (stdin+stderr are both ttys) and turns job control ON, which then
-	// STOPs the foreground job on SIGSTOP and reclaims the pty as ITS OWN
-	// foreground process — a later raw SIGCONT (procx.Freeze/Thaw, not a
-	// shell `fg`) resumes the child's execution but never gives it back
-	// the pty, so anything typed afterwards (e.g. "/exit") goes to the
-	// shell instead ("sh: /exit: not found"), not the child. +m forces job
-	// control off regardless of the tty check, so the shell never takes
-	// the pty back out from under a stopped/continued foreground child.
-	cmd := exec.Command("sh", "+m", "-s")
+	// Job control ON (a real pty below makes sh interactive, which turns
+	// it on): this is what a real user's pane looks like, and it is what
+	// makes the shell take the pty back the moment its foreground job is
+	// SIGSTOPped by the freezer. The thaw path has to hand it back (see
+	// remote.Local.restoreForeground) or everything typed afterwards — the
+	// "/exit" of spec §6.3 included — lands on the shell instead. This
+	// test server used to pass "+m" to force job control off and dodge
+	// that; the tool now handles it, so the fake pane no longer lies about
+	// how a pane behaves.
+	cmd := exec.Command("sh", "-s")
 	cmd.Dir = cwd
 	cmd.Env = f.env(p.id, sess, w.id)
 	// A real pty, not a plain pipe: production code (internal/placeholder)

@@ -26,7 +26,7 @@ type stubEndpoint struct {
 
 func (s stubEndpoint) Hello(ctx context.Context) (HostInfo, error) { return s.hello() }
 func (s stubEndpoint) Paths() session.Paths                        { return session.Paths{Home: "/home/alice"} }
-func (s stubEndpoint) Thaw(ctx context.Context, pid int) error {
+func (s stubEndpoint) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {
 	if pid == 0 {
 		panic("pid zero")
 	}

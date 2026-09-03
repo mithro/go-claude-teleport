@@ -172,7 +172,7 @@ var plan02Ops = map[string]handler{
 		if err != nil {
 			return nil, err
 		}
-		return Empty{}, ep.Thaw(ctx, a.PID)
+		return Empty{}, ep.Thaw(ctx, a.PID, a.Ref)
 	},
 	OpCapture: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {
 		a, err := decode[CaptureArgs](args)

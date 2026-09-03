@@ -56,7 +56,7 @@ type Endpoint interface {
 
 	// processes and panes
 	Freeze(ctx context.Context, pid int, startTime string) error
-	Thaw(ctx context.Context, pid int) error
+	Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error
 	Capture(ctx context.Context, ref *session.TmuxRef, jobID string) error
 	OpenWindow(ctx context.Context, p *tmuxx.Plan) (*session.TmuxRef, error)
 	KillWindow(ctx context.Context, ref *session.TmuxRef) error

@@ -46,7 +46,7 @@ func RunJob(ctx context.Context, dataDir, jobID string, factory EndpointFactory,
 	if runErr != nil {
 		j.Outcome = "failed"
 		if p.sourceState() == session.StateRunning && p.Session.Registry != nil {
-			if terr := src.Thaw(context.Background(), p.Session.Registry.PID); terr != nil {
+			if terr := src.Thaw(context.Background(), p.Session.Registry.PID, p.Session.Tmux); terr != nil {
 				logf("thaw after failure: %v", terr)
 			} else {
 				logf("thawed source claude (pid %d) after failure", p.Session.Registry.PID)
