@@ -18,7 +18,20 @@ import (
 
 const teleportE2ESID = "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b"
 
-var builtTeleportExe string
+var builtTeleportExe, builtTeleportExeDir string
+
+// TestMain removes the build directory buildTeleportExe fills in: the
+// binary is cached for the whole test binary (see the comment below), so
+// no single test's t.Cleanup can remove it and it would otherwise be left
+// behind in the system temp directory by every run (finding A19). PATH is
+// not touched here — the callers use t.Setenv, which testing restores.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if builtTeleportExeDir != "" {
+		os.RemoveAll(builtTeleportExeDir)
+	}
+	os.Exit(code)
+}
 
 // buildTeleportExe builds cmd/claude-teleport once per test binary; the
 // real orchestrate.RunJob path is only reachable through a real process
@@ -42,6 +55,7 @@ func buildTeleportExe(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("mkdir for claude-teleport build: %v", err)
 	}
+	builtTeleportExeDir = dir
 	out := filepath.Join(dir, "claude-teleport")
 	cmd := exec.Command("go", "build", "-o", out, "github.com/mithro/go-claude-teleport/cmd/claude-teleport")
 	if out, err := cmd.CombinedOutput(); err != nil {

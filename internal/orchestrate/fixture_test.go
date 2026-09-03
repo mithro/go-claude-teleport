@@ -114,10 +114,30 @@ func (h *host) refreshProbe(t *testing.T) {
 	h.ep = remote.NewLocal(h.paths, selfExe(t), o)
 }
 
-var builtExe string
+var builtExe, builtExeDir string
+
+// TestMain removes the build directory selfExe fills in and restores the
+// PATH it prepended. Both are process-wide by necessity — the built
+// binaries are cached for the whole test binary, so no single test's
+// t.Cleanup may remove them — which is exactly why the teardown belongs
+// here rather than nowhere (finding A19). No test in this package runs in
+// parallel, so the unsynchronised cache below is safe as written.
+func TestMain(m *testing.M) {
+	oldPath, hadPath := os.LookupEnv("PATH")
+	code := m.Run()
+	if builtExeDir != "" {
+		os.RemoveAll(builtExeDir)
+		if hadPath {
+			os.Setenv("PATH", oldPath)
+		} else {
+			os.Unsetenv("PATH")
+		}
+	}
+	os.Exit(code)
+}
 
 // selfExe builds cmd/claude-teleport once per test binary and puts it and
-// test/fakeclaude (as `claude`) on PATH.
+// test/fakeclaude (as `claude`) on PATH. TestMain above undoes both.
 func selfExe(t *testing.T) string {
 	t.Helper()
 	if builtExe != "" {
@@ -127,6 +147,7 @@ func selfExe(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	builtExeDir = dir
 	for _, b := range [][2]string{{"claude-teleport", "github.com/mithro/go-claude-teleport/cmd/claude-teleport"}, {"claude", "github.com/mithro/go-claude-teleport/test/fakeclaude"}} {
 		cmd := exec.Command("go", "build", "-o", filepath.Join(dir, b[0]), b[1])
 		if out, err := cmd.CombinedOutput(); err != nil {
