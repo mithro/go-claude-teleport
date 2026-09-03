@@ -36,6 +36,28 @@ func (c Class) String() string {
 
 func (c Class) MarshalJSON() ([]byte, error) { return json.Marshal(c.String()) }
 
+// UnmarshalJSON is MarshalJSON's inverse: without it, any *Plan carrying a
+// drift Difference fails to round-trip through the job journal (PlanFromJournal
+// decodes what ToJSON wrote) — every real teleport with drift diffs, and not
+// only the "block" ones, persists Class as a string once per journal write.
+func (c *Class) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return fmt.Errorf("claudecfg.Class: %w", err)
+	}
+	switch s {
+	case "block":
+		*c = Block
+	case "warn":
+		*c = Warn
+	case "info":
+		*c = Info
+	default:
+		return fmt.Errorf("claudecfg.Class: unknown class %q", s)
+	}
+	return nil
+}
+
 // Difference is one row of the drift table.
 type Difference struct {
 	Class  Class  `json:"class"`
