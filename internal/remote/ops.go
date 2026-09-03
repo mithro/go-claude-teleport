@@ -52,6 +52,7 @@ const (
 	OpCleanup         = "cleanup"
 	OpListSessions    = "list-sessions"
 	OpDeleteInstalled = "delete-installed"
+	OpRemoveJob       = "remove-job"
 )
 
 type HelloArgs struct {

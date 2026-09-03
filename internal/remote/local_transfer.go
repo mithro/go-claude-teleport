@@ -78,6 +78,16 @@ func (l *Local) Cleanup(ctx context.Context, jobID string) error {
 	return os.RemoveAll(l.stagingDir(jobID))
 }
 
+// RemoveJob removes jobs/<jobID>/ entirely (manifest.json, extras.json,
+// job.json, ...) — unlike Cleanup, which only removes staging/<jobID>/.
+// Local itself applies no restriction on jobID (it is the low-level
+// primitive); the "inspect-" prefix safety check lives in the wire
+// dispatch handler (ops_plan03.go), the one place this is reachable from
+// outside this process.
+func (l *Local) RemoveJob(ctx context.Context, jobID string) error {
+	return os.RemoveAll(l.jobDir(jobID))
+}
+
 // DeleteInstalled removes the manifest entries named by ids from this
 // host's filesystem when their current content still matches the
 // manifest's hash (transfer.UninstallIDs) — the destination side of

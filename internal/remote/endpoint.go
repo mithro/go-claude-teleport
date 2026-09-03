@@ -46,6 +46,13 @@ type Endpoint interface {
 	// (spec §7.4/abandon --delete-destination-files); see
 	// transfer.UninstallIDs for the containment and hash-check semantics.
 	DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids []int) ([]string, error)
+	// RemoveJob removes jobs/<jobID>/ (manifest.json, extras.json, ...)
+	// entirely — unlike Cleanup, which only removes staging. Ruling
+	// R-P3-23i: this exists so inspect --host's throwaway job dir does
+	// not linger on the destination forever; the wire dispatch handler
+	// (not Local) refuses any jobID not prefixed "inspect-", so a real
+	// job's directory can never be removed this way.
+	RemoveJob(ctx context.Context, jobID string) error
 
 	// processes and panes
 	Freeze(ctx context.Context, pid int, startTime string) error

@@ -3,6 +3,7 @@ package remote
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/mithro/go-claude-teleport/internal/gitx"
 	"github.com/mithro/go-claude-teleport/internal/session"
@@ -71,6 +72,9 @@ type (
 	}
 	tmuxSessionsResult struct {
 		Sessions []tmuxx.SessionInfo `json:"sessions"`
+	}
+	removeJobArgs struct {
+		JobID string `json:"job_id"`
 	}
 )
 
@@ -157,6 +161,20 @@ var plan03Ops = map[string]handler{
 		deleted, err := ep.DeleteInstalled(ctx, v.Manifest, v.IDs)
 		return deleteInstalledResult{Deleted: deleted}, err
 	},
+	// R-P3-23i: the ONLY jobs a remote peer may ever ask this host to
+	// remove entirely are inspect --host's own throwaway ones — a real
+	// job's jobs/<id>/ (manifest.json, journal, ...) must never be
+	// reachable this way, however the caller was mistaken or compromised.
+	OpRemoveJob: func(ctx context.Context, ep Endpoint, a json.RawMessage) (any, error) {
+		v, err := decode[removeJobArgs](a)
+		if err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(v.JobID, "inspect-") {
+			return nil, &Error{Code: "usage", Message: "remove-job: refusing to remove " + v.JobID + " (only inspect-<id> throwaway jobs are removable this way)"}
+		}
+		return Empty{}, ep.RemoveJob(ctx, v.JobID)
+	},
 }
 
 // ---- Client side -------------------------------------------------------
@@ -231,4 +249,8 @@ func (c *Client) DeleteInstalled(ctx context.Context, m *transfer.Manifest, ids 
 		return nil, err
 	}
 	return out.Deleted, nil
+}
+
+func (c *Client) RemoveJob(ctx context.Context, jobID string) error {
+	return c.call(ctx, OpRemoveJob, removeJobArgs{JobID: jobID}, nil)
 }
