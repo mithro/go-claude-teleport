@@ -5,7 +5,9 @@
 package sshtest
 
 import (
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/pem"
@@ -20,6 +22,23 @@ import (
 func GenKey(t testing.TB) (ssh.Signer, ssh.PublicKey) {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signer, signer.PublicKey()
+}
+
+// GenECDSAKey makes a fresh P-256 ECDSA key pair (ssh-type
+// ecdsa-sha2-nistp256) — used alongside GenKey to give a test server two
+// host keys of different types (HK-1: known_hosts host-key-algorithm
+// preference needs at least two types to distinguish).
+func GenECDSAKey(t testing.TB) (ssh.Signer, ssh.PublicKey) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}

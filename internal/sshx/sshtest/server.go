@@ -22,6 +22,12 @@ type Options struct {
 	Authorized []ssh.PublicKey   // keys accepted for any user
 	Exec       ExecFunc          // nil = every exec exits 127 with "exec not configured"
 	Resolver   map[string]string // name -> "127.0.0.1:port" for direct-tcpip; nil = refuse all
+	// HostKeys, when set, replaces the single generated ed25519 host key
+	// with this list — e.g. an ed25519 signer plus GenECDSAKey's ecdsa
+	// signer, so a client's negotiated host-key algorithm can be observed
+	// (HK-1: known_hosts host-key-algorithm preference). nil (the default)
+	// keeps the original single-key behaviour.
+	HostKeys []ssh.Signer
 	// SilentGlobalRequests reads global requests (keepalives) and never
 	// answers them: a server that is up but has stopped responding.
 	SilentGlobalRequests bool
@@ -36,7 +42,11 @@ type Options struct {
 // Server is a running in-process ssh server bound to 127.0.0.1.
 type Server struct {
 	Addr    string
-	HostKey ssh.PublicKey
+	HostKey ssh.PublicKey // first host key (back-compat: every existing test has exactly one)
+
+	// HostKeys lists every host key the server offers, same order as
+	// Options.HostKeys (or a single generated ed25519 key when unset).
+	HostKeys []ssh.PublicKey
 
 	ln     net.Listener
 	config *ssh.ServerConfig
@@ -51,11 +61,15 @@ type Server struct {
 // New starts a server; it is closed by t.Cleanup.
 func New(t testing.TB, o Options) *Server {
 	t.Helper()
-	hostSigner, hostPub := GenKey(t)
+	signers := o.HostKeys
+	if len(signers) == 0 {
+		hostSigner, _ := GenKey(t)
+		signers = []ssh.Signer{hostSigner}
+	}
 	if o.Logf == nil {
 		o.Logf = t.Logf
 	}
-	s := &Server{HostKey: hostPub, opts: o}
+	s := &Server{opts: o}
 	s.config = &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			for _, k := range o.Authorized {
@@ -69,7 +83,11 @@ func New(t testing.TB, o Options) *Server {
 			return nil, fmt.Errorf("sshtest: key not authorized for %q", conn.User())
 		},
 	}
-	s.config.AddHostKey(hostSigner)
+	for _, signer := range signers {
+		s.config.AddHostKey(signer)
+		s.HostKeys = append(s.HostKeys, signer.PublicKey())
+	}
+	s.HostKey = s.HostKeys[0]
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

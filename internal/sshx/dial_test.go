@@ -131,6 +131,101 @@ func TestStartStreamsAndClose(t *testing.T) {
 	pty.Close()
 }
 
+// TestDialPrefersHostKeyAlgorithmAlreadyInKnownHosts is the regression test
+// for HK-1 (real-world bug: `doctor ten64.example` failed with a host key
+// mismatch even though `ssh ten64.example` worked fine). x/crypto/ssh's
+// default ClientConfig.HostKeyAlgorithms tries ecdsa-sha2-nistp256 before
+// ssh-ed25519 (common.go's defaultHostKeyAlgos); OpenSSH instead orders
+// HostKeyAlgorithms so that types already present in known_hosts go first.
+// A server offering BOTH key types must therefore negotiate the ed25519 one
+// when known_hosts only has an ed25519 entry for it — without the fix, the
+// unpatched default order gets the server to offer ecdsa first, and the
+// (correct, by itself) mismatch refusal in hostKeyCallback fires.
+func TestDialPrefersHostKeyAlgorithmAlreadyInKnownHosts(t *testing.T) {
+	home, pub := testHome(t)
+	edSigner, edPub := sshtest.GenKey(t)
+	ecSigner, _ := sshtest.GenECDSAKey(t)
+	srv := sshtest.New(t, sshtest.Options{
+		Authorized: []ssh.PublicKey{pub},
+		Exec:       echoExec,
+		HostKeys:   []ssh.Signer{edSigner, ecSigner},
+	})
+	host, port := hostPort(t, srv.Addr)
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+	// known_hosts has ONLY the ed25519 entry — no ecdsa entry at all.
+	os.WriteFile(kh, []byte(sshtest.KnownHostsLine(knownHostsName(host, port), edPub)), 0o600)
+
+	r := Resolved{Target: Target{User: "alice", Host: host, Port: port}, HostName: host}
+	c, err := Dial(context.Background(), r, nil, nil, Options{KnownHostsFile: kh, Home: home, Logf: t.Logf, ConnectTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("Dial must prefer the ed25519 algorithm already in known_hosts: %v", err)
+	}
+	defer c.Close()
+}
+
+// TestDialAcceptNewWithMultipleServerHostKeysAddsOneUnhashedLine is HK-1's
+// accept-new case: known_hosts lists NEITHER key type yet, so there is
+// nothing to prefer and the default HostKeyAlgorithms order applies —
+// whichever type the server ends up offering first is accepted (accept-new)
+// and exactly one unhashed line is appended, same as the single-host-key
+// behaviour already covered by TestHostKeyAcceptNewAppendsUnhashed.
+func TestDialAcceptNewWithMultipleServerHostKeysAddsOneUnhashedLine(t *testing.T) {
+	home, pub := testHome(t)
+	edSigner, _ := sshtest.GenKey(t)
+	ecSigner, _ := sshtest.GenECDSAKey(t)
+	srv := sshtest.New(t, sshtest.Options{
+		Authorized: []ssh.PublicKey{pub},
+		Exec:       echoExec,
+		HostKeys:   []ssh.Signer{edSigner, ecSigner},
+	})
+	host, port := hostPort(t, srv.Addr)
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+
+	r := Resolved{Target: Target{User: "alice", Host: host, Port: port}, HostName: host}
+	c, err := Dial(context.Background(), r, nil, nil, Options{
+		KnownHostsFile: kh, Home: home, Logf: t.Logf, ConnectTimeout: 5 * time.Second,
+		StrictHostKey: "accept-new",
+	})
+	if err != nil {
+		t.Fatalf("accept-new first contact with two server host keys: %v", err)
+	}
+	defer c.Close()
+	data, err := os.ReadFile(kh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("known_hosts lines = %v, want exactly 1", lines)
+	}
+}
+
+// TestDialWrongOfferedKeyStillRefused is HK-1's negative case: even once
+// HostKeyAlgorithms is steered toward the type already in known_hosts, a
+// WRONG key of that same type must still be refused with the mismatch
+// message (the fix must never weaken the actual key comparison, only the
+// algorithm preference used to pick which key gets compared).
+func TestDialWrongOfferedKeyStillRefused(t *testing.T) {
+	home, pub := testHome(t)
+	edSigner, _ := sshtest.GenKey(t)
+	ecSigner, _ := sshtest.GenECDSAKey(t)
+	_, wrongEd := sshtest.GenKey(t) // a DIFFERENT ed25519 key than the server's
+	srv := sshtest.New(t, sshtest.Options{
+		Authorized: []ssh.PublicKey{pub},
+		Exec:       echoExec,
+		HostKeys:   []ssh.Signer{edSigner, ecSigner},
+	})
+	host, port := hostPort(t, srv.Addr)
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+	os.WriteFile(kh, []byte(sshtest.KnownHostsLine(knownHostsName(host, port), wrongEd)), 0o600)
+
+	r := Resolved{Target: Target{User: "alice", Host: host, Port: port}, HostName: host}
+	_, err := Dial(context.Background(), r, nil, nil, Options{KnownHostsFile: kh, Home: home, Logf: t.Logf, ConnectTimeout: 5 * time.Second})
+	if err == nil || !strings.Contains(err.Error(), "mismatch") {
+		t.Fatalf("err = %v, want a host key mismatch", err)
+	}
+}
+
 func TestDialUnknownHostRefused(t *testing.T) {
 	home, pub := testHome(t)
 	srv := sshtest.New(t, sshtest.Options{Authorized: []ssh.PublicKey{pub}})
