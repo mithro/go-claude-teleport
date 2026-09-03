@@ -1010,3 +1010,68 @@ func TestDiffTreatsThisJobsOwnRootAsInstallable(t *testing.T) {
 		t.Errorf("entry 1 (not yet placed, same root) = %s, want %s", st[1], StagedSame)
 	}
 }
+
+// TestInstallGrantsTrustAtTheMainRepoPath is ruling R-P3-TRUST-1 item 1's
+// destination half: when the source's session was trusted under a path
+// that is NOT the session cwd (a linked worktree's main repository), the
+// destination must grant the trust dialog at that mapped path — the one
+// the destination's Claude Code will actually consult — before the start
+// step ever types `claude --resume`.
+func TestInstallGrantsTrustAtTheMainRepoPath(t *testing.T) {
+	m, staging, p := staged(t)
+	st, _ := Diff(context.Background(), m, staging, p)
+	main := filepath.Join(p.Home, "repo")
+	extra := InstallExtras{
+		ProjectCwd:    filepath.Join(main, ".worktrees", "x"),
+		TrustCwd:      main,
+		SourceTrusted: true,
+	}
+	rep, err := Install(context.Background(), m, st, staging, p, extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.TrustGranted {
+		t.Error("TrustGranted = false, want the trust merged on the destination")
+	}
+	e, ok, err := session.ReadProjectEntry(p.GlobalJSON, main)
+	if err != nil || !ok || !session.TrustAccepted(e) {
+		t.Fatalf("projects[%q] = %+v (%v %v)", main, e, ok, err)
+	}
+	// Idempotent: a re-run (continue) grants nothing new. Everything is
+	// PresentSame by now, so the re-diff is what a continue really sees.
+	st2, _ := Diff(context.Background(), m, staging, p)
+	rep2, err := Install(context.Background(), m, st2, staging, p, extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep2.TrustGranted {
+		t.Error("TrustGranted = true on a second install: the grant must be idempotent")
+	}
+}
+
+// TestInstallRefusesTrustAtADangerousPath: TrustCwd is source-supplied, so
+// the destination never grants the trust dialog for its own home, config
+// dir or data dir however the manifest asks.
+func TestInstallRefusesTrustAtADangerousPath(t *testing.T) {
+	for _, bad := range []string{"", "relative/path", "/home/bob/../bob"} {
+		m, staging, p := staged(t)
+		st, _ := Diff(context.Background(), m, staging, p)
+		extra := InstallExtras{ProjectCwd: filepath.Join(p.Home, "work"), TrustCwd: bad, SourceTrusted: true}
+		if _, err := Install(context.Background(), m, st, staging, p, extra); err == nil {
+			t.Errorf("TrustCwd %q was accepted", bad)
+		}
+	}
+	for _, bad := range []func(p session.Paths) string{
+		func(p session.Paths) string { return p.Home },
+		func(p session.Paths) string { return p.ConfigDir },
+		func(p session.Paths) string { return p.DataDir },
+		func(p session.Paths) string { return "/" },
+	} {
+		m, staging, p := staged(t)
+		st, _ := Diff(context.Background(), m, staging, p)
+		extra := InstallExtras{ProjectCwd: filepath.Join(p.Home, "work"), TrustCwd: bad(p), SourceTrusted: true}
+		if _, err := Install(context.Background(), m, st, staging, p, extra); err == nil {
+			t.Errorf("TrustCwd %q was accepted", bad(p))
+		}
+	}
+}

@@ -153,3 +153,67 @@ func TestAddProjectEntry(t *testing.T) {
 		t.Fatal("no backup should be made when the file did not exist")
 	}
 }
+
+// TestTrustAcceptedReadsTheFlag pins the one field of a project entry the
+// teleport reads rather than copies: real Claude Code 2.1.259 records the
+// first-run trust dialog as projects.<cwd>.hasTrustDialogAccepted.
+func TestTrustAcceptedReadsTheFlag(t *testing.T) {
+	cases := []struct {
+		e    ProjectEntry
+		want bool
+	}{
+		{nil, false},
+		{ProjectEntry{}, false},
+		{ProjectEntry{"hasTrustDialogAccepted": false}, false},
+		{ProjectEntry{"hasTrustDialogAccepted": "true"}, false},
+		{ProjectEntry{"hasTrustDialogAccepted": true}, true},
+	}
+	for _, c := range cases {
+		if got := TrustAccepted(c.e); got != c.want {
+			t.Errorf("TrustAccepted(%v) = %v, want %v", c.e, got, c.want)
+		}
+	}
+}
+
+// TestGrantProjectTrust is ruling R-P3-TRUST-1 item 1: the destination has
+// to be able to grant the trust dialog for a cwd whose project entry it
+// may or may not already have — without touching anything else in the
+// file, and idempotently (a second call changes nothing).
+func TestGrantProjectTrust(t *testing.T) {
+	g := copyFixture(t, ".claude.json")
+	// absent entry: created carrying nothing but the trust flag
+	granted, err := GrantProjectTrust(g, "/home/bob/w")
+	if err != nil || !granted {
+		t.Fatalf("absent cwd: %v %v", granted, err)
+	}
+	e, ok, err := ReadProjectEntry(g, "/home/bob/w")
+	if err != nil || !ok || !TrustAccepted(e) || len(e) != 1 {
+		t.Fatalf("entry = %+v (%v %v)", e, ok, err)
+	}
+	// already granted: no-op
+	if granted, err := GrantProjectTrust(g, "/home/bob/w"); err != nil || granted {
+		t.Fatalf("second call: %v %v", granted, err)
+	}
+	// present but not trusted: only the flag changes, the rest survives
+	before := mustRead(t, g)
+	if _, err := os.Stat(g + ".claude-teleport.bak"); err != nil {
+		t.Fatal("backup missing")
+	}
+	untrusted := filepath.Join(t.TempDir(), ".claude.json")
+	if err := os.WriteFile(untrusted, []byte(`{"projects":{"/home/bob/w":{"hasTrustDialogAccepted":false,"allowedTools":["Bash"]}},"numStartups":12}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if granted, err := GrantProjectTrust(untrusted, "/home/bob/w"); err != nil || !granted {
+		t.Fatalf("untrusted cwd: %v %v", granted, err)
+	}
+	e, _, err = ReadProjectEntry(untrusted, "/home/bob/w")
+	if err != nil || !TrustAccepted(e) || len(e["allowedTools"].([]any)) != 1 {
+		t.Fatalf("entry = %+v (%v)", e, err)
+	}
+	if raw := mustRead(t, untrusted); !strings.Contains(raw, `"numStartups": 12`) {
+		t.Errorf("the rest of the file must survive:\n%s", raw)
+	}
+	if before == "" {
+		t.Fatal("fixture read back empty")
+	}
+}

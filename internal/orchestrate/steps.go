@@ -342,7 +342,7 @@ func (r *runner) verifyInstall(ctx context.Context) (bool, error) {
 	// the transcript itself — is already confirmed PresentSame by the
 	// loop above) and needs no path rewriting (an empty PathMap): we are
 	// reading dest-native state, not producing something to send.
-	if r.p.Extras != nil && (r.p.Extras.IndexEntry != nil || len(r.p.Extras.ProjectEntry) > 0 || len(r.p.Extras.History) > 0) {
+	if r.p.Extras != nil && (r.p.Extras.IndexEntry != nil || len(r.p.Extras.ProjectEntry) > 0 || len(r.p.Extras.History) > 0 || r.p.Extras.SourceTrusted) {
 		de, err := r.dst.SessionExtras(ctx, r.id(), session.PathMap{})
 		if err != nil {
 			return false, err
@@ -351,6 +351,14 @@ func (r *runner) verifyInstall(ctx context.Context) (bool, error) {
 			return false, nil
 		}
 		if len(r.p.Extras.ProjectEntry) > 0 && len(de.ProjectEntry) == 0 {
+			return false, nil
+		}
+		// R-P3-TRUST-1 item 1: the trust the source carried must have
+		// reached the destination's own global config before start types
+		// `claude --resume` — de is the DESTINATION's own reading of it
+		// (its cwd's entry, or its main repository's for a linked
+		// worktree), so this is reality, not a journal claim.
+		if r.p.Extras.SourceTrusted && !de.SourceTrusted {
 			return false, nil
 		}
 		// history.jsonl: session.AppendHistory dedups by timestamp+
@@ -398,8 +406,11 @@ func (r *runner) runInstall(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	r.logf("install: %d installed, %d already present, %d fast-forwarded, index merged %d, history +%d, project entry added %v, memory copied %d (differs %d)",
-		rep.Installed, rep.SkippedSame, rep.FastForwarded, rep.IndexMerged, rep.HistoryAdded, rep.ProjectEntryAdded, len(rep.MemoryCopied), len(rep.MemoryDiffers))
+	r.logf("install: %d installed, %d already present, %d fast-forwarded, index merged %d, history +%d, project entry added %v, trust granted %v, memory copied %d (differs %d)",
+		rep.Installed, rep.SkippedSame, rep.FastForwarded, rep.IndexMerged, rep.HistoryAdded, rep.ProjectEntryAdded, rep.TrustGranted, len(rep.MemoryCopied), len(rep.MemoryDiffers))
+	if r.p.Extras != nil && r.p.Extras.SourceTrusted {
+		r.logf("install: the source's accepted trust dialog now covers %s on %s", r.p.Extras.TrustCwd, r.p.DestInfo.Hostname)
+	}
 	for _, m := range rep.MemoryDiffers {
 		r.logf("install: memory file differs on the destination and was left alone: %s", m)
 	}
