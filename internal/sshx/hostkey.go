@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	skeemaknownhosts "github.com/skeema/knownhosts"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -88,4 +89,34 @@ func hostKeyCallback(knownHostsFile, strict string, logf func(string, ...any)) (
 		logf("added %s (%s) to %s", hostname, ssh.FingerprintSHA256(key), knownHostsFile)
 		return nil
 	}, nil
+}
+
+// hostKeyAlgorithms returns the host-key algorithm(s) knownHostsFile already
+// has recorded for hostWithPort, oldest/first-added entry first (HK-1).
+//
+// x/crypto/ssh.ClientConfig.HostKeyAlgorithms defaults to a fixed
+// preference order (ecdsa before ed25519 among others) applied no matter
+// what known_hosts holds; the server then offers whichever algorithm the
+// client asked for first, and a host whose known_hosts entry is an older
+// key type than that default prefers gets refused as a "mismatch" even
+// though the offered AND the known key are both genuinely the host's own
+// (real bug: `doctor ten64.example` failed this way while `ssh
+// ten64.example` — which orders HostKeyAlgorithms by what's already known —
+// worked). OpenSSH avoids this by trying known types first; this mirrors
+// that using github.com/skeema/knownhosts, a thin wrapper the project
+// already depends on (via go-git) for exactly this lookup.
+//
+// A missing/unreadable known_hosts file or a host with no entry yet (the
+// accept-new first-contact case) returns nil: the caller then leaves
+// ClientConfig.HostKeyAlgorithms unset, so x/crypto/ssh's own default order
+// applies, unchanged.
+func hostKeyAlgorithms(knownHostsFile, hostWithPort string) []string {
+	if knownHostsFile == "" {
+		return nil
+	}
+	db, err := skeemaknownhosts.NewDB(knownHostsFile)
+	if err != nil {
+		return nil
+	}
+	return db.HostKeyAlgorithms(hostWithPort)
 }
