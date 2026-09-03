@@ -254,3 +254,52 @@ func TestTmuxField(t *testing.T) {
 	io.WriteString(stdin, "/exit\n")
 	c.Wait()
 }
+
+// TestRegistryEntrypoint pins what real Claude Code 2.1.247/2.1.259 write
+// (captured by the layer-2 suite, task-26-report.md): "kind" is
+// "interactive" for BOTH an interactive session and a `-p` run, and only
+// "entrypoint" tells them apart — "cli" vs "sdk-cli". internal/remote's
+// ConfirmClaude gates spec §6.2 case 3 on exactly that field, so the fake
+// has to be faithful about it. The print-mode half reads the registry from
+// inside the run itself (the entry is removed the moment `-p` finishes),
+// using the same FAKECLAUDE_RUN_CHILD hook TestRunChild uses.
+func TestRegistryEntrypoint(t *testing.T) {
+	e := setup(t)
+	c := e.cmd(t, nil, "--session-id", sid)
+	stdin, _ := c.StdinPipe()
+	c.Stdout, c.Stderr = io.Discard, os.Stderr
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { c.Process.Kill(); c.Wait() }()
+	var r session.Registry
+	waitFor(t, "registry idle", func() bool {
+		var ok bool
+		r, ok = registry(e, c.Process.Pid)
+		return ok && r.Status == "idle"
+	})
+	if r.Kind != "interactive" || r.Entrypoint != "cli" {
+		t.Errorf("interactive registry kind=%q entrypoint=%q, want interactive/cli", r.Kind, r.Entrypoint)
+	}
+	io.WriteString(stdin, "/exit\n")
+	c.Wait()
+
+	snap := filepath.Join(t.TempDir(), "registry.json")
+	psid := "3f9c2b7e-5a14-4d8e-9b21-7c0e5d6a8f14"
+	out, err := e.cmd(t, []string{"FAKECLAUDE_RUN_CHILD=cp \"$CLAUDE_CONFIG_DIR/sessions/$CLAUDE_PID.json\" " + snap},
+		"-p", "hello", "--session-id", psid).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	data, err := os.ReadFile(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pr session.Registry
+	if err := json.Unmarshal(data, &pr); err != nil {
+		t.Fatal(err)
+	}
+	if pr.Kind != "interactive" || pr.Entrypoint != "sdk-cli" {
+		t.Errorf("print-mode registry kind=%q entrypoint=%q, want interactive/sdk-cli: %s", pr.Kind, pr.Entrypoint, data)
+	}
+}

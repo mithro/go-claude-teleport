@@ -39,25 +39,32 @@ type Registry struct {
 	ProcStart string `json:"procStart"` // string OR number in the file; normalised to string
 	Version   string `json:"version"`
 	Kind      string `json:"kind"`
-	Status    string `json:"status"` // "busy" | "idle"
-	Tmux      string `json:"tmux"`   // "<session>:@<win>.%<pane>" or ""
-	Name      string `json:"name"`
-	UpdatedAt int64  `json:"updatedAt"`
-	File      string `json:"-"` // path it was read from
+	// Entrypoint is how the session was launched: "cli" for a terminal
+	// session, "sdk-cli" for a `claude -p` (print/programmatic) run.
+	// Verified against real Claude Code 2.1.247 and 2.1.259 (task-26):
+	// "kind" is "interactive" for BOTH, so this is the only field that
+	// tells a print run apart.
+	Entrypoint string `json:"entrypoint"`
+	Status     string `json:"status"` // "busy" | "idle"
+	Tmux       string `json:"tmux"`   // "<session>:@<win>.%<pane>" or ""
+	Name       string `json:"name"`
+	UpdatedAt  int64  `json:"updatedAt"`
+	File       string `json:"-"` // path it was read from
 }
 
 // registryFile is the on-disk shape; procStart may be a string or a number.
 type registryFile struct {
-	PID       int             `json:"pid"`
-	SessionID string          `json:"sessionId"`
-	Cwd       string          `json:"cwd"`
-	ProcStart json.RawMessage `json:"procStart"`
-	Version   string          `json:"version"`
-	Kind      string          `json:"kind"`
-	Status    string          `json:"status"`
-	Tmux      string          `json:"tmux"`
-	Name      string          `json:"name"`
-	UpdatedAt int64           `json:"updatedAt"`
+	PID        int             `json:"pid"`
+	SessionID  string          `json:"sessionId"`
+	Cwd        string          `json:"cwd"`
+	ProcStart  json.RawMessage `json:"procStart"`
+	Version    string          `json:"version"`
+	Kind       string          `json:"kind"`
+	Entrypoint string          `json:"entrypoint"`
+	Status     string          `json:"status"`
+	Tmux       string          `json:"tmux"`
+	Name       string          `json:"name"`
+	UpdatedAt  int64           `json:"updatedAt"`
 }
 
 // ReadRegistryFile reads one sessions/<pid>.json. *.key files are never opened.
@@ -78,7 +85,7 @@ func ReadRegistryFile(path string) (Registry, error) {
 		return Registry{}, fmt.Errorf("parse registry %s: %w", path, err)
 	}
 	return Registry{PID: f.PID, SessionID: f.SessionID, Cwd: f.Cwd, ProcStart: start, Version: f.Version,
-		Kind: f.Kind, Status: f.Status, Tmux: f.Tmux, Name: f.Name, UpdatedAt: f.UpdatedAt, File: path}, nil
+		Kind: f.Kind, Entrypoint: f.Entrypoint, Status: f.Status, Tmux: f.Tmux, Name: f.Name, UpdatedAt: f.UpdatedAt, File: path}, nil
 }
 
 // normaliseProcStart accepts a JSON string or number (older writers) and

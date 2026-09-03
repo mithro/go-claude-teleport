@@ -97,10 +97,12 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 	// registry entry on exit rather than looping back to a prompt — so
 	// success for one is declared once its transcript has grown past this
 	// call's own baseline size (evidence a turn actually completed) while
-	// status is "busy". See task-21-report.md for the disclosed
-	// detectability gap: whether a live registry entry's Kind reliably
-	// distinguishes a print run from an interactive one could not be
-	// verified against real Claude Code from here.
+	// status is "busy". T26-1 closed task-21-report.md's disclosed
+	// detectability gap by capturing real registry entries (Claude Code
+	// 2.1.247 and 2.1.259): "kind" is "interactive" for a print run and an
+	// interactive one alike, and the field that actually differs is
+	// "entrypoint" ("sdk-cli" for -p, "cli" for a terminal session), so
+	// that is what the acceptance below gates on.
 	// Baselined once, up front, rather than at the first busy+print
 	// sighting: the growth that matters is growth since this call began.
 	transcriptBaseline := int64(-1)
@@ -113,9 +115,9 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 	// burns the whole --start-timeout on a run that in fact succeeded.
 	// Remembering the print entry we DID see lets the same evidence (its
 	// transcript grew past the baseline) be accepted one poll late. Only a
-	// run seen to be print-kind qualifies: an interactive Claude whose
-	// entry disappears has not resumed, however much it wrote on the way
-	// down.
+	// run whose entrypoint said "sdk-cli" qualifies: an interactive Claude
+	// whose entry disappears has not resumed, however much it wrote on the
+	// way down.
 	var lastPrintReg *session.Registry
 
 	for {
@@ -156,7 +158,7 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 			last = fmt.Sprintf("registry pane %q is not our pane %q", reg.Tmux, wantTmux)
 		case reg.Status == "idle":
 			return reg, nil
-		case reg.Status == "busy" && strings.EqualFold(reg.Kind, "print"):
+		case reg.Status == "busy" && strings.EqualFold(reg.Entrypoint, "sdk-cli"):
 			lastPrintReg = reg
 			if n, terr := l.transcriptSize(id); terr == nil {
 				if transcriptBaseline < 0 {

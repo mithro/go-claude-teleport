@@ -202,13 +202,18 @@ func TestRealClaudeTmuxResumeWritesRegistry(t *testing.T) {
 // TestRealClaudePrintRegistryKind is controller requirement C's hard probe
 // (ledgered carry M5, internal/remote/local_claude.go's ConfirmClaude):
 // nothing in the codebase had verified what a real `claude -p` writes to
-// ~/.claude/sessions/<pid>.json while it is running. ConfirmClaude accepts
-// a "busy" status after a user turn only when the registry's "kind" field
-// equals "print" (case-insensitively). This test backgrounds a real
-// `claude -p` run and polls the registry as fast as the shell allows,
-// recording every distinct snapshot it observes plus the state immediately
-// after the process exits, then asserts the fact ConfirmClaude depends on:
-// any snapshot seen with status "busy" must have kind "print".
+// ~/.claude/sessions/<pid>.json while it is running. This test backgrounds
+// a real `claude -p` run and polls the registry as fast as the shell
+// allows, recording every distinct snapshot it observes plus the state
+// immediately after the process exits.
+//
+// The first run of this probe (task-26-report.md) established that "kind"
+// is "interactive" for a print run AND an interactive one — real Claude
+// Code has no "print" kind at all — and that "entrypoint" is the field
+// that differs ("sdk-cli" vs "cli"). ConfirmClaude was moved onto
+// "entrypoint" for that reason (T26-1), so this probe now asserts the fact
+// the tool actually depends on: any snapshot seen with status "busy" must
+// carry entrypoint "sdk-cli", and none of them may claim kind "print".
 func TestRealClaudePrintRegistryKind(t *testing.T) {
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -245,13 +250,13 @@ else
 fi
 `
 	out := sh(t, "source", "alice", script)
-	t.Logf("kind probe for sid %s:\n%s", sid, out)
+	t.Logf("entrypoint probe for sid %s:\n%s", sid, out)
 
 	// Assert the fact ConfirmClaude's gate depends on: every "busy"
-	// snapshot observed must carry kind "print". Parse each snapshot block
-	// (a JSON object) rather than doing a blind substring search, since a
-	// false negative here (missing a real "busy" snapshot) would silently
-	// under-report the finding.
+	// snapshot observed must carry entrypoint "sdk-cli". Parse each
+	// snapshot block (a JSON object) rather than doing a blind substring
+	// search, since a false negative here (missing a real "busy" snapshot)
+	// would silently under-report the finding.
 	var busySnapshots, printSnapshots int
 	for _, block := range strings.Split(out, "=== snapshot") {
 		if !strings.Contains(block, "{") {
@@ -263,26 +268,30 @@ fi
 			continue
 		}
 		var reg struct {
-			Status string `json:"status"`
-			Kind   string `json:"kind"`
+			Status     string `json:"status"`
+			Kind       string `json:"kind"`
+			Entrypoint string `json:"entrypoint"`
 		}
 		if err := json.Unmarshal([]byte(block[start:end+1]), &reg); err != nil {
-			t.Logf("kind probe: could not parse snapshot block: %v", err)
+			t.Logf("entrypoint probe: could not parse snapshot block: %v", err)
 			continue
+		}
+		if strings.EqualFold(reg.Kind, "print") {
+			t.Errorf(`a real claude -p run wrote kind=%q: real Claude Code was believed to have no "print" kind at all (task-26-report.md) — ConfirmClaude's gate may need revisiting`, reg.Kind)
 		}
 		if strings.EqualFold(reg.Status, "busy") {
 			busySnapshots++
-			t.Logf("kind probe: busy snapshot has kind=%q", reg.Kind)
-			if strings.EqualFold(reg.Kind, "print") {
+			t.Logf("entrypoint probe: busy snapshot has kind=%q entrypoint=%q", reg.Kind, reg.Entrypoint)
+			if strings.EqualFold(reg.Entrypoint, "sdk-cli") {
 				printSnapshots++
 			} else {
-				t.Errorf(`ConfirmClaude gates a "busy" print-mode turn on kind=="print" (internal/remote/local_claude.go), but a real claude -p run wrote status=busy with kind=%q`, reg.Kind)
+				t.Errorf(`ConfirmClaude gates a "busy" print-mode turn on entrypoint=="sdk-cli" (internal/remote/local_claude.go), but a real claude -p run wrote status=busy with entrypoint=%q (kind=%q)`, reg.Entrypoint, reg.Kind)
 			}
 		}
 	}
 	if busySnapshots == 0 {
-		t.Logf("kind probe: never observed a busy snapshot (the window between registration and completion may be too short to sample against this fakeapi's near-instant canned reply) — see the full transcript above for what WAS observed")
+		t.Logf("entrypoint probe: never observed a busy snapshot (the window between registration and completion may be too short to sample against this fakeapi's near-instant canned reply) — see the full transcript above for what WAS observed")
 	} else {
-		t.Logf("kind probe: observed %d busy snapshot(s), %d with kind=print", busySnapshots, printSnapshots)
+		t.Logf("entrypoint probe: observed %d busy snapshot(s), %d with entrypoint=sdk-cli", busySnapshots, printSnapshots)
 	}
 }

@@ -29,7 +29,7 @@ const defaultVersion = "2.1.247"
 type fake struct {
 	version, cfg, cwd, branch, sid, transcript, registry string
 	pid                                                  int
-	procStart, tmux                                      string
+	procStart, tmux, entrypoint                          string
 	startedAt                                            int64
 	lastUUID                                             string
 }
@@ -130,6 +130,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			"type": "permission-mode", "permissionMode": "default", "sessionId": f.sid, "timestamp": now(),
 		})
 	}
+	// Real Claude Code 2.1.247/2.1.259 write "kind":"interactive" for BOTH
+	// a terminal session and a `-p` run; the field that distinguishes them
+	// is "entrypoint" ("cli" vs "sdk-cli") — captured verbatim by the
+	// layer-2 suite (task-26-report.md), and what internal/remote's
+	// ConfirmClaude gates spec §6.2 case 3 on.
+	f.entrypoint = "cli"
+	if printMode {
+		f.entrypoint = "sdk-cli"
+	}
 	f.procStart, _ = procx.StartTime("/proc", f.pid)
 	f.startedAt = nowMS()
 	f.tmux = tmuxRef()
@@ -200,7 +209,7 @@ func (f *fake) writeRegistry(status string) error {
 	ts := nowMS()
 	rec := map[string]any{
 		"pid": f.pid, "sessionId": f.sid, "cwd": f.cwd, "startedAt": f.startedAt, "procStart": f.procStart,
-		"version": f.version, "kind": "interactive", "entrypoint": "cli", "tmux": f.tmux,
+		"version": f.version, "kind": "interactive", "entrypoint": f.entrypoint, "tmux": f.tmux,
 		"messagingSocketPath": filepath.Join(f.cfg, "sessions", strconv.Itoa(f.pid)+".sock"),
 		"name":                filepath.Base(f.cwd), "nameSource": "auto", "status": status, "updatedAt": ts, "statusUpdatedAt": ts,
 	}

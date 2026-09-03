@@ -34,15 +34,16 @@ func fakeProcRoot(t *testing.T, procs [][4]string) string {
 
 func writeRegistry(t *testing.T, p session.Paths, pid int, status, tmux string) {
 	t.Helper()
-	writeRegistryKind(t, p, pid, status, tmux, "interactive")
+	writeRegistryEntrypoint(t, p, pid, status, tmux, "cli")
 }
 
-// writeRegistryKind is writeRegistry with an explicit "kind" (M5: a `-p`
-// registry entry's kind, per fakeclaude's "interactive"/real Claude Code's
-// hypothesised "print" — see task-21-report.md's disclosed gap).
-func writeRegistryKind(t *testing.T, p session.Paths, pid int, status, tmux, kind string) {
+// writeRegistryEntrypoint is writeRegistry with an explicit "entrypoint"
+// (T26-1: "cli" for a terminal session, "sdk-cli" for a `claude -p` run).
+// "kind" is "interactive" either way, exactly as real Claude Code 2.1.247
+// and 2.1.259 write it — see task-26-report.md's captured samples.
+func writeRegistryEntrypoint(t *testing.T, p session.Paths, pid int, status, tmux, entrypoint string) {
 	t.Helper()
-	b, _ := json.Marshal(map[string]any{"pid": pid, "sessionId": sid, "cwd": "/home/alice/x", "procStart": "777", "version": "2.1.247", "kind": kind, "status": status, "tmux": tmux, "updatedAt": time.Now().UnixMilli()})
+	b, _ := json.Marshal(map[string]any{"pid": pid, "sessionId": sid, "cwd": "/home/alice/x", "procStart": "777", "version": "2.1.247", "kind": "interactive", "entrypoint": entrypoint, "status": status, "tmux": tmux, "updatedAt": time.Now().UnixMilli()})
 	// Atomic (temp file + rename) so a concurrent reader (e.g. ConfirmClaude's
 	// poll loop, especially with a no-op Sleep) never observes a partial
 	// write — plain os.WriteFile raced procx.RegistryForSession here.
@@ -155,7 +156,7 @@ func TestConfirmClaudeAcceptsBusyPrintModeAfterTurn(t *testing.T) {
 	if err := os.WriteFile(transcript, []byte(`{"type":"user"}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeRegistryKind(t, p, 5150, "busy", "", "print")
+	writeRegistryEntrypoint(t, p, 5150, "busy", "", "sdk-cli")
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -169,7 +170,7 @@ func TestConfirmClaudeAcceptsBusyPrintModeAfterTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err = %v, want the busy print-mode run to be accepted once its turn lands", err)
 	}
-	if reg.Status != "busy" || reg.Kind != "print" {
+	if reg.Status != "busy" || reg.Entrypoint != "sdk-cli" {
 		t.Errorf("reg = %+v", reg)
 	}
 }
@@ -184,7 +185,7 @@ func TestConfirmClaudeBusyPrintModeTimesOutWithoutATurn(t *testing.T) {
 	proj := filepath.Join(p.ProjectsDir(), "-home-alice-x")
 	os.MkdirAll(proj, 0o700)
 	os.WriteFile(filepath.Join(proj, sid+".jsonl"), []byte(`{"type":"user"}`+"\n"), 0o600)
-	writeRegistryKind(t, p, 5150, "busy", "", "print")
+	writeRegistryEntrypoint(t, p, 5150, "busy", "", "sdk-cli")
 	_, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 300*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "not confirmed within") {
 		t.Fatalf("err = %v, want a timeout", err)
@@ -397,13 +398,13 @@ func TestConfirmClaudeAcceptsPrintModeThatExitedBetweenPolls(t *testing.T) {
 		defer f.Close()
 		f.WriteString(`{"type":"assistant"}` + "\n")
 	}})
-	writeRegistryKind(t, p, 5150, "busy", "", "print")
+	writeRegistryEntrypoint(t, p, 5150, "busy", "", "sdk-cli")
 
 	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second)
 	if err != nil {
 		t.Fatalf("err = %v, want the finished print-mode run to be accepted", err)
 	}
-	if reg == nil || reg.Kind != "print" {
+	if reg == nil || reg.Entrypoint != "sdk-cli" {
 		t.Fatalf("reg = %+v, want the print run's own last registry entry", reg)
 	}
 }
@@ -432,9 +433,55 @@ func TestConfirmClaudeDoesNotAcceptAVanishedInteractiveRun(t *testing.T) {
 			f.Close()
 		}
 	}})
-	writeRegistryKind(t, p, 5150, "busy", "", "interactive")
+	writeRegistryEntrypoint(t, p, 5150, "busy", "", "cli")
 	_, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 300*time.Millisecond)
 	if err == nil || !strings.Contains(err.Error(), "not confirmed within") {
 		t.Fatalf("err = %v, want a timeout", err)
+	}
+}
+
+// TestConfirmClaudeAcceptsTheRealPrintModeRegistryEntry is T26-1, written
+// against the registry entry a REAL `claude -p` wrote (Claude Code 2.1.247,
+// captured verbatim by the layer-2 suite — task-26-report.md; 2.1.259 wrote
+// the same shape). Only pid/sessionId/procStart are substituted so the
+// fixture's /proc tree and session id line up; every other field, above all
+// "kind":"interactive" alongside "entrypoint":"sdk-cli", is exactly what
+// real Claude Code wrote. A print run is NOT distinguishable by "kind" —
+// interactive sessions carry the same value — so the spec §6.2 case-3
+// acceptance has to gate on "entrypoint".
+func TestConfirmClaudeAcceptsTheRealPrintModeRegistryEntry(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Sleep: func(time.Duration) {}})
+	proj := filepath.Join(p.ProjectsDir(), "-home-alice-x")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(proj, sid+".jsonl")
+	if err := os.WriteFile(transcript, []byte(`{"type":"user"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sample := `{"pid":5150,"sessionId":"` + sid + `","cwd":"/home/alice/x","startedAt":1788439163760,` +
+		`"procStart":"777","version":"2.1.247","peerProtocol":1,"peerFeatures":["notify_idle","artifact_yield"],` +
+		`"kind":"interactive","entrypoint":"sdk-cli","pidDomain":"linux:0","name":"proj-be",` +
+		`"nameSource":"derived","nameSince":1788439163770,"status":"busy"}`
+	if err := session.WriteFileAtomic(filepath.Join(p.SessionsDir(), "5150.json"), []byte(sample), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		f.WriteString(`{"type":"assistant"}` + "\n")
+	}()
+	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second)
+	if err != nil {
+		t.Fatalf("err = %v, want the real print-mode entry accepted once its turn lands", err)
+	}
+	if reg.Entrypoint != "sdk-cli" || reg.Kind != "interactive" {
+		t.Errorf("reg = %+v", reg)
 	}
 }
