@@ -187,6 +187,15 @@ func (a *app) spawnAndFollow(ctx context.Context, j *job.Journal, bang bool) int
 		return a.fail(fmt.Errorf("start runner: %w", err))
 	}
 	j.RunnerPID = pid
+	// The journal on disk may still say finished/failed from the run this
+	// one continues. The new runner clears that itself, but not before
+	// follow's first done() check can read it and report the OLD outcome
+	// without waiting for anything — seen for real in the Docker
+	// integration suite, where `continue` after a network drop exited 1
+	// the instant it started, its freshly spawned runner still connecting.
+	// Clearing it here, in the same Save that records the new runner's
+	// pid, closes that window: follow only ever runs after this.
+	j.Finished, j.Outcome = false, ""
 	if err := j.Save(); err != nil {
 		return a.fail(err)
 	}
