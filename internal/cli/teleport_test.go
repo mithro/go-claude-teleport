@@ -344,8 +344,20 @@ func TestContinueDerivesBangMode(t *testing.T) {
 	if err := os.WriteFile(at9Path, rawJ, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// The write is flock'd on the SAME <job dir>/.journal.lock path every
+	// real Journal.Save (and spawnAndFollow's SaveMerged) takes, exactly
+	// like a real runner's save would be. Without this the write races
+	// spawnAndFollow's own post-spawn save recording this runner's pid:
+	// under CPU contention that save can read the journal before this
+	// write lands and then write it back after, silently reverting it —
+	// reproduced locally, and the likely cause of this test's flake on
+	// GitHub's 2-CPU release runner (see job.SaveMerged's doc comment).
+	// j.Dir (not $2, which is only equal to it by convention and would
+	// anyway be unset inside flock -c's own nested shell) is baked in
+	// directly: it is already known here.
 	script := filepath.Join(dir, "runner.sh")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncp "+at9Path+" \"$2\"/job.json\nsleep 30\n"), 0o700); err != nil {
+	runnerScript := "#!/bin/sh\nflock " + j.Dir + "/.journal.lock -c 'cp " + at9Path + " " + j.Dir + "/job.json'\nsleep 30\n"
+	if err := os.WriteFile(script, []byte(runnerScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	a.selfExe = script
