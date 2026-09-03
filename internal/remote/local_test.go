@@ -446,3 +446,44 @@ func TestLocalNilPayloadsAreUsageErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestLocalManifestDiffAndInstallRejectMismatchedJobID covers ruling
+// R-P3-B1c minor 4: ManifestDiff/Install thread the caller's jobID
+// argument straight into stagingDir (job.StagingDir(DataDir, jobID)) and
+// jobDir, but transfer.Diff/transfer.Install's own destination re-checks
+// (canonicalCaptureDst, validateDst) derive their answers from m.JobID —
+// the manifest's OWN wire field, never cross-checked against the jobID
+// this call actually received. A source that sends a manifest whose JobID
+// names a DIFFERENT job than the one this RPC's jobID argument identifies
+// would have its capture/session checks computed against the wrong job's
+// directory. Local must refuse the mismatch itself, before ever touching
+// the (correct) job's staging or job directory.
+func TestLocalManifestDiffAndInstallRejectMismatchedJobID(t *testing.T) {
+	p := testPaths(t)
+	l := NewLocal(p, "self", LocalOptions{Logf: t.Logf})
+	m := sourceManifest(t, p) // m.JobID == sid
+	otherJobID := "other-job-id-not-sid"
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"manifest-diff", func() error { _, err := l.ManifestDiff(ctx, m, otherJobID); return err }},
+		{"install", func() error { _, err := l.Install(ctx, m, otherJobID); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			var re *Error
+			if !errors.As(err, &re) || re.Code != "usage" {
+				t.Fatalf("err = %v (%T), want a remote.Error with code usage", err, err)
+			}
+			if !strings.Contains(re.Message, m.JobID) || !strings.Contains(re.Message, otherJobID) {
+				t.Errorf("message = %q, want it to name both the manifest's JobID %q and the job %q", re.Message, m.JobID, otherJobID)
+			}
+		})
+	}
+	if _, err := os.Stat(job.Dir(p.DataDir, otherJobID)); !os.IsNotExist(err) {
+		t.Errorf("the mismatched job's directory must not have been created: err=%v", err)
+	}
+}

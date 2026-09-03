@@ -165,6 +165,9 @@ func (l *Local) ManifestDiff(ctx context.Context, m *transfer.Manifest, jobID st
 	if m == nil {
 		return nil, &Error{Code: "usage", Message: "manifest-diff: nil manifest"}
 	}
+	if m.JobID != jobID {
+		return nil, &Error{Code: "usage", Message: fmt.Sprintf("manifest-diff: manifest JobID %q does not match job %q", m.JobID, jobID)}
+	}
 	if err := os.MkdirAll(l.jobDir(jobID), 0o700); err != nil {
 		return nil, err
 	}
@@ -198,6 +201,9 @@ func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string)
 	}
 	if m == nil {
 		return nil, &Error{Code: "usage", Message: "install: nil manifest"}
+	}
+	if m.JobID != jobID {
+		return nil, &Error{Code: "usage", Message: fmt.Sprintf("install: manifest JobID %q does not match job %q", m.JobID, jobID)}
 	}
 	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID))
 	if err != nil {
