@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -95,11 +96,43 @@ func New(dataDir, id string) (*Journal, error) {
 	}, nil
 }
 
-// Save writes job.json atomically (temp file + rename) and bumps UpdatedAt.
+// lockPath is the advisory lock every Save (and SaveMerged) holds for its
+// critical section. Tests that stand in for a real runner by writing
+// job.json directly (bypassing Save) must flock this same path around
+// their write to stay correctly serialized against the app process — see
+// SaveMerged.
+func lockPath(dir string) string { return filepath.Join(dir, ".journal.lock") }
+
+// withLock runs fn with an exclusive advisory lock (flock) held on
+// <dir>/.journal.lock, serializing it against any other process's Save or
+// SaveMerged on the same job — including a runner and the CLI process
+// that spawned it recording that runner's pid, which otherwise race with
+// no ordering guarantee at all.
+func withLock(dir string, fn func() error) error {
+	lf, err := os.OpenFile(lockPath(dir), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("lock journal %s: %w", dir, err)
+	}
+	defer lf.Close()
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock journal %s: %w", dir, err)
+	}
+	defer syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+// Save writes job.json atomically (temp file + rename) and bumps UpdatedAt,
+// under the per-job lock (see withLock).
 func (j *Journal) Save() error {
 	if j.Dir == "" {
 		return errors.New("journal has no Dir")
 	}
+	return withLock(j.Dir, j.saveLocked)
+}
+
+// saveLocked is Save's body, run by both Save and SaveMerged from inside
+// withLock — never call it without the lock already held.
+func (j *Journal) saveLocked() error {
 	j.UpdatedAt = time.Now().UTC()
 	raw, err := json.MarshalIndent(j, "", "  ")
 	if err != nil {
@@ -133,6 +166,53 @@ func (j *Journal) Save() error {
 		return fmt.Errorf("save journal %s: %w", journalPath(j.Dir), err)
 	}
 	return nil
+}
+
+// SaveMerged locks dataDir/jobs/id, re-reads the journal fresh from disk,
+// applies mutate to that fresh copy and saves it — all inside the one
+// critical section. Use it instead of Open-then-Save whenever the caller
+// is not the process that owns the journal's progress (e.g. the CLI
+// process recording the pid of a runner it just spawned): a plain
+// Open-then-Save can read the journal, have the runner concurrently save
+// its own progress, and then overwrite that progress with the caller's
+// now-stale snapshot. Under CPU contention this is not merely
+// theoretical — it reproduces reliably (see internal/cli spawnAndFollow).
+//
+// This only protects fields SaveMerged itself amends: the journal's OWNER
+// (the runner, via its own plain Save calls) still does a blind
+// whole-journal write of its own continuously-held in-memory state, which
+// does not know about anything SaveMerged wrote. Today the only field the
+// CLI amends this way is RunnerPID, and it stays correct only because the
+// runner independently sets that SAME value itself (os.Getpid(), matching
+// the pid the CLI just spawned) as part of its own first Save — so a
+// runner Save landing after SaveMerged reverts nothing, it just reasserts
+// the identical value. Amending any OTHER field via SaveMerged in future,
+// one the runner does not also set, would be silently reverted by the
+// runner's next Save; that field would need the runner's cooperation too
+// (or its own dedicated file), not just a SaveMerged call here.
+//
+// flock is sufficient (rather than needing a distributed lock) because
+// the runner and the CLI process that spawned it are always on the same
+// host, sharing the same job directory on the same filesystem.
+func SaveMerged(dataDir, id string, mutate func(*Journal)) (*Journal, error) {
+	dir := Dir(dataDir, id)
+	var out *Journal
+	err := withLock(dir, func() error {
+		jj, ok, err := Open(dataDir, id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no journal at %s", journalPath(dir))
+		}
+		mutate(jj)
+		if err := jj.saveLocked(); err != nil {
+			return err
+		}
+		out = jj
+		return nil
+	})
+	return out, err
 }
 
 func (j *Journal) LogPath() string      { return filepath.Join(j.Dir, "log.txt") }
