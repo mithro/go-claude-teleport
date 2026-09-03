@@ -87,18 +87,13 @@ func (c *idleConn) Read(b []byte) (int, error) {
 func startKeepalive(cl *ssh.Client, interval time.Duration, count int, desc string, logf func(string, ...any)) func() {
 	stop := make(chan struct{})
 	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
 		missed := 0
 		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-			}
-			// The reply is waited for in a goroutine: SendRequest blocks
-			// until the peer answers or the connection breaks, and a peer
-			// that has stopped answering does neither.
+			// One request per interval, whatever happens to it — so count
+			// consecutive misses really do mean interval*count of silence.
+			// The reply is waited for in a goroutine because SendRequest
+			// blocks until the peer answers or the connection breaks, and a
+			// peer that has stopped answering does neither.
 			done := make(chan error, 1)
 			go func() {
 				_, _, err := cl.SendRequest("keepalive@openssh.com", true, nil)
@@ -108,14 +103,21 @@ func startKeepalive(cl *ssh.Client, interval time.Duration, count int, desc stri
 			case <-stop:
 				return
 			case err := <-done:
-				if err == nil {
+				if err != nil {
+					missed++
+					logf("keepalive to %s failed (%d/%d): %v", desc, missed, count, err)
+				} else {
 					missed = 0
-					continue
 				}
-				missed++
-				logf("keepalive to %s failed (%d/%d): %v", desc, missed, count, err)
-			case <-t.C:
-				missed++
+				if missed < count {
+					select { // answered early: wait out this interval
+					case <-stop:
+						return
+					case <-time.After(interval):
+					}
+				}
+			case <-time.After(interval):
+				missed++ // the wait itself was this interval: send again at once
 				logf("keepalive to %s unanswered after %s (%d/%d)", desc, interval, missed, count)
 			}
 			if missed >= count {
