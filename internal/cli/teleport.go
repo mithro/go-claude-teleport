@@ -254,25 +254,40 @@ func (a *app) spawnAndFollow(ctx context.Context, j *job.Journal, bang bool) int
 	// still carry the REPLACED run's status for it (carry 2). Only a
 	// change made by the runner we are about to start counts as evidence.
 	base := stepState(j, "thaw+exit")
-	pid, err := procx.SpawnDetached([]string{a.selfExe, "internal-runner", j.Dir}, "/", j.LogPath(), envSlice(a.env))
-	if err != nil {
-		return a.fail(fmt.Errorf("start runner: %w", err))
-	}
-	j.RunnerPID = pid
 	// The journal on disk may still say finished/failed from the run this
 	// one continues. The new runner clears that itself, but not before
 	// follow's first done() check can read it and report the OLD outcome
 	// without waiting for anything — seen for real in the Docker
 	// integration suite, where `continue` after a network drop exited 1
 	// the instant it started, its freshly spawned runner still connecting.
-	// Clearing it here, in the same Save that records the new runner's
-	// pid, closes that window: follow only ever runs after this.
+	// Clearing it here, strictly BEFORE the runner is spawned, closes that
+	// window without racing the runner's own writes (see below): follow
+	// only ever runs after this, and the runner only ever runs after this.
 	j.Finished, j.Outcome = false, ""
 	if err := j.Save(); err != nil {
 		return a.fail(err)
 	}
+	pid, err := procx.SpawnDetached([]string{a.selfExe, "internal-runner", j.Dir}, "/", j.LogPath(), envSlice(a.env))
+	if err != nil {
+		return a.fail(fmt.Errorf("start runner: %w", err))
+	}
 	a.logf("runner pid %d, log %s", pid, j.LogPath())
-	return a.follow(ctx, j, bang, base)
+	// Record RunnerPID via a locked merge (job.SaveMerged), not a plain
+	// Open-then-Save: the runner is already live the instant
+	// SpawnDetached returns and, under CPU contention, can reach its own
+	// first Save (e.g. step thaw+exit going Running) before this goroutine
+	// gets scheduled again. A plain Open-then-Save can read the journal
+	// BEFORE that save lands and then write it back AFTER, silently
+	// clobbering it — follow's !-mode bangDone check would then never
+	// observe the runner's progress, hanging until the ctx deadline
+	// (reproduced locally under CPU pressure; the likely cause of the
+	// TestContinueDerivesBangMode flake on GitHub's 2-CPU release runner).
+	// SaveMerged's lock rules that interleaving out.
+	jj, err := job.SaveMerged(a.paths.DataDir, j.ID, func(m *job.Journal) { m.RunnerPID = pid })
+	if err != nil {
+		return a.fail(err)
+	}
+	return a.follow(ctx, jj, bang, base)
 }
 
 // stepState reads a step's recorded state WITHOUT job.Journal.Step's
