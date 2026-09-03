@@ -641,3 +641,49 @@ func TestAbandonRetryDoesNotDuplicateHistoryRecord(t *testing.T) {
 		t.Errorf("history.jsonl has %d line(s) after abandon ran twice, want exactly 1:\n%s", lines, raw)
 	}
 }
+
+// TestAbandonRefusesFromTheJobsOtherEnd covers the deferred carry: a job
+// is driven from one side (the source for --to), and the plan's stored
+// target names the far end AS SEEN FROM THERE — so an abandon run on the
+// destination would re-dial that name from the wrong machine. Refuse with
+// a message naming the host to run it on, rather than dialling something
+// arbitrary.
+func TestAbandonRefusesFromTheJobsOtherEnd(t *testing.T) {
+	here, err := os.Hostname()
+	if err != nil || here == "" {
+		t.Skip("no hostname on this machine")
+	}
+	env, home := testEnv(t)
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	j, _ := job.New(dataDir, tsid)
+	j.Direction = "to"
+	p := &orchestrate.Plan{
+		Options:    orchestrate.Options{Direction: "to", Target: "dest.private"},
+		Session:    &session.Session{ID: session.ID(tsid)},
+		SourceInfo: remote.HostInfo{Hostname: "laptop.example"},
+		// This machine IS the job's destination: abandon belongs on the
+		// source, which drove the job.
+		DestInfo: remote.HostInfo{Hostname: here},
+	}
+	j.Plan, _ = p.ToJSON()
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, stderr := run(t, env, "abandon", tsid)
+	if code != ExitUsage {
+		t.Fatalf("abandon from the destination = %d, want %d: %s", code, ExitUsage, stderr)
+	}
+	for _, want := range []string{"laptop.example", "destination"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("the refusal must mention %q:\n%s", want, stderr)
+		}
+	}
+	got, _, err := job.Open(dataDir, tsid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Outcome == "abandoned" {
+		t.Error("a refused abandon must not mark the journal")
+	}
+}

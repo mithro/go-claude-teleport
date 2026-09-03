@@ -504,7 +504,7 @@ func (r *runner) runStart(ctx context.Context) error {
 		case err != nil:
 			return err
 		case !shells[st.Command]:
-			return fmt.Errorf("destination pane %s we opened earlier now runs %q; refusing to type over it", r.p.DestRef.PaneID, st.Command)
+			return fmt.Errorf("destination pane %s we opened earlier now runs %q; refusing to type over it — wait for that command to finish (or close the pane) and re-run `claude-teleport continue %s`", r.p.DestRef.PaneID, st.Command, r.p.JobID)
 		}
 	}
 	if r.p.DestRef == nil {

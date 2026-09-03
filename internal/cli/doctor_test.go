@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,7 +116,7 @@ func TestRemoteChecksSurfacesClaudeVersionErrAndListSessionsError(t *testing.T) 
 	paths := session.Paths{Home: home, ConfigDir: cfg, GlobalJSON: filepath.Join(home, ".claude.json"), DataDir: filepath.Join(home, ".local", "share", "claude-teleport"), ProcRoot: "/proc"}
 	ep := remote.NewLocal(paths, "x", remote.LocalOptions{ProcRoot: "/proc"})
 
-	cs, err := remoteChecks(context.Background(), ep, "bob@dest.example")
+	cs, _, err := remoteChecks(context.Background(), ep, "bob@dest.example")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,5 +135,42 @@ func TestRemoteChecksSurfacesClaudeVersionErrAndListSessionsError(t *testing.T) 
 	}
 	if sessOK || sessDetail == "" {
 		t.Errorf("remote sessions check = %q ok=%v, want the ListSessions error surfaced, not swallowed", sessDetail, sessOK)
+	}
+}
+
+// TestDoctorRemoteVersionMismatchIsUnreachable pins A12: `doctor <host>`
+// printed FAIL for a peer running a different claude-teleport and exited
+// 1 ("doctor found problems"), but spec §5 reserves exit 4 for a version
+// mismatch — the same code preflight and compare-config return for that
+// very peer, and the one a caller keys "you cannot work with this host"
+// off.
+func TestDoctorRemoteVersionMismatchIsUnreachable(t *testing.T) {
+	remoteEnv, _ := testEnv(t)
+	target, opts, localHome := remoteHostExec(t, func(cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+		p, err := envPaths(remoteEnv)
+		if err != nil {
+			io.WriteString(stderr, err.Error())
+			return 1
+		}
+		lopts, closeProbe := serverLocalOptions(context.Background(), remoteEnv, func(string, ...any) {})
+		defer closeProbe()
+		ep := &otherVersionEndpoint{Endpoint: remote.NewLocal(p, "claude-teleport", lopts), version: "0.0.0-other"}
+		if err := remote.Serve(context.Background(), stdin, stdout, ep); err != nil {
+			io.WriteString(stderr, err.Error())
+			return 1
+		}
+		return 0
+	})
+	cfg := filepath.Join(localHome, ".claude")
+	if err := os.MkdirAll(filepath.Join(cfg, "projects"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := harness.Env(t, localHome, cfg, "USER=alice")
+	code, out, stderr := run(t, env, append([]string{"doctor", target}, opts...)...)
+	if code != ExitUnreachable {
+		t.Fatalf("doctor against a mismatched peer = %d, want %d\n%s\n%s", code, ExitUnreachable, out, stderr)
+	}
+	if !strings.Contains(stderr, "0.0.0-other") {
+		t.Errorf("the failure must name the remote version:\n%s", stderr)
 	}
 }

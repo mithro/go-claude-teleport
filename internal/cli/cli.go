@@ -9,17 +9,21 @@ import (
 	"io"
 	"strings"
 
+	"github.com/mithro/go-claude-teleport/internal/orchestrate"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
-// Exit codes (spec §5).
+// Exit codes (spec §5). The three a job journal decides are orchestrate's
+// (ExitCode maps outcome -> code there); the rest are decided before or
+// outside any job. Re-exported, not re-numbered, so the numbers exist in
+// exactly one place (finding A13).
 const (
-	ExitOK          = 0
-	ExitFailed      = 1
+	ExitOK          = orchestrate.ExitOK
+	ExitFailed      = orchestrate.ExitFailed
 	ExitUsage       = 2
 	ExitRefused     = 3
 	ExitUnreachable = 4
-	ExitNotResumed  = 5
+	ExitNotResumed  = orchestrate.ExitNotResumed
 	ExitInterrupted = 6
 )
 

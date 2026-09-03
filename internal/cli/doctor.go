@@ -92,10 +92,10 @@ func sockDetail(sock string) string {
 // against an in-process Local standing in for "the remote host" (as the
 // rest of Plan 03 does), with the real ssh dial living entirely in
 // newDoctorCmd's RunE.
-func remoteChecks(ctx context.Context, ep remote.Endpoint, host string) ([]check, error) {
+func remoteChecks(ctx context.Context, ep remote.Endpoint, host string) ([]check, remote.HostInfo, error) {
 	hi, err := ep.Hello(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("hello %s: %w", host, err)
+		return nil, hi, fmt.Errorf("hello %s: %w", host, err)
 	}
 	var cs []check
 	cs = append(cs, check{"remote claude-teleport", fmt.Sprintf("%s (local %s)", hi.Version, version.Version), hi.Version == version.Version})
@@ -115,7 +115,7 @@ func remoteChecks(ctx context.Context, ep remote.Endpoint, host string) ([]check
 		sessDetail = lerr.Error()
 	}
 	cs = append(cs, check{"remote sessions", sessDetail, lerr == nil})
-	return cs, nil
+	return cs, hi, nil
 }
 
 // newDoctorCmd checks local prerequisites and, with a host, the same kind
@@ -151,11 +151,18 @@ func newDoctorCmd(a *app) *cobra.Command {
 					return exitErr(a.fail(err))
 				}
 				defer closeFn()
-				cs, err := remoteChecks(ctx, ep, host)
+				cs, hi, err := remoteChecks(ctx, ep, host)
 				if err != nil {
 					return Exit(ExitUnreachable, "%v", err)
 				}
 				print(cs)
+				// A version mismatch is exit 4, not 1 (spec §5, and what
+				// preflight/compare-config already return for the same
+				// peer): nothing the two hosts would do together can
+				// work, and it is not a local problem to fix (A12).
+				if hi.Version != version.Version {
+					return Exit(ExitUnreachable, "claude-teleport version mismatch: here %s, %s %s — install the same version on both hosts", version.Version, host, hi.Version)
+				}
 			}
 			if failed {
 				return Exit(ExitFailed, "doctor found problems")

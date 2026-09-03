@@ -104,16 +104,28 @@ func FailedStep(j *job.Journal) (string, bool) {
 	return "", false
 }
 
+// The spec §5 exit codes a JOURNAL can decide. They live here, next to
+// ExitCode, because this is the one place that maps outcome -> code;
+// internal/cli re-exports these three as cli.ExitOK/ExitFailed/
+// ExitNotResumed alongside its own input-only codes (usage, refused,
+// unreachable, interrupted), so the numbers exist exactly once
+// (finding A13).
+const (
+	ExitOK         = 0 // success
+	ExitFailed     = 1 // teleport failed; the job is left resumable
+	ExitNotResumed = 5 // confirmation failed: the destination Claude did not resume
+)
+
 // ExitCode maps a finished journal to the spec §5 exit code.
 func ExitCode(j *job.Journal) int {
 	switch j.Outcome {
 	case "success":
-		return 0
+		return ExitOK
 	case "failed":
 		if name, _ := FailedStep(j); name == "start" {
-			return 5
+			return ExitNotResumed
 		}
-		return 1
+		return ExitFailed
 	}
-	return 1
+	return ExitFailed
 }

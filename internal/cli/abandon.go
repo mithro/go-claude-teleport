@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -60,6 +61,9 @@ func newAbandonCmd(a *app) *cobra.Command {
 				return fail(ExitFailed, "job %s has no recorded plan (preflight never completed)", id.Short())
 			}
 			alreadyAbandoned := j.Outcome == "abandoned" && j.Finished
+			if err := checkDriverHost(p); err != nil {
+				return err
+			}
 
 			src, dst, closeFn, err := a.endpoints(ctx, p.Options)
 			if err != nil {
@@ -141,6 +145,37 @@ func newAbandonCmd(a *app) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&deleteFiles, "delete-destination-files", false, "delete the files this job itself installed on the destination (unchanged since); refuses if the destination session is still running")
 	return cmd
+}
+
+// checkDriverHost refuses an abandon run on the job's OTHER host. A job is
+// driven from one side — the source for --to, the destination for --from —
+// and everything stored in the plan is written from there:
+// p.Options.Target names the far end AS SEEN FROM THE DRIVER, so re-dialling
+// it from the other end reaches the wrong machine (often the very host
+// running the command). Only the unambiguous case is refused: this host's
+// name is exactly the job's non-driver hostname (earlier deferred carry).
+func checkDriverHost(p *orchestrate.Plan) error {
+	here, err := os.Hostname()
+	if err != nil || here == "" {
+		return nil
+	}
+	driver, other := p.SourceInfo.Hostname, p.DestInfo.Hostname
+	if p.Options.Direction == "from" {
+		driver, other = other, driver
+	}
+	if here == driver || here != other {
+		return nil
+	}
+	return fail(ExitUsage, "this host (%s) is the job's %s end; it was driven from %s — run `claude-teleport abandon %s` there (the stored target %q is only reachable from that host)",
+		here, otherEndWord(p.Options.Direction), driver, p.Session.ID.Short(), p.Options.Target)
+}
+
+// otherEndWord names the end an abandon must NOT be run from.
+func otherEndWord(direction string) string {
+	if direction == "from" {
+		return "source"
+	}
+	return "destination"
 }
 
 // deleteInstalledFiles loads the job's manifest and deletes, on dst, only

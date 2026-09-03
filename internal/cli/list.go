@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 )
 
 type listRow struct {
@@ -81,7 +82,7 @@ func listSessions(p session.Paths, probe session.PaneProbe) ([]listRow, error) {
 			row.State, row.Name, row.PID, row.Tmux = session.StateRunning.String(), r.Name, r.PID, r.Tmux
 		} else if pi, ok := suspended[id]; ok {
 			row.State = session.StateSuspended.String()
-			row.Tmux = fmt.Sprintf("%s:%s.%s", pi.Session, pi.WindowID, pi.PaneID)
+			row.Tmux = tmuxx.RefString(&session.TmuxRef{Session: pi.Session, WindowID: pi.WindowID, PaneID: pi.PaneID})
 		}
 		rows = append(rows, row)
 	}

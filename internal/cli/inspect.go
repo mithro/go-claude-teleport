@@ -150,7 +150,10 @@ job's own manifest is left untouched.`,
 				Version: sess.Version, Transcript: sess.Transcript, Registry: sess.Registry,
 				Tmux: sess.Tmux, Files: inv.Files, Memory: inv.Memory, Skipped: inv.Skipped, Usage: usage,
 			}
-			for _, f := range inv.Files {
+			// Memory files are counted in the same summary line ("%d
+			// session files, %d memory files, %d bytes total"), so their
+			// bytes belong in the total too (earlier deferred carry).
+			for _, f := range append(append([]session.FileEntry{}, inv.Files...), inv.Memory...) {
 				rep.TotalBytes += f.Size
 			}
 			if gi, gerr := gitx.Inspect(sess.LaunchCwd); gerr != nil {

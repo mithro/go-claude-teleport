@@ -14,10 +14,10 @@ Usage:
   claude-teleport [<session>] --from <host> [--via <jump>]... [options]
   claude-teleport <tmux-session> <window> --to|--from <host> ...
   claude-teleport continue <sid>            resume an interrupted job (default when re-running)
-  claude-teleport status  [<sid>]           journal and manifest of a job
+  claude-teleport status  <sid>             journal and manifest of a job
   claude-teleport abandon <sid> [--delete-destination-files]
   claude-teleport inspect [<session>]       everything a teleport would move + drift report
-  claude-teleport list [--host <host>]      sessions here (running/suspended/idle) and teleport history
+  claude-teleport list [--host <host>]      sessions here, or on <host> (running/suspended/idle)
   claude-teleport compare-config <host> [--session <session>]
   claude-teleport doctor [<host>]           local (and remote) prerequisites
   claude-teleport placeholder --resume <sid> [--saved-output F] [--now] [--teleported-to H]
