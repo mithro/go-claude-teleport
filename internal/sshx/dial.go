@@ -18,10 +18,18 @@ type Options struct {
 	AgentSocket    string        // $SSH_AUTH_SOCK
 	StrictHostKey  string        // "yes" (default) | "accept-new" | "no"
 	ConnectTimeout time.Duration // 0 = 15s
-	Logf           func(string, ...any)
-	Home           string                                                            // for "~" in identity files
-	NetDial        func(ctx context.Context, network, addr string) (net.Conn, error) // first hop only; nil = net.Dialer
-	LocalUser      string                                                            // user for jump hops with no explicit user (falls back to r.User if empty)
+	// KeepaliveInterval/KeepaliveCountMax are OpenSSH's
+	// ServerAliveInterval/ServerAliveCountMax: 0 takes the default
+	// (DefaultKeepaliveInterval/CountMax), a negative interval disables
+	// keepalives (and with them the idle read deadline). A `-o
+	// ServerAliveInterval=`/`-o ServerAliveCountMax=` override wins over
+	// both.
+	KeepaliveInterval time.Duration
+	KeepaliveCountMax int
+	Logf              func(string, ...any)
+	Home              string                                                            // for "~" in identity files
+	NetDial           func(ctx context.Context, network, addr string) (net.Conn, error) // first hop only; nil = net.Dialer
+	LocalUser         string                                                            // user for jump hops with no explicit user (falls back to r.User if empty)
 }
 
 func (o Options) logf() func(string, ...any) {
@@ -108,6 +116,11 @@ func Dial(ctx context.Context, r Resolved, cfg *ssh_config.Config, overrides map
 	}
 	hops = append(hops, r)
 
+	// The keepalive settings come from the final target: -o overrides are
+	// never applied to jump hops (see above), and one loop on the end of
+	// the chain notices a break anywhere along it.
+	keepaliveInterval, keepaliveCount := keepaliveSettings(o, r.Options)
+
 	c := &Client{}
 	var prev *ssh.Client
 	for i, hop := range hops {
@@ -133,6 +146,14 @@ func Dial(ctx context.Context, r Resolved, cfg *ssh_config.Config, overrides map
 			c.closeAll()
 			return nil, fmt.Errorf("dial %s (%s): %w", hop.Host, addr, err)
 		}
+		// Only the first hop is a real socket; every later hop rides
+		// inside it as a channel, so this one wrapper covers the whole
+		// chain's liveness.
+		var idle *idleConn
+		if prev == nil {
+			idle = &idleConn{Conn: raw}
+			raw = idle
+		}
 		if dl, ok := ctx.Deadline(); ok {
 			raw.SetDeadline(dl)
 		}
@@ -144,11 +165,17 @@ func Dial(ctx context.Context, r Resolved, cfg *ssh_config.Config, overrides map
 		}
 		raw.SetDeadline(time.Time{})
 		cl := ssh.NewClient(cc, chans, reqs)
+		if idle != nil && keepaliveInterval > 0 {
+			idle.enable(idleTimeout(keepaliveInterval, keepaliveCount))
+		}
 		logf("connected to %s@%s (%s)", hop.User, hop.Host, addr)
 		if i < len(hops)-1 {
 			c.jumps = append(c.jumps, cl)
 		} else {
 			c.ssh = cl
+			if keepaliveInterval > 0 {
+				c.closes = append(c.closes, startKeepalive(cl, keepaliveInterval, keepaliveCount, r.User+"@"+r.Host, logf))
+			}
 		}
 		prev = cl
 	}

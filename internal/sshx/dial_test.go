@@ -147,3 +147,101 @@ func knownHostsName(host string, port int) string {
 	return "[" + host + "]:" + itoa(port)
 }
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// TestKeepaliveClosesAConnectionThatStopsAnswering pins the liveness rule
+// spec §4.2's "a lost connection is re-dialled and the step re-verified"
+// depends on: a peer that is still connected but has stopped answering
+// must surface as an ssh error, not as a transfer that hangs forever.
+// SilentGlobalRequests is exactly what a frozen host looks like from here.
+func TestKeepaliveClosesAConnectionThatStopsAnswering(t *testing.T) {
+	home, pub := testHome(t)
+	srv := sshtest.New(t, sshtest.Options{Authorized: []ssh.PublicKey{pub}, Exec: echoExec, SilentGlobalRequests: true})
+	host, port := hostPort(t, srv.Addr)
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+	os.WriteFile(kh, []byte(sshtest.KnownHostsLine(knownHostsName(host, port), srv.HostKey)), 0o600)
+
+	r := Resolved{Target: Target{User: "alice", Host: host, Port: port}, HostName: host}
+	c, err := Dial(context.Background(), r, nil, nil, Options{
+		KnownHostsFile: kh, Home: home, Logf: t.Logf, ConnectTimeout: 5 * time.Second,
+		KeepaliveInterval: 150 * time.Millisecond, KeepaliveCountMax: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// 150ms x 3 unanswered keepalives ~= 450ms; well inside this bound and
+	// nowhere near it if the keepalives are not running at all.
+	done := make(chan error, 1)
+	go func() { done <- c.SSH().Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("connection closed cleanly; want a keepalive failure")
+		}
+		t.Logf("connection died as expected: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("connection to a server that stopped answering never failed")
+	}
+}
+
+// TestKeepaliveSettings pins the OpenSSH-named -o overrides and defaults.
+func TestKeepaliveSettings(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		o        Options
+		opts     map[string]string
+		interval time.Duration
+		count    int
+	}{
+		{"defaults", Options{}, nil, DefaultKeepaliveInterval, DefaultKeepaliveCountMax},
+		{"option fields", Options{KeepaliveInterval: time.Second, KeepaliveCountMax: 5}, nil, time.Second, 5},
+		{"-o wins", Options{KeepaliveInterval: time.Second, KeepaliveCountMax: 5},
+			map[string]string{"ServerAliveInterval": "30", "ServerAliveCountMax": "2"}, 30 * time.Second, 2},
+		{"-o 0 disables", Options{}, map[string]string{"ServerAliveInterval": "0"}, 0, DefaultKeepaliveCountMax},
+		{"junk -o is ignored", Options{}, map[string]string{"ServerAliveInterval": "soon"}, DefaultKeepaliveInterval, DefaultKeepaliveCountMax},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gi, gc := keepaliveSettings(tc.o, tc.opts)
+			if gi != tc.interval || gc != tc.count {
+				t.Errorf("keepaliveSettings = %s/%d, want %s/%d", gi, gc, tc.interval, tc.count)
+			}
+		})
+	}
+	if got, want := idleTimeout(15*time.Second, 3), time.Minute; got != want {
+		t.Errorf("idleTimeout = %s, want %s", got, want)
+	}
+}
+
+// TestIdleConnReadDeadline pins the backstop under the keepalives: a socket
+// that is open but delivers nothing must fail a Read rather than block for
+// TCP's own many-minute zero-window schedule.
+func TestIdleConnReadDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept() // accepted and then left silent, never closed
+		if err == nil {
+			t.Cleanup(func() { c.Close() })
+		}
+	}()
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	ic := &idleConn{Conn: raw}
+	ic.enable(200 * time.Millisecond)
+	start := time.Now()
+	if _, err := ic.Read(make([]byte, 8)); err == nil {
+		t.Fatal("read from a silent connection returned no error")
+	} else if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("read error = %v, want a deadline error", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("read blocked for %s", elapsed)
+	}
+}

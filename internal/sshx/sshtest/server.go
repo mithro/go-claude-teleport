@@ -21,7 +21,10 @@ type Options struct {
 	Authorized []ssh.PublicKey   // keys accepted for any user
 	Exec       ExecFunc          // nil = every exec exits 127 with "exec not configured"
 	Resolver   map[string]string // name -> "127.0.0.1:port" for direct-tcpip; nil = refuse all
-	Logf       func(string, ...any)
+	// SilentGlobalRequests reads global requests (keepalives) and never
+	// answers them: a server that is up but has stopped responding.
+	SilentGlobalRequests bool
+	Logf                 func(string, ...any)
 }
 
 // Server is a running in-process ssh server bound to 127.0.0.1.
@@ -119,7 +122,14 @@ func (s *Server) handleConn(c net.Conn) {
 		return
 	}
 	defer sc.Close()
-	go ssh.DiscardRequests(reqs)
+	if s.opts.SilentGlobalRequests {
+		go func() {
+			for range reqs { // read and drop: never Reply
+			}
+		}()
+	} else {
+		go ssh.DiscardRequests(reqs)
+	}
 	for nc := range chans {
 		switch nc.ChannelType() {
 		case "session":

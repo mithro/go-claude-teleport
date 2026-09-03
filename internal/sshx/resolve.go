@@ -37,6 +37,10 @@ func canonicalOption(k string) string {
 		return "UserKnownHostsFile"
 	case "connecttimeout":
 		return "ConnectTimeout"
+	case "serveraliveinterval":
+		return "ServerAliveInterval"
+	case "serveralivecountmax":
+		return "ServerAliveCountMax"
 	}
 	return k
 }
