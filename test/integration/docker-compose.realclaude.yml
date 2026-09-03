@@ -1,0 +1,12 @@
+# test/integration/docker-compose.realclaude.yml
+# Overrides source/dest to drop the fakeclaude bind-mount so the real
+# Claude Code installed in the layer-2 image (CLAUDE_VERSION set) is used.
+services:
+  source:
+    volumes:
+      - ./keys:/run/keys:ro
+      - ../../dist/claude-teleport:/usr/local/bin/claude-teleport:ro
+  dest:
+    volumes:
+      - ./keys:/run/keys:ro
+      - ../../dist/claude-teleport:/usr/local/bin/claude-teleport:ro

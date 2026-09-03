@@ -21,5 +21,9 @@ tmp/
 /claude-teleport
 /dist/
 
+# Integration harness: per-run ssh keys and fakeapi logs
+/test/integration/keys/
+/test/integration/api-log/
+
 # Python caches (packaging/version.py tests)
 __pycache__/

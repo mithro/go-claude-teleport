@@ -1,0 +1,15 @@
+#!/bin/sh
+# test/integration/build.sh — build the binaries for the container arch,
+# generate the per-run key, and (re)build the images.
+# Usage: test/integration/build.sh [CLAUDE_VERSION]
+set -eu
+cd "$(dirname "$0")/../.."
+arch=$(docker info --format '{{.Architecture}}' | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+mkdir -p dist test/integration/keys test/integration/api-log
+CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -ldflags "-X github.com/mithro/go-claude-teleport/internal/version.Version=it-$(git rev-parse --short HEAD)" -o dist/claude-teleport ./cmd/claude-teleport
+CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -o dist/fakeclaude ./test/fakeclaude
+rm -f test/integration/keys/id_ed25519 test/integration/keys/id_ed25519.pub
+ssh-keygen -q -t ed25519 -N '' -C claude-teleport-it -f test/integration/keys/id_ed25519
+chmod 644 test/integration/keys/id_ed25519   # the container copies it into alice's ~/.ssh with 600
+export CLAUDE_VERSION="${1:-}"
+docker compose -f test/integration/docker-compose.yml build

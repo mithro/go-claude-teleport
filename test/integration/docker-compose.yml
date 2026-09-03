@@ -1,0 +1,59 @@
+# test/integration/docker-compose.yml
+# Three hosts: source and jump on `public`; jump and dest on `private`.
+# `dest` resolves only on `private`, so source must go --via jump.
+x-common: &common
+  build:
+    context: .
+    args:
+      CLAUDE_VERSION: ${CLAUDE_VERSION:-}
+  image: claude-teleport-it:${CLAUDE_VERSION:-fake}
+  volumes:
+    - ./keys:/run/keys:ro
+    - ../../dist/claude-teleport:/usr/local/bin/claude-teleport:ro
+  environment:
+    CLAUDE_CONFIG_DIR: /home/alice/.claude
+    DISABLE_AUTOUPDATER: "1"
+    DISABLE_TELEMETRY: "1"
+    DISABLE_ERROR_REPORTING: "1"
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    ANTHROPIC_BASE_URL: http://api:8080
+    ANTHROPIC_API_KEY: dummy-key
+  init: true
+
+services:
+  source:
+    <<: *common
+    hostname: source
+    networks: [public]
+    volumes:
+      - ./keys:/run/keys:ro
+      - ../../dist/claude-teleport:/usr/local/bin/claude-teleport:ro
+      - ../../dist/fakeclaude:/usr/local/bin/claude:ro
+  jump:
+    <<: *common
+    hostname: jump
+    networks: [public, private]
+  dest:
+    <<: *common
+    hostname: dest
+    networks: [private]
+    volumes:
+      - ./keys:/run/keys:ro
+      - ../../dist/claude-teleport:/usr/local/bin/claude-teleport:ro
+      - ../../dist/fakeclaude:/usr/local/bin/claude:ro
+  api:
+    profiles: [realclaude]
+    image: claude-teleport-fakeapi:local
+    build:
+      context: ../..
+      dockerfile: test/integration/Dockerfile.fakeapi
+    hostname: api
+    networks: [public, private]
+    command: ["/fakeapi-server", "-addr", ":8080", "-log", "/log"]
+    volumes:
+      - ./api-log:/log
+
+networks:
+  public: {}
+  private:
+    internal: true
