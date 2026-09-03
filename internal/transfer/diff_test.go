@@ -33,7 +33,7 @@ func TestDiffStatuses(t *testing.T) {
 	os.MkdirAll(staging, 0o700)
 	m := destManifest(dest)
 
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, hostPaths(dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestDiffStatuses(t *testing.T) {
 	os.Symlink("target", m.Entries[3].Dst)
 	writeFile(t, StagedPath(staging, 1), "line1\nline2\n")
 	writeFile(t, StagedPath(staging, 2)+".part", "{")
-	st, err = Diff(context.Background(), m, staging)
+	st, err = Diff(context.Background(), m, staging, hostPaths(dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestDiffStatuses(t *testing.T) {
 	// wrong-size staged copy -> staged-mismatch and removed
 	os.Remove(m.Entries[2].Dst)
 	writeFile(t, StagedPath(staging, 2), "{}}}")
-	st, _ = Diff(context.Background(), m, staging)
+	st, _ = Diff(context.Background(), m, staging, hostPaths(dest))
 	if st[2] != StagedMismatch {
 		t.Errorf("wrong-size staged = %s", st[2])
 	}
@@ -98,7 +98,7 @@ func TestPendingExcludesFFCandidate(t *testing.T) {
 	m := destManifest(dest)
 	writeFile(t, m.Entries[1].Dst, "line1\n")              // older copy of the FFAllowed transcript
 	writeFile(t, StagedPath(staging, 1), "line1\nline2\n") // the just-received, longer copy
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, hostPaths(dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestDiffFastForwardAndCollision(t *testing.T) {
 	// present-different regardless of size.
 	writeFile(t, m.Entries[1].Dst, "line1\n")
 	writeFile(t, m.Entries[2].Dst, "[]") // same size, different content -> present-different
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, hostPaths(dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestDiffFastForwardAndCollision(t *testing.T) {
 	// once staged, the prefix check is exact: a non-prefix becomes present-different
 	writeFile(t, StagedPath(staging, 1), "line1\nline2\n")
 	writeFile(t, m.Entries[1].Dst, "lineX\n")
-	st, _ = Diff(context.Background(), m, staging)
+	st, _ = Diff(context.Background(), m, staging, hostPaths(dest))
 	if st[1] != PresentDifferent {
 		t.Errorf("non-prefix same-session transcript = %s, want present-different", st[1])
 	}
@@ -171,10 +171,12 @@ func TestDiffFastForwardAndCollision(t *testing.T) {
 		t.Errorf("Need with forced present-different (-want +got):\n%s", diff)
 	}
 
-	// dir vs file collision
-	writeFile(t, filepath.Join(dest, "x"), "")
-	m.Entries[0].Dst = filepath.Join(dest, "x")
-	st, _ = Diff(context.Background(), m, staging)
+	// dir vs file collision (inside the config dir: a session entry
+	// outside it is refused outright, which is a different verdict —
+	// see TestDiffRefusalNamesTheEntryAndReason)
+	writeFile(t, filepath.Join(dest, ".claude", "x"), "")
+	m.Entries[0].Dst = filepath.Join(dest, ".claude", "x")
+	st, _ = Diff(context.Background(), m, staging, hostPaths(dest))
 	if st[0] != PresentDifferent {
 		t.Errorf("file where dir expected = %s", st[0])
 	}
@@ -201,7 +203,7 @@ func TestDiffFFCandidateRecordReflow(t *testing.T) {
 	writeFile(t, m.Entries[0].Dst, reflowed)
 	writeFile(t, StagedPath(staging, 0), full)
 
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, hostPaths(dest))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +225,7 @@ func TestDiffPropagatesNonENOENTStagedErrors(t *testing.T) {
 	staging := t.TempDir()
 	m := &Manifest{Version: 1, JobID: sid, SessionID: sid}
 	m.Entries = []Entry{
-		{ID: 0, Category: session.CatSession, Dst: filepath.Join(dest, "link"), Mode: uint32(os.ModeSymlink | 0o777), Symlink: "target"},
+		{ID: 0, Category: session.CatSession, Dst: filepath.Join(dest, ".claude", "link"), Mode: uint32(os.ModeSymlink | 0o777), Symlink: "target"},
 	}
 	staged := StagedPath(staging, 0) + ".symlink"
 	writeFile(t, staged, "target")
@@ -232,7 +234,7 @@ func TestDiffPropagatesNonENOENTStagedErrors(t *testing.T) {
 	}
 	defer os.Chmod(staged, 0o600) // best-effort: let TempDir cleanup remove it either way
 
-	_, err := Diff(context.Background(), m, staging)
+	_, err := Diff(context.Background(), m, staging, hostPaths(dest))
 	if err == nil {
 		t.Fatal("Diff must propagate a non-ENOENT staged-symlink read error, not swallow it")
 	}
@@ -277,28 +279,30 @@ func TestDiffHonoursDeferredOnlyForItsOwnCategories(t *testing.T) {
 		writeFile(t, StagedPath(staging, i), payload)
 	}
 
-	st, err := Diff(context.Background(), m, staging)
+	// Ruling R-P3-B1e: the pack entry (category outside the allow-list)
+	// and the rogue capture entry (not this job's canonical capture path)
+	// are REFUSALS, not statuses — the whole manifest is refused, naming
+	// both entries and their reasons, so preflight reports them as
+	// refusals rather than as content collisions.
+	_, err := Diff(context.Background(), m, staging, hostPaths(home))
+	if diff := cmp.Diff([]int{0, 1}, refusedIDs(t, err)); diff != "" {
+		t.Errorf("refused ids (-want +got):\n%s\nerr = %v", diff, err)
+	}
+	// The two categories Deferred IS meaningful for (existing-main's dirty
+	// index/worktree entries, which git-attach applies itself and Install
+	// never sees) are still classified by staging state alone.
+	gitOnly := &Manifest{Version: 1, JobID: m.JobID, SessionID: sid, Entries: m.Entries[2:]}
+	st, err := Diff(context.Background(), gitOnly, staging, hostPaths(home))
 	if err != nil {
 		t.Fatal(err)
-	}
-	if st[0] != PresentDifferent {
-		t.Errorf("deferred pack entry over an existing file = %s, want %s (Deferred must not be honoured for this category)", st[0], PresentDifferent)
-	}
-	if st[1] != PresentDifferent {
-		t.Errorf("deferred capture entry with a rogue Dst = %s, want %s (R-P3-B1b: not the canonical capture path)", st[1], PresentDifferent)
 	}
 	for _, id := range []int{2, 3} {
 		if st[id] != StagedSame {
 			t.Errorf("deferred %s entry = %s, want %s", m.Entries[id].Category, st[id], StagedSame)
 		}
 	}
-	blocking := Blocking(m, st, false)
-	var gotIDs []int
-	for _, e := range blocking {
-		gotIDs = append(gotIDs, e.ID)
-	}
-	if diff := cmp.Diff([]int{0, 1}, gotIDs); diff != "" {
-		t.Errorf("Blocking ids (-want +got):\n%s\nblocking = %+v", diff, blocking)
+	if blk := Blocking(gitOnly, st, false); len(blk) != 0 {
+		t.Errorf("Blocking = %+v, want none", blk)
 	}
 	if got, _ := os.ReadFile(bashrc); string(got) != "# the user's own shell rc\n" {
 		t.Errorf("Diff must not touch %s; content = %q", bashrc, got)
@@ -336,15 +340,12 @@ func TestDiffRefusesPackEntryWithAbsentTarget(t *testing.T) {
 	}}
 	writeFile(t, StagedPath(staging, 0), payload)
 
-	st, err := Diff(context.Background(), m, staging)
-	if err != nil {
-		t.Fatal(err)
+	_, err := Diff(context.Background(), m, staging, hostPaths(home))
+	if diff := cmp.Diff([]int{0}, refusedIDs(t, err)); diff != "" {
+		t.Errorf("refused ids (-want +got):\n%s\nerr = %v", diff, err)
 	}
-	if st[0] != PresentDifferent {
-		t.Errorf("pack entry over an absent target = %s, want %s (must never be staged-same/absent)", st[0], PresentDifferent)
-	}
-	if blocking := Blocking(m, st, false); len(blocking) != 1 || blocking[0].ID != 0 {
-		t.Errorf("Blocking = %+v, want the pack entry blocked", blocking)
+	if !strings.Contains(err.Error(), target) {
+		t.Errorf("refusal must name the entry: %v", err)
 	}
 	if _, err := os.Lstat(target); !os.IsNotExist(err) {
 		t.Errorf("Diff must never create %s: lstat err = %v", target, err)
@@ -382,15 +383,12 @@ func TestDiffRefusesCaptureDstRegardlessOfDeferred(t *testing.T) {
 			}}
 			writeFile(t, StagedPath(staging, 0), payload)
 
-			st, err := Diff(context.Background(), m, staging)
-			if err != nil {
-				t.Fatal(err)
+			_, err := Diff(context.Background(), m, staging, hostPaths(home))
+			if diff := cmp.Diff([]int{0}, refusedIDs(t, err)); diff != "" {
+				t.Errorf("refused ids (deferred=%v) (-want +got):\n%s\nerr = %v", deferred, diff, err)
 			}
-			if st[0] != PresentDifferent {
-				t.Errorf("capture entry with rogue Dst (deferred=%v) = %s, want %s", deferred, st[0], PresentDifferent)
-			}
-			if blk := Blocking(m, st, false); len(blk) != 1 || blk[0].ID != 0 {
-				t.Errorf("Blocking = %+v, want the rogue capture entry", blk)
+			if !strings.Contains(err.Error(), bashrc) {
+				t.Errorf("refusal must name the entry: %v", err)
 			}
 			if got, _ := os.ReadFile(bashrc); string(got) != "# the user's own shell rc\n" {
 				t.Errorf("Diff must not touch %s; content = %q", bashrc, got)
@@ -445,7 +443,7 @@ func TestDiffAllowsCanonicalCaptureEntry(t *testing.T) {
 	}}
 	writeFile(t, StagedPath(staging, 0), payload)
 
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, hostPaths(home))
 	if err != nil {
 		t.Fatal(err)
 	}

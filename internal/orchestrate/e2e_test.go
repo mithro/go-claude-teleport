@@ -231,3 +231,44 @@ func TestE2EReTeleportBackFastForwardsTranscript(t *testing.T) {
 	}
 	_ = p
 }
+
+// TestE2ENotARepoDestCwdPreExisting is ruling R-P3-B1e item 4/I2: in
+// not-a-repo mode the single declared Root is the DRIVER's chosen
+// destination cwd, which legitimately already exists and holds the user's
+// own unrelated files. The teleport must proceed (the Root freshness rule
+// does not apply there — only the ordinary per-file collision rules do),
+// the session's own files must land inside it, and everything already
+// there must be untouched.
+func TestE2ENotARepoDestCwdPreExisting(t *testing.T) {
+	src := newHost(t, "laptop.example", "alice", newFakeTmux())
+	dst := newHost(t, "big-storage.example", "bob", newFakeTmux())
+	cwd := filepath.Join(src.paths.Home, "proj")
+	seedSession(t, src, cwd)
+	if err := os.WriteFile(filepath.Join(cwd, "work.txt"), []byte("in progress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The destination directory the user already works in.
+	dstCwd := filepath.Join(dst.paths.Home, "proj")
+	if err := os.MkdirAll(dstCwd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	notes := filepath.Join(dstCwd, "notes.txt")
+	unrelated := "the user's own notes\n"
+	if err := os.WriteFile(notes, []byte(unrelated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	startClaudeInPane(t, src, "main", cwd)
+
+	p, j := teleport(t, baseOptions(), src, dst)
+	if j.Outcome != "success" || p.Git.Mode != gitx.ModeNotRepo {
+		t.Fatalf("outcome %q mode %s", j.Outcome, p.Git.Mode)
+	}
+	if got, err := os.ReadFile(filepath.Join(dstCwd, "work.txt")); err != nil || string(got) != "in progress\n" {
+		t.Errorf("work.txt on the destination = %q err=%v", got, err)
+	}
+	if got, err := os.ReadFile(notes); err != nil || string(got) != unrelated {
+		t.Errorf("%s must be untouched: %q err=%v", notes, got, err)
+	}
+	readTranscript(t, dst, dstCwd)
+	waitRegistry(t, dst, "idle")
+}

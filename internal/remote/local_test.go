@@ -487,3 +487,34 @@ func TestLocalManifestDiffAndInstallRejectMismatchedJobID(t *testing.T) {
 		t.Errorf("the mismatched job's directory must not have been created: err=%v", err)
 	}
 }
+
+// TestLocalManifestDiffReportsRefusalsAsRefused covers ruling R-P3-B1e
+// item 5: a manifest entry the destination may never install (here an
+// unknown category aimed at ~/.bash_profile) must come back from the
+// manifest-diff RPC as a REFUSAL — its own error code, naming the entry
+// and the reason — so the driver's preflight reports it as a refusal
+// (exit 3) rather than as an internal failure or a content collision.
+func TestLocalManifestDiffReportsRefusalsAsRefused(t *testing.T) {
+	p := testPaths(t)
+	l := NewLocal(p, "self", LocalOptions{Logf: t.Logf})
+	m := sourceManifest(t, p)
+	target := filepath.Join(p.Home, ".bash_profile")
+	m.Entries[0].Category = "junk"
+	m.Entries[0].Dst = target
+	ctx := context.Background()
+
+	_, err := l.ManifestDiff(ctx, m, sid)
+	var re *Error
+	if !errors.As(err, &re) || re.Code != "refused" {
+		t.Fatalf("err = %v (%T), want a remote.Error with code refused", err, err)
+	}
+	if !strings.Contains(re.Message, target) || !strings.Contains(re.Message, "category") {
+		t.Errorf("message = %q, want it to name the entry and the reason", re.Message)
+	}
+	if _, err := l.Install(ctx, m, sid); !errors.As(err, &re) || re.Code != "refused" {
+		t.Fatalf("install err = %v, want the same refusal", err)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Errorf("%s was created (err %v)", target, err)
+	}
+}

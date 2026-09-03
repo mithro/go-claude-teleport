@@ -126,23 +126,6 @@ func deferrableCategory(cat session.Category) bool {
 	return false
 }
 
-// dataDirFromStagingDir recovers the destination's own claude-teleport
-// DataDir from a stagingDir argument, instead of adding a session.Paths
-// parameter to Diff that every caller of it — including ones with nothing
-// to do with this fix — would then have to thread through. Every real
-// caller builds stagingDir as job.StagingDir(DataDir, jobID), i.e.
-// "<DataDir>/staging/<jobID>" (internal/remote/local.go's stagingDir
-// method, used identically for both ManifestDiff and Install), so
-// stripping the last two path components recovers exactly DataDir.
-// stagingDir is never wire data — the caller builds it from its own
-// trusted configuration — so this is exactly as trustworthy as being
-// handed DataDir directly, and it never depends on any wire-supplied job
-// id lining up with anything: it is pure path arithmetic on a
-// caller-constructed argument.
-func dataDirFromStagingDir(stagingDir string) string {
-	return filepath.Dir(filepath.Dir(filepath.Clean(stagingDir)))
-}
-
 // canonicalCaptureDst is the ONE legitimate Dst a manifest's CatCapture
 // entry may ever name: job.Dir(dataDir, jobID)/capture.txt — exactly the
 // path internal/orchestrate/steps.go's runCapture builds on the source
@@ -159,74 +142,37 @@ func canonicalCaptureDst(dataDir, jobID string) (string, error) {
 }
 
 // Diff runs on the destination and classifies every entry.
-func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, error) {
+//
+// p is the DESTINATION's own Paths (ruling R-P3-B1e item 5): it is what
+// lets this function run the very same validator Install runs, so a
+// category/root/symlink refusal is diagnosed HERE — at preflight, naming
+// the entry and the reason — instead of being mistaken for an ordinary
+// content collision or only surfacing at the moment of the write. A
+// manifest carrying even one refused entry is never classified at all:
+// Diff returns a *RefusalError listing every refusal it found.
+func Diff(ctx context.Context, m *Manifest, stagingDir string, p session.Paths) (map[int]Status, error) {
 	out := make(map[int]Status, len(m.Entries))
-	// Ruling R-P3-B1b (the B1 residual hole): a hostile or buggy source
-	// can set a CatCapture entry's Dst to any path under Home (e.g.
-	// ~/.bashrc), mark it Deferred, and stage attacker-chosen bytes under
-	// that entry's id — Diff's Deferred branch below would then classify
-	// it staged-same purely from staging state, WITHOUT ever comparing
-	// Dst, and Install would rename the staged bytes straight over it.
-	// The destination re-derives the only legitimate capture Dst itself,
-	// once, up front, and the per-entry check below refuses any other Dst
-	// unconditionally — before the Deferred short-circuit, before any
-	// Lstat of Dst, regardless of what (if anything) already lives there.
-	captureDst, captureDstErr := canonicalCaptureDst(dataDirFromStagingDir(stagingDir), m.JobID)
-	// Ruling R-P3-B1d: Diff's own mirror of the Roots containment check —
-	// see rootChecker's doc comment for why it is p=nil here (no
-	// session.Paths available) and therefore only the declared-root-
-	// membership and freshness halves, not validRoot's Home/ConfigDir/
-	// DataDir containment (Install's validateDst is authoritative for
-	// that, unconditionally, regardless of what this function says).
-	rc := newRootChecker(m, nil)
+	v, err := newValidator(m, p, modeDiff)
+	if err != nil {
+		return nil, err
+	}
+	var refusals []Refusal
 	for _, e := range m.Entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		// Ruling R-P3-B1c: CatPack has no legitimate Dst at all — no
-		// FileEntry anywhere in this codebase (session.FileEntry,
-		// gitx.Files, session.InventoryFiles) is ever built with this
-		// category; the git pack itself travels as the raw StreamPack,
-		// straight into gitx.Attach, never as a manifest entry. So, unlike
-		// CatCapture (which legitimately owns exactly one canonical Dst,
-		// checked below) or CatRepo/CatWorktree (legitimately placed by
-		// Install itself for fresh-main/not-a-repo teleports, and
-		// legitimately Deferred for existing-main's dirty index/worktree
-		// files below), a CatPack entry is refused unconditionally, before
-		// any Lstat or staging-state check, regardless of Deferred and
-		// regardless of whether Dst already exists — there is no path
-		// through which the destination could ever receive one honestly.
-		if e.Category == session.CatPack {
-			out[e.ID] = PresentDifferent
-			continue
-		}
-		if e.Category == session.CatCapture && (captureDstErr != nil || filepath.Clean(e.Dst) != captureDst) {
-			out[e.ID] = PresentDifferent
-			continue
-		}
-		// Ruling R-P3-B1d: a non-Deferred CatRepo/CatWorktree entry (the
-		// fresh-main/not-a-repo legitimate case — existing-main's dirty
-		// index/worktree files are always Deferred and skip this
-		// entirely, exactly like the Deferred branch below) must lie
-		// under one of the manifest's declared Roots, and that Root must
-		// be fresh (absent, or containing only this manifest's own
-		// entries — see rootForeignContent). Checked before Lstat, before
-		// staging state: an entry outside every declared Root, or under
-		// one that is not fresh, is never a candidate for staged-same.
-		if gitRootCategory(e.Category) && !e.Deferred {
-			root, ok := entryRoot(e.Dst, m.Roots)
-			if !ok {
-				out[e.ID] = PresentDifferent
+		// The destination's ONE validation of an entry (validate.go): the
+		// category allow-list, home/config-dir/forbidden containment, this
+		// job's canonical capture path, declared-root membership,
+		// real-path containment, symlink targets and root provenance.
+		// Install re-runs the identical check as the authoritative gate.
+		if verr := v.check(e); verr != nil {
+			var re *RefusalError
+			if errors.As(verr, &re) {
+				refusals = append(refusals, re.Refusals...)
 				continue
 			}
-			reason, rerr := rc.check(root)
-			if rerr != nil {
-				return nil, fmt.Errorf("check root %s: %w", root, rerr)
-			}
-			if reason != "" {
-				out[e.ID] = PresentDifferent
-				continue
-			}
+			return nil, verr
 		}
 		staged, mismatch, err := stagedState(stagingDir, e)
 		if err != nil {
@@ -315,6 +261,9 @@ func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, 
 				out[e.ID] = PresentDifferent
 			}
 		}
+	}
+	if len(refusals) > 0 {
+		return nil, &RefusalError{Refusals: refusals}
 	}
 	return out, nil
 }

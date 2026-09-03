@@ -2,11 +2,60 @@ package transfer
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
+
+// hostPaths is the destination's session.Paths for a sandboxed home, in
+// the standard shape internal/cli's session.NewPaths produces.
+func hostPaths(home string) session.Paths {
+	return session.Paths{
+		Home:       home,
+		ConfigDir:  filepath.Join(home, ".claude"),
+		GlobalJSON: filepath.Join(home, ".claude.json"),
+		DataDir:    filepath.Join(home, ".local", "share", "claude-teleport"),
+	}
+}
+
+// refusedIDs returns the manifest ids err refuses, failing if err is not a
+// *RefusalError (ruling R-P3-B1e item 5: a refusal is its own verdict, not
+// a status).
+func refusedIDs(t *testing.T, err error) []int {
+	t.Helper()
+	var re *RefusalError
+	if !errors.As(err, &re) {
+		t.Fatalf("err = %v, want a *RefusalError", err)
+	}
+	var ids []int
+	for _, r := range re.Refusals {
+		ids = append(ids, r.ID)
+	}
+	return ids
+}
+
+// destPaths derives the DESTINATION's session.Paths from a manifest built
+// by newTwoHosts: every Dst there lives under <destHome>/.claude/…, so the
+// config dir (and from it the home, global json and data dir) is recovered
+// by walking entry 0's Dst up to its ".claude" component. Diff needs it
+// (ruling R-P3-B1e item 5) for exactly the same reason Install always
+// did: only the destination's own paths say what a manifest may write.
+func destPaths(t *testing.T, m *Manifest) session.Paths {
+	t.Helper()
+	cfg := m.Entries[0].Dst
+	for filepath.Base(cfg) != ".claude" {
+		parent := filepath.Dir(cfg)
+		if parent == cfg {
+			t.Fatalf("no .claude component in %s", m.Entries[0].Dst)
+		}
+		cfg = parent
+	}
+	p := hostPaths(filepath.Dir(cfg))
+	p.ConfigDir = cfg
+	return p
+}
 
 // newTwoHosts builds a source manifest (from sourceTree) whose Dst paths live
 // under a second host's home directory, and returns the manifest plus a

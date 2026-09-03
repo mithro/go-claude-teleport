@@ -174,7 +174,23 @@ func (l *Local) ManifestDiff(ctx context.Context, m *transfer.Manifest, jobID st
 	if err := m.Save(filepath.Join(l.jobDir(jobID), "manifest.json")); err != nil {
 		return nil, err
 	}
-	return transfer.Diff(ctx, m, l.stagingDir(jobID))
+	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID), l.paths)
+	if err != nil {
+		return nil, refusalError(err)
+	}
+	return st, nil
+}
+
+// refusalError turns transfer's "the destination may never write this
+// entry" verdict into a wire error the driver can tell apart from an I/O
+// failure (ruling R-P3-B1e item 5: preflight reports it as a refusal
+// naming the entry and the reason, never as a content collision). Anything
+// else passes through untouched.
+func refusalError(err error) error {
+	if transfer.IsRefusal(err) {
+		return &Error{Code: "refused", Message: err.Error()}
+	}
+	return err
 }
 
 // PutInstallExtras stores the merge inputs for Install under jobs/<id>/extras.json.
@@ -205,9 +221,9 @@ func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string)
 	if m.JobID != jobID {
 		return nil, &Error{Code: "usage", Message: fmt.Sprintf("install: manifest JobID %q does not match job %q", m.JobID, jobID)}
 	}
-	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID))
+	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID), l.paths)
 	if err != nil {
-		return nil, err
+		return nil, refusalError(err)
 	}
 	var extra transfer.InstallExtras
 	raw, err := os.ReadFile(l.extrasPath(jobID))
@@ -218,7 +234,11 @@ func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	return transfer.Install(ctx, m, st, l.stagingDir(jobID), l.paths, extra)
+	rep, err := transfer.Install(ctx, m, st, l.stagingDir(jobID), l.paths, extra)
+	if err != nil {
+		return rep, refusalError(err)
+	}
+	return rep, nil
 }
 
 // Freeze SIGSTOPs pid through a freezer helper that outlives this process.

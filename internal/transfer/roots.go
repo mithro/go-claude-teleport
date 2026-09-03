@@ -2,35 +2,50 @@
 package transfer
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
-// GitRoots builds Manifest.Roots (ruling R-P3-B1d) from a gitx.Plan's own
-// already-computed destination paths: DstMain and DstWorktree are both
-// declared in every git repo mode (fresh-main, existing-main), and
-// DstWorktree alone (== the destination cwd) in not-a-repo mode, where
-// DstMain is "". Deduplicated (DstMain == DstWorktree for an unlinked W==M
+// Root is one destination directory a CatRepo/CatWorktree entry may be
+// installed under (ruling R-P3-B1d, reshaped by R-P3-B1e). Path is
+// gitx.Plan's own DstMain/DstWorktree. MayPreExist marks not-a-repo mode,
+// whose single Root is the destination cwd — the DRIVER user's chosen
+// directory, which legitimately already exists and holds unrelated files
+// (ruling R-P3-B1e item 4). It relaxes ONLY the provenance rule below; every
+// containment rule (under $HOME, not $HOME, outside ConfigDir/DataDir, no
+// dot-prefixed first component, real-path resolution) still applies, and the
+// ordinary per-file collision rules do the rest: an absent file is created,
+// a present-same one skipped, a present-different one blocks the teleport.
+type Root struct {
+	Path        string `json:"path"`
+	MayPreExist bool   `json:"may_pre_exist,omitempty"`
+}
+
+// GitRoots builds Manifest.Roots from a gitx.Plan's own already-computed
+// destination paths: DstMain and DstWorktree are both declared in every git
+// repo mode (fresh-main, existing-main), and DstWorktree alone (== the
+// destination cwd) in not-a-repo mode, where DstMain is "" and mayPreExist
+// is true. Deduplicated (DstMain == DstWorktree for an unlinked W==M
 // checkout) and empty strings dropped. Callers pass gitx.Plan fields
 // directly rather than this package importing gitx, which would be a
-// dependency cycle (gitx has no reason to import transfer, but the
-// convention elsewhere in this codebase — dataDirFromStagingDir, the
-// canonicalCaptureDst jobID parameter — is that transfer takes exactly the
-// primitive values it needs rather than a caller's richer type).
-func GitRoots(dstMain, dstWorktree string) []string {
-	var out []string
+// dependency cycle.
+func GitRoots(dstMain, dstWorktree string, mayPreExist bool) []Root {
+	var out []Root
 	seen := map[string]bool{}
 	for _, r := range []string{dstMain, dstWorktree} {
 		if r == "" || seen[r] {
 			continue
 		}
 		seen[r] = true
-		out = append(out, r)
+		out = append(out, Root{Path: r, MayPreExist: mayPreExist})
 	}
 	return out
 }
@@ -41,177 +56,148 @@ func gitRootCategory(cat session.Category) bool {
 	return cat == session.CatRepo || cat == session.CatWorktree
 }
 
-// entryRoot returns the first of roots that dst equals or is lexically
-// nested under, or ("", false) if none contains it — including when roots
-// is empty, which makes a manifest that carries a CatRepo/CatWorktree
-// entry but never declared any Root exactly as untrusted as one naming a
-// bogus Dst.
-func entryRoot(dst string, roots []string) (string, bool) {
-	clean := filepath.Clean(dst)
+// entryRoot returns the declared root that dst equals or is nested under,
+// preferring the LONGEST match (a linked worktree's root nests inside the
+// main repo's, and the more specific one is the one whose own rules must
+// govern the entry). ok is false when no declared root contains dst —
+// including when roots is empty, which makes a manifest that carries a
+// CatRepo/CatWorktree entry but never declared a Root exactly as untrusted
+// as one naming a bogus Dst.
+func entryRoot(cleanDst string, roots []Root) (Root, bool) {
+	var best Root
+	found := false
 	for _, r := range roots {
-		if r == "" {
+		if r.Path == "" {
 			continue
 		}
-		if rc := filepath.Clean(r); underDir(clean, rc) {
-			return rc, true
+		rc := filepath.Clean(r.Path)
+		if !underDir(cleanDst, rc) {
+			continue
+		}
+		if !found || len(rc) > len(filepath.Clean(best.Path)) {
+			best, found = Root{Path: rc, MayPreExist: r.MayPreExist}, true
 		}
 	}
-	return "", false
+	return best, found
 }
 
-// validRoot is ruling R-P3-B1d's containment check for a declared
-// CatRepo/CatWorktree Root, independent of anything the manifest itself
-// claims: it must be a real boundary under $HOME — not $HOME itself (a
-// Root that IS Home would let a CatWorktree/CatRepo entry land literally
-// anywhere under Home, defeating the whole point of declaring Roots),
-// outside the config dir and the data dir (both already have their own,
-// separate and stricter, checks elsewhere), and its first path component
-// under Home must not be dot-prefixed — a bare ~/.something is exactly the
-// shape of the config dirs, dotfiles and dot-directories a shell or tool
-// reads on login; a Root has no fixed name list to check against the way
-// session.Forbidden does for CatSession, so the dot-prefix shape itself is
-// refused instead.
-func validRoot(root string, p session.Paths) error {
-	r := filepath.Clean(root)
-	home := filepath.Clean(p.Home)
-	if !underDir(r, home) {
-		return fmt.Errorf("is not under home %s", p.Home)
+// resolveExisting resolves path's longest EXISTING prefix with
+// filepath.EvalSymlinks and rejoins the components that do not exist yet,
+// so containment can be judged on where a path REALLY lands rather than on
+// its spelling (ruling R-P3-B1e item 2: a symlinked ancestor must not be
+// able to smuggle a Root — or a write — out of its declared boundary).
+// A component that exists but is not a directory (ENOTDIR while walking
+// up) surfaces as an error rather than a silently truncated resolution.
+func resolveExisting(path string) (string, error) {
+	clean := filepath.Clean(path)
+	var rest []string
+	for cur := clean; ; {
+		res, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			for i := len(rest) - 1; i >= 0; i-- {
+				res = filepath.Join(res, rest[i])
+			}
+			return res, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return clean, nil // not even the filesystem root resolves: nothing to do
+		}
+		rest = append(rest, filepath.Base(cur))
+		cur = parent
 	}
-	if r == home {
-		return fmt.Errorf("must not be $HOME itself")
+}
+
+// jobRootsFile is jobs/<id>/roots.json on the DESTINATION: the repo roots
+// this job itself created here (ruling R-P3-B1e item 3). It is the
+// destination's own record — never wire data — and it is what makes
+// "freshness" a question of provenance rather than of a directory's
+// current contents: Install claims a Root the moment it finds it absent
+// (before placing anything under it), so every later Diff/Install of the
+// same job — verifyInstall's re-diff, a resumed job's repeated steps —
+// still sees a legitimately non-empty Root as its own.
+type jobRootsFile struct {
+	Version int      `json:"version"`
+	Roots   []string `json:"roots"`
+}
+
+func jobRootsPath(dataDir, jobID string) (string, error) {
+	if err := job.ValidateID(jobID); err != nil {
+		return "", fmt.Errorf("job roots: %w", err)
 	}
-	if underDir(r, filepath.Clean(p.ConfigDir)) {
-		return fmt.Errorf("is under the config dir %s", p.ConfigDir)
-	}
-	if underDir(r, filepath.Clean(p.DataDir)) {
-		return fmt.Errorf("is under the data dir %s", p.DataDir)
-	}
-	rel, err := filepath.Rel(home, r)
+	return filepath.Join(job.Dir(dataDir, jobID), "roots.json"), nil
+}
+
+// loadJobRoots reads the recorded roots; a missing file is no roots.
+func loadJobRoots(dataDir, jobID string) (map[string]bool, error) {
+	path, err := jobRootsPath(dataDir, jobID)
 	if err != nil {
-		return fmt.Errorf("relative to home: %w", err)
+		return nil, err
+	}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]bool{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	var f jobRootsFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	out := make(map[string]bool, len(f.Roots))
+	for _, r := range f.Roots {
+		out[filepath.Clean(r)] = true
+	}
+	return out, nil
+}
+
+// recordJobRoot adds root to jobs/<id>/roots.json (temp + rename, 0600).
+func recordJobRoot(dataDir, jobID string, recorded map[string]bool, root string) error {
+	path, err := jobRootsPath(dataDir, jobID)
+	if err != nil {
+		return err
+	}
+	recorded[filepath.Clean(root)] = true
+	all := make([]string, 0, len(recorded))
+	for r := range recorded {
+		all = append(all, r)
+	}
+	sort.Strings(all)
+	raw, err := json.MarshalIndent(jobRootsFile{Version: 1, Roots: all}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("record job root: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("record job root: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("record job root: %w", err)
+	}
+	return nil
+}
+
+// firstComponentDotted reports whether the first path component of dir
+// relative to home is dot-prefixed — the shape of every config dir,
+// dotfile and dot-directory a shell or tool reads on login. A Root has no
+// fixed name list to check against the way session.Forbidden does for
+// CatSession, so the shape itself is refused.
+func firstComponentDotted(home, dir string) (bool, error) {
+	rel, err := filepath.Rel(home, dir)
+	if err != nil {
+		return false, err
 	}
 	first := rel
 	if i := strings.IndexRune(rel, filepath.Separator); i >= 0 {
 		first = rel[:i]
 	}
-	if strings.HasPrefix(first, ".") {
-		return fmt.Errorf("first path component %q under home is dot-prefixed", first)
-	}
-	return nil
-}
-
-// rootForeignContent walks root (which may not exist) and returns the
-// first path found that is neither root itself, nor one of owned, nor a
-// lexical ancestor directory of one of owned — i.e. content this
-// manifest's own CatRepo/CatWorktree entries do not account for. An
-// absent root has none ("", nil).
-//
-// This is a subset check ("is everything under root something this job's
-// OWN entries would put there"), not a bare emptiness check, because
-// Diff/Install run more than once against the very same destination
-// across one teleport's lifetime: verifyInstall re-Diffs after a
-// successful install to confirm present-same, and a crashed job is
-// resumed by re-running the very same steps. A plain "root must be empty"
-// check would refuse the destination's OWN files the instant install
-// placed the first one — breaking every fresh-main/not-a-repo teleport of
-// more than trivial size at its own verify step, not just a crash-retry
-// edge case. Only content that predates (or is unrelated to) this job —
-// a hostile Root claim, or an incidentally non-empty directory — fails.
-func rootForeignContent(root string, owned []string) (string, error) {
-	fi, err := os.Lstat(root)
-	if os.IsNotExist(err) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-		return root, nil // a non-directory standing in for the root is never fresh
-	}
-	allowed := map[string]bool{filepath.Clean(root): true}
-	for _, d := range owned {
-		for p := filepath.Clean(d); !allowed[p]; {
-			allowed[p] = true
-			parent := filepath.Dir(p)
-			if parent == p {
-				break
-			}
-			p = parent
-		}
-	}
-	var foreign string
-	walkErr := filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !allowed[filepath.Clean(path)] {
-			foreign = path
-			return fs.SkipAll
-		}
-		return nil
-	})
-	if walkErr != nil {
-		return "", walkErr
-	}
-	return foreign, nil
-}
-
-// rootChecker precomputes, once per Diff/Install call, which of a
-// manifest's declared Roots are safe to place CatRepo/CatWorktree content
-// under — memoized per root so a Diff/Install call that touches many
-// entries sharing one root only walks that root's tree once. p is nil for
-// Diff (which has no session.Paths to check validRoot's Home/ConfigDir/
-// DataDir containment against — see the package-level note by
-// dataDirFromStagingDir on why this package avoids threading one through
-// every caller); Diff's mirror therefore checks only what it CAN derive
-// without one (declared-root membership, root freshness), while Install's
-// validateDst — always given a real p, and the actual placement gate
-// regardless of what Diff/a status map claimed — is authoritative for the
-// full check.
-type rootChecker struct {
-	declared []string
-	p        *session.Paths
-	owned    map[string][]string
-	bad      map[string]string // root -> reason ("" once checked and fine)
-}
-
-func newRootChecker(m *Manifest, p *session.Paths) *rootChecker {
-	rc := &rootChecker{declared: m.Roots, p: p, owned: map[string][]string{}, bad: map[string]string{}}
-	for _, e := range m.Entries {
-		if !gitRootCategory(e.Category) || e.Deferred {
-			continue
-		}
-		if root, ok := entryRoot(e.Dst, m.Roots); ok {
-			rc.owned[root] = append(rc.owned[root], e.Dst)
-		}
-	}
-	return rc
-}
-
-// roots returns the manifest's own declared Roots, for a caller (Install's
-// validateDst) that needs to re-run entryRoot per entry itself.
-func (rc *rootChecker) roots() []string { return rc.declared }
-
-// check returns "" if root is fine to place non-Deferred CatRepo/
-// CatWorktree content under, else the reason it is not.
-func (rc *rootChecker) check(root string) (string, error) {
-	if reason, ok := rc.bad[root]; ok {
-		return reason, nil
-	}
-	if rc.p != nil {
-		if err := validRoot(root, *rc.p); err != nil {
-			rc.bad[root] = err.Error()
-			return rc.bad[root], nil
-		}
-	}
-	foreign, err := rootForeignContent(root, rc.owned[root])
-	if err != nil {
-		return "", err
-	}
-	reason := ""
-	if foreign != "" {
-		reason = fmt.Sprintf("contains content this job does not own: %s", foreign)
-	}
-	rc.bad[root] = reason
-	return reason, nil
+	return strings.HasPrefix(first, "."), nil
 }

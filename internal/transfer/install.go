@@ -168,91 +168,6 @@ func underDir(cleanPath, dir string) bool {
 	return cleanPath == dir || strings.HasPrefix(cleanPath, dir+string(filepath.Separator))
 }
 
-// validateDst is a defense-in-depth re-check performed on the DESTINATION,
-// independent of whatever the source already refused to include in the
-// manifest: every entry's Dst must lexically resolve (Clean only — no
-// EvalSymlinks, so a symlink swap on disk cannot fool this) under p.Home,
-// and a session-category entry's Dst must additionally resolve under
-// p.ConfigDir and not be a config-dir-relative forbidden path (spec §7.1:
-// credentials, the registry, messaging keys, the global json, settings,
-// plugins). This guards against a compromised or buggy source relaying a
-// manifest (or an InstallExtras.Memory entry) whose Dst tries to smuggle a
-// write outside the sandbox — e.g. <ConfigDir>/.credentials.json, or a path
-// outside $HOME entirely.
-//
-// Ruling R-P3-B1b: a CatCapture entry's Dst must additionally equal
-// canonicalCaptureDst(p.DataDir, jobID) — the destination's own re-derived
-// answer to "where does THIS job's pane capture belong" — never whatever a
-// hostile or buggy source put in the wire Dst field. jobID is the
-// manifest's own JobID (callers pass m.JobID), matching the path
-// internal/orchestrate/steps.go built the entry with on the source side.
-//
-// Ruling R-P3-B1c: a CatPack entry is refused outright — see Diff's own
-// CatPack branch for why no Dst is ever legitimate for that category.
-//
-// Ruling R-P3-B1d (closes B1c's disclosed CatRepo/CatWorktree gap above):
-// existing-main's dirty index/worktree files carry those categories AND
-// Entry.Deferred, and are refused by Install's separate "only capture may
-// be deferred" gate below — installManifest (internal/orchestrate/
-// steps.go) never even sends them here, and rc (built from m.Roots) never
-// needs to know about them. A NON-deferred CatRepo/CatWorktree entry —
-// fresh-main's whole transferred .git/worktree, or a not-a-repo cwd's
-// plain files, both placed by this very function rather than
-// gitx.Attach — must additionally lie under one of the manifest's
-// declared Roots (m.Roots, populated by orchestrate from gitx.Plan's own
-// DstMain/DstWorktree), and that Root must itself be a real boundary
-// (validRoot: under Home, not Home itself, outside ConfigDir/DataDir, no
-// dot-prefixed first component) that is either absent or contains only
-// this manifest's own entries (rootChecker/rootForeignContent) — closing
-// the gap the R-P3-B1c comment above used to disclose: a hostile source
-// naming CatRepo/CatWorktree with a Dst elsewhere under Home is no longer
-// merely "under Home", it must be under a Root that passes all of the
-// above.
-func validateDst(e Entry, p session.Paths, jobID string, rc *rootChecker) error {
-	dst := filepath.Clean(e.Dst)
-	if !underDir(dst, p.Home) {
-		return fmt.Errorf("refusing entry: %s is not under home %s", e.Dst, p.Home)
-	}
-	if e.Category == session.CatPack {
-		return fmt.Errorf("refusing pack entry: %s: category %q has no legitimate Dst and is never installed by this path", e.Dst, e.Category)
-	}
-	if gitRootCategory(e.Category) && !e.Deferred && rc != nil {
-		root, ok := entryRoot(dst, rc.roots())
-		if !ok {
-			return fmt.Errorf("refusing %s entry: %s is not under any declared root", e.Category, e.Dst)
-		}
-		reason, err := rc.check(root)
-		if err != nil {
-			return fmt.Errorf("refusing %s entry: %s: check root %s: %w", e.Category, e.Dst, root, err)
-		}
-		if reason != "" {
-			return fmt.Errorf("refusing %s entry: %s: root %s %s", e.Category, e.Dst, root, reason)
-		}
-	}
-	if e.Category == session.CatSession {
-		if !underDir(dst, p.ConfigDir) {
-			return fmt.Errorf("refusing session entry: %s is not under config dir %s", e.Dst, p.ConfigDir)
-		}
-		rel, err := filepath.Rel(p.ConfigDir, dst)
-		if err != nil {
-			return fmt.Errorf("refusing session entry: %s: %w", e.Dst, err)
-		}
-		if session.Forbidden(rel) {
-			return fmt.Errorf("refusing session entry: %s is a forbidden path (%s)", e.Dst, rel)
-		}
-	}
-	if e.Category == session.CatCapture {
-		canon, err := canonicalCaptureDst(p.DataDir, jobID)
-		if err != nil {
-			return fmt.Errorf("refusing capture entry: %s: %w", e.Dst, err)
-		}
-		if dst != canon {
-			return fmt.Errorf("refusing capture entry: %s is not this job's own capture path (%s)", e.Dst, canon)
-		}
-	}
-	return nil
-}
-
 // checkForceOverwrite is the destination's gate on spec §7.3's forced
 // (non-fast-forward) replacement. FFAllowed travels from the source, so it
 // is corroborated — never simply believed — by re-deriving from Dst whether
@@ -275,14 +190,22 @@ func checkForceOverwrite(m *Manifest, e Entry, force bool) error {
 func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir string, p session.Paths, extra InstallExtras) (*InstallReport, error) {
 	rep := &InstallReport{}
 	// Defense-in-depth destination re-check, before anything is touched.
-	rc := newRootChecker(m, &p)
+	// modeInstall also CLAIMS every root this job finds absent, recording
+	// it in jobs/<id>/roots.json before a single file lands under it, so
+	// this job's own later re-runs (verifyInstall's re-diff, a resumed
+	// job) still recognise the now-populated root as their own while a
+	// root somebody else populated stays refused.
+	v, err := newValidator(m, p, modeInstall)
+	if err != nil {
+		return rep, err
+	}
 	for _, e := range m.Entries {
-		if err := validateDst(e, p, m.JobID, rc); err != nil {
+		if err := v.check(e); err != nil {
 			return rep, err
 		}
 	}
 	for _, e := range extra.Memory {
-		if err := validateDst(e, p, m.JobID, rc); err != nil {
+		if err := v.check(e); err != nil {
 			return rep, err
 		}
 	}
@@ -319,6 +242,9 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 		}
 		switch st[e.ID] {
 		case StagedSame:
+			if err := v.checkPlacement(e); err != nil {
+				return rep, err
+			}
 			if err := placeEntry(stagingDir, e); err != nil {
 				return rep, err
 			}
@@ -343,6 +269,9 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			}
 			if !ok {
 				return rep, fmt.Errorf("install %s: existing file is not a prefix of the incoming one (present-different)", e.Dst)
+			}
+			if err := v.checkPlacement(e); err != nil {
+				return rep, err
 			}
 			if err := placeFile(stagingDir, e); err != nil {
 				return rep, err
@@ -371,6 +300,9 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			if err := os.Remove(e.Dst); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return rep, fmt.Errorf("install %s: force overwrite: %w", e.Dst, err)
 			}
+			if err := v.checkPlacement(e); err != nil {
+				return rep, err
+			}
 			if err := placeFile(stagingDir, e); err != nil {
 				return rep, err
 			}
@@ -384,6 +316,9 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 	for _, e := range extra.Memory {
 		switch st[e.ID] {
 		case StagedSame:
+			if err := v.checkPlacement(e); err != nil {
+				return rep, err
+			}
 			if err := placeEntry(stagingDir, e); err != nil {
 				return rep, err
 			}
@@ -434,16 +369,20 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 // Uninstall removes manifest-listed installed files whose current content
 // still matches the manifest (for `abandon --delete-destination-files`), then
 // removes directories the install emptied. Every entry is re-checked against
-// p with the same defense-in-depth validateDst as Install (rc is nil: R-P3-
-// B1d's Root freshness/membership check is meaningless here — Uninstall only
-// ever removes content some earlier Install call already placed, by that
-// point necessarily non-empty, and it also legitimately processes
-// existing-main's Deferred dirty entries, whose Root was never fresh to
-// begin with), before anything is deleted, so a manifest cannot be used to
-// smuggle a deletion outside the session's own paths.
+// p with the same defense-in-depth validator as Install (modeUninstall: the
+// Root rules are meaningless here — Uninstall only ever removes content
+// some earlier Install call already placed and hash-verifies each one
+// before removing it, and it also legitimately processes existing-main's
+// Deferred dirty entries, whose Root was never this job's), before anything
+// is deleted, so a manifest cannot be used to smuggle a deletion outside
+// the session's own paths.
 func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
+	v, err := newValidator(m, p, modeUninstall)
+	if err != nil {
+		return nil, err
+	}
 	for _, e := range m.Entries {
-		if err := validateDst(e, p, m.JobID, nil); err != nil {
+		if err := v.check(e); err != nil {
 			return nil, err
 		}
 	}
@@ -531,7 +470,7 @@ func UninstallIDs(m *Manifest, p session.Paths, ids []int) ([]string, error) {
 	for _, id := range ids {
 		want[id] = true
 	}
-	sub := &Manifest{Version: m.Version, JobID: m.JobID, SessionID: m.SessionID, SourceHost: m.SourceHost, DestHost: m.DestHost, PathMap: m.PathMap}
+	sub := &Manifest{Version: m.Version, JobID: m.JobID, SessionID: m.SessionID, SourceHost: m.SourceHost, DestHost: m.DestHost, PathMap: m.PathMap, Roots: m.Roots}
 	for _, e := range m.Entries {
 		if want[e.ID] {
 			sub.Entries = append(sub.Entries, e)
