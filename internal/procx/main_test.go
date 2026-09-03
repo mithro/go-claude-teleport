@@ -12,9 +12,24 @@ import (
 // path, and the hook writes the pid it was asked to restore there. That
 // proves both that Freeze carried the pane ref through argv and that the
 // helper ran the hook — without needing a tmux server in a unit test.
+//
+// Written via a temp file + rename, not a direct os.WriteFile: the test
+// that reads this (TestHelperRestoresTheForegroundWhenOwnerDies) polls
+// with a plain os.ReadFile and treats ANY successful read as final —
+// os.WriteFile's own O_CREATE|O_TRUNC leaves a window where the file
+// exists but is still 0 bytes, which that poll can (and, under enough
+// concurrent load elsewhere on the machine, did) observe: "restore hook
+// ran for pid , want <pid>" is an EMPTY, not a missing, read. os.Rename
+// onto path is atomic on the same filesystem (same directory here), so a
+// concurrent reader only ever sees the old state (file absent) or the
+// complete new one — never a partial write.
 func restoreMarker(path string) RestoreFunc {
 	return func(pid int) error {
-		return os.WriteFile(path, []byte(strconv.Itoa(pid)), 0o600)
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, []byte(strconv.Itoa(pid)), 0o600); err != nil {
+			return err
+		}
+		return os.Rename(tmp, path)
 	}
 }
 
