@@ -1,6 +1,7 @@
 package sshx
 
 import (
+	"fmt"
 	"net"
 	"strconv"
 	"sync"
@@ -21,10 +22,17 @@ const (
 )
 
 // keepaliveSettings resolves the interval/count for a connection from the
-// Options defaults and any -o ServerAliveInterval / ServerAliveCountMax
-// override. interval <= 0 disables keepalives entirely (as `-o
-// ServerAliveInterval=0` does in OpenSSH).
-func keepaliveSettings(o Options, opts map[string]string) (time.Duration, int) {
+// Options defaults and the resolved ServerAliveInterval /
+// ServerAliveCountMax (an -o override, or the same keyword read out of
+// ~/.ssh/config by Resolve — OpenSSH honours both). interval <= 0 disables
+// keepalives entirely (as `-o ServerAliveInterval=0` does in OpenSSH).
+//
+// A ServerAliveCountMax that parses to zero or less is an error rather
+// than a silently-ignored value: it reads like "tolerate no misses" but
+// would leave the connection with the default 3, and quietly getting
+// different liveness behaviour than asked for is the kind of thing that is
+// only noticed when a job hangs.
+func keepaliveSettings(o Options, opts map[string]string) (time.Duration, int, error) {
 	interval := o.KeepaliveInterval
 	if interval == 0 {
 		interval = DefaultKeepaliveInterval
@@ -39,11 +47,15 @@ func keepaliveSettings(o Options, opts map[string]string) (time.Duration, int) {
 		}
 	}
 	if v, ok := opts["ServerAliveCountMax"]; ok {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		n, err := strconv.Atoi(v)
+		if err == nil && n <= 0 {
+			return 0, 0, fmt.Errorf("ServerAliveCountMax=%s: must be 1 or more (use ServerAliveInterval=0 to turn keepalives off)", v)
+		}
+		if err == nil {
 			count = n
 		}
 	}
-	return interval, count
+	return interval, count, nil
 }
 
 // idleTimeout is the read deadline that backs the keepalives up: with a
@@ -103,6 +115,15 @@ func startKeepalive(cl *ssh.Client, interval time.Duration, count int, desc stri
 			case <-stop:
 				return
 			case err := <-done:
+				// Stopped while this request was in flight (Client.Close):
+				// its failure is our own doing, not the link's. Checked
+				// here as well as in the select above because both cases
+				// can be ready at once, and select would pick either.
+				select {
+				case <-stop:
+					return
+				default:
+				}
 				if err != nil {
 					missed++
 					logf("keepalive to %s failed (%d/%d): %v", desc, missed, count, err)

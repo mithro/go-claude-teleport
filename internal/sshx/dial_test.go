@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -160,9 +162,18 @@ func TestKeepaliveClosesAConnectionThatStopsAnswering(t *testing.T) {
 	kh := filepath.Join(home, ".ssh", "known_hosts")
 	os.WriteFile(kh, []byte(sshtest.KnownHostsLine(knownHostsName(host, port), srv.HostKey)), 0o600)
 
+	var mu sync.Mutex
+	var lines []string
+	logf := func(f string, a ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(f, a...))
+		t.Logf(f, a...)
+	}
+
 	r := Resolved{Target: Target{User: "alice", Host: host, Port: port}, HostName: host}
 	c, err := Dial(context.Background(), r, nil, nil, Options{
-		KnownHostsFile: kh, Home: home, Logf: t.Logf, ConnectTimeout: 5 * time.Second,
+		KnownHostsFile: kh, Home: home, Logf: logf, ConnectTimeout: 5 * time.Second,
 		KeepaliveInterval: 150 * time.Millisecond, KeepaliveCountMax: 3,
 	})
 	if err != nil {
@@ -183,6 +194,69 @@ func TestKeepaliveClosesAConnectionThatStopsAnswering(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("connection to a server that stopped answering never failed")
 	}
+	// The idle read deadline (interval x (count+1)) is only one interval
+	// behind the keepalives here and would kill the connection too, so the
+	// timing alone does not pin WHICH mechanism fired. The log does.
+	mu.Lock()
+	defer mu.Unlock()
+	closed := false
+	for _, l := range lines {
+		if strings.Contains(l, "no keepalive answer from") {
+			closed = true
+		}
+	}
+	if !closed {
+		t.Errorf("nothing in the log says the keepalive loop closed it: %q", lines)
+	}
+}
+
+// TestKeepaliveSurvivesABriefHiccup is the other side of the same rule: a
+// pause SHORTER than interval x countMax is a hiccup, not a dead link, and
+// must not cost the job its connection. Only the countMax-th consecutive
+// miss may close it.
+func TestKeepaliveSurvivesABriefHiccup(t *testing.T) {
+	home, pub := testHome(t)
+	const interval = 200 * time.Millisecond
+	// One pause of 300ms: longer than an interval (so a keepalive really
+	// is missed and the recovery path is exercised) but well short of the
+	// 600ms of silence that 3 misses would take.
+	srv := sshtest.New(t, sshtest.Options{
+		Authorized: []ssh.PublicKey{pub}, Exec: echoExec,
+		GlobalRequestDelay: func(n int) time.Duration {
+			if n == 1 {
+				return 300 * time.Millisecond
+			}
+			return 0
+		},
+	})
+	host, port := hostPort(t, srv.Addr)
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+	os.WriteFile(kh, []byte(sshtest.KnownHostsLine(knownHostsName(host, port), srv.HostKey)), 0o600)
+
+	r := Resolved{Target: Target{User: "alice", Host: host, Port: port}, HostName: host}
+	c, err := Dial(context.Background(), r, nil, nil, Options{
+		KnownHostsFile: kh, Home: home, Logf: t.Logf, ConnectTimeout: 5 * time.Second,
+		KeepaliveInterval: interval, KeepaliveCountMax: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- c.SSH().Wait() }()
+	select {
+	case err := <-done:
+		t.Fatalf("connection died over a %s hiccup (%s x 3 = %s of silence is the limit): %v",
+			300*time.Millisecond, interval, 3*interval, err)
+	case <-time.After(2 * time.Second):
+	}
+	// Still usable, not merely still open.
+	sess, err := c.SSH().NewSession()
+	if err != nil {
+		t.Fatalf("NewSession after the hiccup: %v", err)
+	}
+	sess.Close()
 }
 
 // TestKeepaliveSettings pins the OpenSSH-named -o overrides and defaults.
@@ -193,16 +267,32 @@ func TestKeepaliveSettings(t *testing.T) {
 		opts     map[string]string
 		interval time.Duration
 		count    int
+		wantErr  string
 	}{
-		{"defaults", Options{}, nil, DefaultKeepaliveInterval, DefaultKeepaliveCountMax},
-		{"option fields", Options{KeepaliveInterval: time.Second, KeepaliveCountMax: 5}, nil, time.Second, 5},
-		{"-o wins", Options{KeepaliveInterval: time.Second, KeepaliveCountMax: 5},
-			map[string]string{"ServerAliveInterval": "30", "ServerAliveCountMax": "2"}, 30 * time.Second, 2},
-		{"-o 0 disables", Options{}, map[string]string{"ServerAliveInterval": "0"}, 0, DefaultKeepaliveCountMax},
-		{"junk -o is ignored", Options{}, map[string]string{"ServerAliveInterval": "soon"}, DefaultKeepaliveInterval, DefaultKeepaliveCountMax},
+		{name: "defaults", interval: DefaultKeepaliveInterval, count: DefaultKeepaliveCountMax},
+		{name: "option fields", o: Options{KeepaliveInterval: time.Second, KeepaliveCountMax: 5}, interval: time.Second, count: 5},
+		{name: "-o wins", o: Options{KeepaliveInterval: time.Second, KeepaliveCountMax: 5},
+			opts:     map[string]string{"ServerAliveInterval": "30", "ServerAliveCountMax": "2"},
+			interval: 30 * time.Second, count: 2},
+		{name: "-o 0 disables", opts: map[string]string{"ServerAliveInterval": "0"}, interval: 0, count: DefaultKeepaliveCountMax},
+		{name: "junk -o is ignored", opts: map[string]string{"ServerAliveInterval": "soon"}, interval: DefaultKeepaliveInterval, count: DefaultKeepaliveCountMax},
+		// A count of 0 reads like "tolerate no misses" but used to leave
+		// the default 3 in place; it is refused instead of silently
+		// meaning something else.
+		{name: "-o ServerAliveCountMax=0 is refused", opts: map[string]string{"ServerAliveCountMax": "0"}, wantErr: "must be 1 or more"},
+		{name: "-o ServerAliveCountMax=-1 is refused", opts: map[string]string{"ServerAliveCountMax": "-1"}, wantErr: "must be 1 or more"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			gi, gc := keepaliveSettings(tc.o, tc.opts)
+			gi, gc, err := keepaliveSettings(tc.o, tc.opts)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("keepaliveSettings: %v", err)
+			}
 			if gi != tc.interval || gc != tc.count {
 				t.Errorf("keepaliveSettings = %s/%d, want %s/%d", gi, gc, tc.interval, tc.count)
 			}
@@ -243,5 +333,64 @@ func TestIdleConnReadDeadline(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("read blocked for %s", elapsed)
+	}
+}
+
+// TestCloseStopsKeepaliveBeforeClosingTheConnection covers B4. Close used
+// to close the ssh connections first and stop the keepalive loop
+// afterwards, so the request that was in flight at that moment failed and
+// the loop logged "keepalive to … failed (1/3)" about a connection the
+// caller had deliberately closed — an alarming line in log.txt with no
+// problem behind it. A silent server keeps the very first keepalive
+// pending, which is exactly that window.
+func TestCloseStopsKeepaliveBeforeClosingTheConnection(t *testing.T) {
+	home, pub := testHome(t)
+	srv := sshtest.New(t, sshtest.Options{Authorized: []ssh.PublicKey{pub}, Exec: echoExec, SilentGlobalRequests: true})
+	host, port := hostPort(t, srv.Addr)
+	kh := filepath.Join(home, ".ssh", "known_hosts")
+	os.WriteFile(kh, []byte(sshtest.KnownHostsLine(knownHostsName(host, port), srv.HostKey)), 0o600)
+
+	var mu sync.Mutex
+	var lines []string
+	logf := func(f string, a ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(f, a...))
+	}
+	keepaliveLines := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		var out []string
+		for _, l := range lines {
+			if strings.Contains(l, "keepalive") {
+				out = append(out, l)
+			}
+		}
+		return out
+	}
+
+	r := Resolved{Target: Target{User: "alice", Host: host, Port: port}, HostName: host}
+	c, err := Dial(context.Background(), r, nil, nil, Options{
+		KnownHostsFile: kh, Home: home, Logf: logf, ConnectTimeout: 5 * time.Second,
+		// Long enough that nothing times out on its own: the only thing
+		// that can make the pending request fail is Close itself.
+		KeepaliveInterval: 30 * time.Second, KeepaliveCountMax: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Give the keepalive goroutine time to react to the closed connection.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(keepaliveLines()) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := keepaliveLines(); len(got) > 0 {
+		t.Errorf("Close logged keepalive noise: %q", got)
 	}
 }

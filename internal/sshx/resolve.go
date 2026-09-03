@@ -142,6 +142,17 @@ func Resolve(t Target, cfg *ssh_config.Config, overrides map[string]string, loca
 		}
 	}
 
+	// OpenSSH reads the keepalive keywords from the config too; an
+	// explicit -o wins (the copy loop below writes it over this).
+	for _, k := range []string{"ServerAliveInterval", "ServerAliveCountMax"} {
+		if _, ok := ov[k]; ok {
+			continue
+		}
+		if v := cfgGet(cfg, t.Host, k); v != "" {
+			r.Options[k] = v
+		}
+	}
+
 	jumpSpec, has := ov["ProxyJump"]
 	if !has {
 		jumpSpec = cfgGet(cfg, t.Host, "ProxyJump")

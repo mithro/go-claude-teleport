@@ -50,17 +50,9 @@ type Client struct {
 // SSH exposes the underlying client (used by remote tests and Plan 03 pty runs).
 func (c *Client) SSH() *ssh.Client { return c.ssh }
 
-// Close closes the target connection, then each jump, innermost first.
-func (c *Client) Close() error {
-	err := c.ssh.Close()
-	for i := len(c.jumps) - 1; i >= 0; i-- {
-		c.jumps[i].Close()
-	}
-	for _, f := range c.closes {
-		f()
-	}
-	return err
-}
+// Close stops the keepalive loop, then closes the target connection and
+// each jump, innermost first.
+func (c *Client) Close() error { return c.closeAll() }
 
 // String renders user@host (via a, b).
 func (c *Client) String() string { return c.desc }
@@ -119,7 +111,10 @@ func Dial(ctx context.Context, r Resolved, cfg *ssh_config.Config, overrides map
 	// The keepalive settings come from the final target: -o overrides are
 	// never applied to jump hops (see above), and one loop on the end of
 	// the chain notices a break anywhere along it.
-	keepaliveInterval, keepaliveCount := keepaliveSettings(o, r.Options)
+	keepaliveInterval, keepaliveCount, err := keepaliveSettings(o, r.Options)
+	if err != nil {
+		return nil, fmt.Errorf("ssh %s: %w", r.Host, err)
+	}
 
 	c := &Client{}
 	var prev *ssh.Client
@@ -190,16 +185,27 @@ func Dial(ctx context.Context, r Resolved, cfg *ssh_config.Config, overrides map
 	return c, nil
 }
 
-func (c *Client) closeAll() {
+// closeAll is the one teardown path — Close and dial's own error returns
+// both use it, so the ordering below can never be got right in one and
+// wrong in the other.
+//
+// The keepalive loop is stopped BEFORE anything is closed (B4): a request
+// is very likely in flight, and closing under it makes the loop report a
+// failure — "keepalive to … failed (1/3)" in log.txt — about a connection
+// the caller deliberately closed. It returns the target connection's own
+// close error; a half-built chain (c.ssh == nil) has none.
+func (c *Client) closeAll() error {
+	for _, f := range c.closes {
+		f()
+	}
+	var err error
 	if c.ssh != nil {
-		c.ssh.Close()
+		err = c.ssh.Close()
 	}
 	for i := len(c.jumps) - 1; i >= 0; i-- {
 		c.jumps[i].Close()
 	}
-	for _, f := range c.closes {
-		f()
-	}
+	return err
 }
 
 // Redial calls dial up to attempts times with exponential backoff

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -24,7 +25,12 @@ type Options struct {
 	// SilentGlobalRequests reads global requests (keepalives) and never
 	// answers them: a server that is up but has stopped responding.
 	SilentGlobalRequests bool
-	Logf                 func(string, ...any)
+	// GlobalRequestDelay, when set, is consulted for each global request
+	// in arrival order (n starts at 1) and the server waits that long
+	// before answering it: a host that hiccups and then recovers, as
+	// opposed to SilentGlobalRequests' host that never comes back.
+	GlobalRequestDelay func(n int) time.Duration
+	Logf               func(string, ...any)
 }
 
 // Server is a running in-process ssh server bound to 127.0.0.1.
@@ -125,6 +131,21 @@ func (s *Server) handleConn(c net.Conn) {
 	if s.opts.SilentGlobalRequests {
 		go func() {
 			for range reqs { // read and drop: never Reply
+			}
+		}()
+	} else if s.opts.GlobalRequestDelay != nil {
+		go func() {
+			n := 0
+			for req := range reqs {
+				n++
+				if d := s.opts.GlobalRequestDelay(n); d > 0 {
+					time.Sleep(d)
+				}
+				if req.WantReply {
+					// false is what OpenSSH answers an unknown global
+					// request with; the point is that it answers at all.
+					req.Reply(false, nil)
+				}
 			}
 		}()
 	} else {
