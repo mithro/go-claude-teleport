@@ -356,7 +356,26 @@ func (r *runner) runInstall(ctx context.Context) error {
 	for _, m := range rep.MemoryDiffers {
 		r.logf("install: memory file differs on the destination and was left alone: %s", m)
 	}
-	return nil
+	// R-P3-23a: record which ids this (or an earlier, partial) attempt
+	// actually placed, immutably — Statuses gets overwritten by every
+	// later manifest-diff (capture/verifyTransfer/runTransfer), so it can
+	// no longer answer "what did this job install" once the job finishes;
+	// InstalledIDs is the durable record abandon reads instead. Union with
+	// whatever a prior attempt already recorded (never drop an id), since
+	// a retried install only reports THIS attempt's newly-placed entries —
+	// anything already PresentSame from an earlier attempt is correctly
+	// absent from rep.InstalledIDs this time and must not be lost.
+	seen := make(map[int]bool, len(r.p.InstalledIDs))
+	for _, id := range r.p.InstalledIDs {
+		seen[id] = true
+	}
+	for _, id := range rep.InstalledIDs {
+		if !seen[id] {
+			r.p.InstalledIDs = append(r.p.InstalledIDs, id)
+			seen[id] = true
+		}
+	}
+	return r.persist(ctx)
 }
 
 // ---- 6 git-attach -------------------------------------------------------

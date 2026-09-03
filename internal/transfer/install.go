@@ -20,6 +20,11 @@ type InstallReport struct {
 	IndexMerged, HistoryAdded             int
 	ProjectEntryAdded                     bool
 	MemoryCopied, MemoryDiffers           []string
+	// InstalledIDs is the manifest ids this call actually placed at Dst
+	// (the StagedSame and FFCandidate cases below) — never a PresentSame
+	// entry, which was already there before this call touched anything.
+	// abandon --delete-destination-files (ruling R-P3-23a) is the reader.
+	InstalledIDs []int
 }
 
 type InstallExtras struct {
@@ -207,6 +212,7 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			}
 			rep.Installed++
 			installed[e.Dst] = true
+			rep.InstalledIDs = append(rep.InstalledIDs, e.ID)
 		case PresentSame:
 			dropStaged(stagingDir, e)
 			rep.SkippedSame++
@@ -231,6 +237,7 @@ func Install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 			}
 			rep.FastForwarded++
 			installed[e.Dst] = true
+			rep.InstalledIDs = append(rep.InstalledIDs, e.ID)
 		default:
 			return rep, fmt.Errorf("install %s: status %s — refusing (nothing after this entry was touched)", e.Dst, st[e.ID])
 		}
@@ -359,15 +366,20 @@ func Uninstall(m *Manifest, p session.Paths) ([]string, error) {
 }
 
 // UninstallIDs is Uninstall restricted to the manifest entries named by
-// ids (abandon --delete-destination-files, Plan 03: only files this job
-// itself installed — entries whose preflight status was Absent — are ever
-// candidates, so a file that merely already existed on the destination
-// with matching content for unrelated reasons is never removed). It
-// reuses Uninstall's containment check (validateDst) and hash
-// verification unchanged; every directory entry in m is still considered
-// for the deepest-first empty-directory cleanup afterward, since a
-// directory holds no content of its own to protect and Uninstall never
-// deletes a non-empty one.
+// ids (abandon --delete-destination-files, Plan 03: ids is
+// orchestrate.Plan.InstalledIDs — only files this job itself installed —
+// so a file that merely already existed on the destination with matching
+// content for unrelated reasons is never removed). It reuses Uninstall's
+// containment check (validateDst) and hash verification unchanged.
+//
+// Ruling M1: a directory entry is a deletion/empty-cleanup candidate ONLY
+// when its own id is in ids — i.e. the job itself created that directory
+// (Install's StagedSame/FFCandidate case, which is exactly what populates
+// InstalledIDs). A pre-existing directory (PresentSame at install time,
+// never in InstalledIDs) must never be removed even if it happens to be
+// empty by the time abandon runs — unlike Uninstall's caller in the
+// "this host is already the destination" path, which legitimately means
+// every manifest dir.
 func UninstallIDs(m *Manifest, p session.Paths, ids []int) ([]string, error) {
 	want := make(map[int]bool, len(ids))
 	for _, id := range ids {
@@ -375,7 +387,7 @@ func UninstallIDs(m *Manifest, p session.Paths, ids []int) ([]string, error) {
 	}
 	sub := &Manifest{Version: m.Version, JobID: m.JobID, SessionID: m.SessionID, SourceHost: m.SourceHost, DestHost: m.DestHost, PathMap: m.PathMap}
 	for _, e := range m.Entries {
-		if e.IsDir() || want[e.ID] {
+		if want[e.ID] {
 			sub.Entries = append(sub.Entries, e)
 		}
 	}

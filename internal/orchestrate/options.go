@@ -60,10 +60,20 @@ type Plan struct {
 	Collisions   []transfer.Entry `json:"collisions"`
 
 	// Additions (Plan 03):
-	JobID          string                  `json:"job_id"`
-	SourceFacts    *tmuxx.Facts            `json:"source_facts"` // nil when the source has no pane
-	Files          []session.FileEntry     `json:"files"`        // everything the manifest is built from (rebuilt with the capture at step 3)
-	Statuses       map[int]transfer.Status `json:"statuses"`
+	JobID       string                  `json:"job_id"`
+	SourceFacts *tmuxx.Facts            `json:"source_facts"` // nil when the source has no pane
+	Files       []session.FileEntry     `json:"files"`        // everything the manifest is built from (rebuilt with the capture at step 3)
+	Statuses    map[int]transfer.Status `json:"statuses"`
+	// InstalledIDs is the set of manifest ids the install step (spec §6
+	// step 5) actually placed on the destination (transfer.InstallReport's
+	// StagedSame/FFCandidate entries) — recorded once there and never
+	// recomputed: Statuses is overwritten by later manifest-diffs (capture,
+	// verifyTransfer, runTransfer all re-diff and persist a fresh map), so
+	// by the time a job finishes every entry reads back PresentSame and
+	// Statuses can no longer answer "what did THIS job install" (ruling
+	// R-P3-23a). abandon --delete-destination-files reads this field
+	// directly instead of deriving a candidate set from Statuses.
+	InstalledIDs   []int                   `json:"installed_ids"`
 	Extras         *transfer.InstallExtras `json:"extras"`
 	CaptureEntryID int                     `json:"capture_entry_id"`
 	DestCwd        string                  `json:"dest_cwd"`

@@ -401,6 +401,31 @@ func TestUninstallIDsOnlyNamedEntries(t *testing.T) {
 	}
 }
 
+// TestUninstallIDsNeverRemovesDirNotInIDs is folded minor M1: a directory
+// entry is a cleanup candidate only when its OWN id is in ids (i.e. the
+// job itself created it) — never merely because every file under it also
+// happened to be named. Here every non-dir entry is named, emptying the
+// project directory, but its own id (0) is not — it must survive.
+func TestUninstallIDsNeverRemovesDirNotInIDs(t *testing.T) {
+	m, staging, p := staged(t)
+	st, _ := Diff(context.Background(), m, staging)
+	if _, err := Install(context.Background(), m, st, staging, p, InstallExtras{}); err != nil {
+		t.Fatal(err)
+	}
+	var ids []int
+	for _, e := range m.Entries {
+		if !e.IsDir() {
+			ids = append(ids, e.ID)
+		}
+	}
+	if _, err := UninstallIDs(m, p, ids); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(m.Entries[0].Dst); err != nil {
+		t.Errorf("directory whose id is not in ids must survive even once empty: %v", err)
+	}
+}
+
 // TestUninstallRemovesEmptiedNestedDirs covers controller ruling 2: a
 // manifest whose dir entries include a nested "<sid>/subagents/" tree must
 // leave no empty directories behind once every file under it is removed —
