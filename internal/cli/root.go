@@ -123,9 +123,9 @@ func (a *app) rootCmd() *cobra.Command {
 	root.PersistentFlags().StringVar(&a.configDir, "config-dir", "", "local CLAUDE_CONFIG_DIR override")
 	a.flags = &tf
 
-	root.AddCommand(a.versionCmd(), a.internalFreezerCmd(), a.placeholderCmd(), a.inspectCmd(), a.listCmd(), a.compareConfigCmd(), a.doctorCmd())
+	root.AddCommand(a.versionCmd(), a.internalFreezerCmd(), a.placeholderCmd(), newInspectCmd(a), a.listCmd(), a.compareConfigCmd(), newDoctorCmd(a))
 	AddTransportCommands(root)
-	root.AddCommand(newContinueCmd(a), newInternalRunnerCmd(a))
+	root.AddCommand(newContinueCmd(a), newInternalRunnerCmd(a), newAbandonCmd(a))
 	return root
 }
 

@@ -4,16 +4,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/mithro/go-claude-teleport/internal/remote"
+	"github.com/mithro/go-claude-teleport/internal/gitx"
+	"github.com/mithro/go-claude-teleport/internal/orchestrate"
 	"github.com/mithro/go-claude-teleport/internal/session"
 )
 
-type inspectOut struct {
+// inspectReport is everything `inspect` can show: the local inventory
+// (files a teleport would move, git state) always, and — with --host —
+// the preflight plan and drift table against that destination, or the
+// refusal reason.
+type inspectReport struct {
 	ID         string              `json:"id"`
 	State      string              `json:"state"`
 	Name       string              `json:"name,omitempty"`
@@ -29,6 +36,10 @@ type inspectOut struct {
 	Skipped    []session.Skipped   `json:"skipped"`
 	TotalBytes int64               `json:"total_bytes"`
 	Usage      *session.Usage      `json:"usage"`
+	Git        *gitx.Info          `json:"git,omitempty"`
+	GitError   string              `json:"git_error,omitempty"`
+	Plan       *orchestrate.Plan   `json:"plan,omitempty"`
+	Refused    string              `json:"refused,omitempty"`
 }
 
 func keys(m map[string]bool) string {
@@ -43,125 +54,173 @@ func keys(m map[string]bool) string {
 	return strings.Join(ks, ", ")
 }
 
-func (a *app) inspectCmd() *cobra.Command {
+// newInspectCmd subsumes Plan 01's local-only inspect and Plan 02's
+// inspectRemote: --host runs the exact preflight a teleport would (spec
+// §6 step 1) and renders the plan and drift table, or the refusal.
+func newInspectCmd(a *app) *cobra.Command {
 	var host string
 	var via, opts []string
 	cmd := &cobra.Command{
 		Use:   "inspect [<session>]",
-		Short: "show everything a teleport would move for a session",
+		Short: "show everything a teleport would move, and the drift report against --host",
 		Long: `Resolves the session (same rules as a teleport), then lists its state,
-directories, every session file that would be transferred, what the
-transcript used (MCP servers, skills, plugins, sub-agents) and what would
-be skipped. The configuration drift report needs a destination host: see
-"claude-teleport compare-config <host> --session <session>".
+directories, every session file that would be transferred, its git state
+and what would be skipped.
 
-With --host, the session is resolved and inventoried on that host instead
-of locally (--via/-o work as they do for a teleport); the report is
-otherwise identical.`,
+With --host, also runs preflight against that destination (--via/-o work
+as they do for a teleport) and renders the plan and drift table exactly as
+a real teleport would show it, or the refusal reason (exit 3).`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if host != "" {
-				return a.inspectRemote(cmd, args, host, via, opts)
-			}
-			s, err := a.resolveSession(args)
+			ctx := cmd.Context()
+			sess, err := a.resolveSession(args)
 			if err != nil {
 				return err
 			}
-			inv, err := session.InventoryFiles(s)
+			inv, err := session.InventoryFiles(sess)
 			if err != nil {
 				return Exit(ExitFailed, "%v", err)
 			}
-			usage, err := session.ScanUsage(s)
+			usage, err := session.ScanUsage(sess)
 			if err != nil {
 				return Exit(ExitFailed, "%v", err)
 			}
-			return a.renderInspect(s, inv, usage)
+			rep := &inspectReport{
+				ID: string(sess.ID), State: sess.State.String(), Name: sess.Name,
+				LaunchCwd: sess.LaunchCwd, WorkCwd: sess.WorkCwd, Branch: sess.Branch,
+				Version: sess.Version, Transcript: sess.Transcript, Registry: sess.Registry,
+				Tmux: sess.Tmux, Files: inv.Files, Memory: inv.Memory, Skipped: inv.Skipped, Usage: usage,
+			}
+			for _, f := range inv.Files {
+				rep.TotalBytes += f.Size
+			}
+			if gi, gerr := gitx.Inspect(sess.LaunchCwd); gerr != nil {
+				if !errors.Is(gerr, gitx.ErrNotRepo) {
+					rep.GitError = gerr.Error()
+				}
+			} else {
+				rep.Git = gi
+			}
+
+			code := ExitOK
+			if host != "" {
+				sshOpts, err := parseSSHOptions(opts)
+				if err != nil {
+					return usageErr(err)
+				}
+				o := orchestrate.Options{
+					Direction: "to", Target: host, Via: via, SSHOptions: sshOpts,
+					Selector: session.Selector{ID: sess.ID}, State: "auto",
+					ExitTimeout: 30 * time.Second, StartTimeout: 90 * time.Second,
+				}
+				src, dst, closeFn, err := a.endpoints(ctx, o)
+				if err != nil {
+					return exitErr(a.fail(err))
+				}
+				defer closeFn()
+				plan, err := orchestrate.Preflight(ctx, o, src, dst, string(sess.ID))
+				var re *orchestrate.RefusedError
+				switch {
+				case errors.As(err, &re):
+					rep.Refused, code = re.Reason, ExitRefused
+				case err != nil:
+					return exitErr(a.fail(err))
+				default:
+					rep.Plan = plan
+				}
+			}
+
+			if a.json() {
+				b, err := json.MarshalIndent(rep, "", "  ")
+				if err != nil {
+					return err
+				}
+				fmt.Fprintln(a.stdout, string(b))
+				return exitErr(code)
+			}
+			renderInspect(a.stdout, rep, host)
+			return exitErr(code)
 		},
 	}
-	cmd.Flags().StringVar(&host, "host", "", "resolve and inventory the session on this host instead of locally")
+	cmd.Flags().StringVar(&host, "host", "", "also run preflight against HOST and show the plan and drift")
 	remoteFlags(cmd, &via, &opts)
 	return cmd
 }
 
-// inspectRemote resolves the selector on host over the Plan 02 remote
-// transport and renders the same report renderInspect produces locally,
-// sourced from that host's inventory instead of this machine's.
-func (a *app) inspectRemote(cmd *cobra.Command, args []string, host string, via, opts []string) error {
-	ctx := cmd.Context()
-	sel, err := session.ParseSelector(args, a.selectorEnv())
-	if err != nil {
-		return Exit(ExitUsage, "%v", err)
+// renderInspect writes the human-readable report; a.json() short-circuits
+// to JSON before this is ever called.
+func renderInspect(w io.Writer, rep *inspectReport, host string) {
+	shortID := session.ID(rep.ID).Short()
+	fmt.Fprintf(w, "session    %s (%s)\n", shortID, rep.State)
+	if rep.Name != "" {
+		fmt.Fprintf(w, "name       %s\n", rep.Name)
 	}
-	rc, closeRemote, err := openRemote(cmd, host, via, opts)
-	if err != nil {
-		return err
+	fmt.Fprintf(w, "launch cwd %s\n", rep.LaunchCwd)
+	if rep.WorkCwd != "" && rep.WorkCwd != rep.LaunchCwd {
+		fmt.Fprintf(w, "work cwd   %s\n", rep.WorkCwd)
 	}
-	defer closeRemote()
-	s, err := rc.ResolveSession(ctx, sel)
-	if err != nil {
-		var pe *remote.Error
-		if errors.As(err, &pe) && pe.Code == "not-found" {
-			return Exit(ExitRefused, "%s: %v", host, err)
-		}
-		return Exit(ExitFailed, "%s: %v", host, err)
+	fmt.Fprintf(w, "branch     %s\nclaude     %s\ntranscript %s\n", rep.Branch, rep.Version, rep.Transcript)
+	if rep.Registry != nil {
+		fmt.Fprintf(w, "process    pid %d status %s tmux %q\n", rep.Registry.PID, rep.Registry.Status, rep.Registry.Tmux)
 	}
-	inv, usage, err := rc.InventorySession(ctx, s.ID)
-	if err != nil {
-		return Exit(ExitFailed, "%s: %v", host, err)
-	}
-	return a.renderInspect(s, inv, usage)
-}
 
-// renderInspect writes the inspect report for s/inv/usage; the single
-// rendering path shared by the local branch and inspect --host.
-func (a *app) renderInspect(s *session.Session, inv *session.Inventory, usage *session.Usage) error {
-	out := inspectOut{ID: string(s.ID), State: s.State.String(), Name: s.Name, LaunchCwd: s.LaunchCwd, WorkCwd: s.WorkCwd,
-		Branch: s.Branch, Version: s.Version, Transcript: s.Transcript, Registry: s.Registry, Tmux: s.Tmux,
-		Files: inv.Files, Memory: inv.Memory, Skipped: inv.Skipped, Usage: usage}
-	for _, f := range inv.Files {
-		out.TotalBytes += f.Size
+	nSession := 0
+	for _, f := range rep.Files {
+		if !f.Mode.IsDir() {
+			nSession++
+		}
 	}
-	if a.json() {
-		b, _ := json.MarshalIndent(out, "", "  ")
-		fmt.Fprintln(a.stdout, string(b))
-		return nil
-	}
-	w := a.stdout
-	fmt.Fprintf(w, "session    %s (%s)\n", out.ID, out.State)
-	if out.Name != "" {
-		fmt.Fprintf(w, "name       %s\n", out.Name)
-	}
-	fmt.Fprintf(w, "launch cwd %s\n", out.LaunchCwd)
-	if out.WorkCwd != out.LaunchCwd {
-		fmt.Fprintf(w, "work cwd   %s\n", out.WorkCwd)
-	}
-	fmt.Fprintf(w, "branch     %s\nclaude     %s\ntranscript %s\n", out.Branch, out.Version, out.Transcript)
-	if out.Registry != nil {
-		fmt.Fprintf(w, "process    pid %d status %s tmux %q\n", out.Registry.PID, out.Registry.Status, out.Registry.Tmux)
-	}
-	fmt.Fprintf(w, "\nfiles to move (%d, %d bytes):\n", len(out.Files), out.TotalBytes)
-	for _, f := range out.Files {
+	fmt.Fprintf(w, "\n%d session files, %d memory files, %d bytes total, %d skipped:\n", nSession, len(rep.Memory), rep.TotalBytes, len(rep.Skipped))
+	for _, f := range rep.Files {
 		if f.Mode.IsDir() {
 			continue
 		}
 		fmt.Fprintf(w, "  %10d  %s\n", f.Size, f.Rel)
 	}
-	if len(out.Memory) > 0 {
+	if len(rep.Memory) > 0 {
 		fmt.Fprintln(w, "\nproject memory (copied only if absent on the destination):")
-		for _, f := range out.Memory {
+		for _, f := range rep.Memory {
 			if !f.Mode.IsDir() {
 				fmt.Fprintf(w, "  %10d  %s\n", f.Size, f.Rel)
 			}
 		}
 	}
-	if len(out.Skipped) > 0 {
-		fmt.Fprintln(w, "\nskipped:")
-		for _, sk := range out.Skipped {
-			fmt.Fprintf(w, "  %s (%s)\n", sk.Path, sk.Reason)
-		}
+	for _, s := range rep.Skipped {
+		fmt.Fprintf(w, "  skipped %s: %s\n", s.Path, s.Reason)
 	}
-	fmt.Fprintf(w, "\nused by the transcript:\n  mcp: %s\n  skills: %s\n  plugins: %s\n  sub-agents: %s\n  permission modes: %s\n",
-		keys(usage.MCPServers), keys(usage.Skills), keys(usage.Plugins), keys(usage.SubagentTypes), keys(usage.PermissionModes))
-	fmt.Fprintln(w, "\ndrift report: needs a destination — run: claude-teleport compare-config <host> --session", out.ID[:8])
-	return nil
+
+	switch {
+	case rep.Git != nil:
+		g := rep.Git
+		kind := "main checkout"
+		if g.IsLinked {
+			kind = "linked worktree " + g.WorktreeName
+		}
+		head := g.Head
+		if len(head) > 7 {
+			head = head[:7]
+		}
+		fmt.Fprintf(w, "\nGit     %s of %s, branch %s at %s\n", kind, g.MainDir, g.Branch, head)
+		fmt.Fprintf(w, "  dirty %d staged, %d modified, %d untracked, %d deleted; %d other worktree(s)\n",
+			len(g.Dirty.Staged), len(g.Dirty.Modified), len(g.Dirty.Untracked), len(g.Dirty.Deleted), len(g.OtherWorktrees))
+	case rep.GitError != "":
+		fmt.Fprintf(w, "\nGit     error: %s\n", rep.GitError)
+	default:
+		fmt.Fprintf(w, "\nGit     not a git repository (%s is copied as plain files)\n", rep.LaunchCwd)
+	}
+
+	if rep.Usage != nil {
+		fmt.Fprintf(w, "\nused by the transcript:\n  mcp: %s\n  skills: %s\n  plugins: %s\n  sub-agents: %s\n  permission modes: %s\n",
+			keys(rep.Usage.MCPServers), keys(rep.Usage.Skills), keys(rep.Usage.Plugins), keys(rep.Usage.SubagentTypes), keys(rep.Usage.PermissionModes))
+	}
+
+	switch {
+	case rep.Plan != nil:
+		fmt.Fprintf(w, "\nPlan against %s\n", host)
+		rep.Plan.Render(w)
+	case rep.Refused != "":
+		fmt.Fprintf(w, "\nTeleport to %s would be refused: %s\n", host, rep.Refused)
+	case host == "":
+		fmt.Fprintf(w, "\ndrift report: needs a destination — run: claude-teleport inspect %s --host <host>\n", shortID)
+	}
 }

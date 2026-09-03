@@ -266,17 +266,22 @@ func tailLog(path string, n int) []string {
 	return lines
 }
 
+// runnerAlive reports whether pid is a live internal-runner process — the
+// pid alone is not enough (pids are reused), so this also requires the
+// cmdline to name internal-runner. Shared by continueJob and abandon (do
+// not duplicate this closure elsewhere).
+func runnerAlive(pid int) bool {
+	t, err := procx.Scan("/proc")
+	if err != nil {
+		return false
+	}
+	p, ok := t.Get(pid)
+	return ok && strings.Contains(strings.Join(p.Cmdline, " "), "internal-runner")
+}
+
 // continueJob attaches to a live runner or respawns a dead one.
 func (a *app) continueJob(ctx context.Context, j *job.Journal, bang bool) int {
-	alive := func(pid int) bool {
-		t, err := procx.Scan("/proc")
-		if err != nil {
-			return false
-		}
-		p, ok := t.Get(pid)
-		return ok && strings.Contains(strings.Join(p.Cmdline, " "), "internal-runner")
-	}
-	if j.RunnerAlive(alive) {
+	if j.RunnerAlive(runnerAlive) {
 		fmt.Fprintf(a.stdout, "attaching to runner %d\n", j.RunnerPID)
 		return a.follow(ctx, j, bang)
 	}

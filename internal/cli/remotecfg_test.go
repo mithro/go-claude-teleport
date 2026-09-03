@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/mithro/go-claude-teleport/internal/sshx/sshtest"
+	"github.com/mithro/go-claude-teleport/test/fakeclaude/harness"
 )
 
 // remoteHost starts an sshtest server whose exec handler runs THIS cli's
@@ -134,27 +136,57 @@ func TestCompareConfigUnreachable(t *testing.T) {
 	}
 }
 
-func TestInspectHostResolvesRemotely(t *testing.T) {
-	remoteEnv, remoteHome := testEnv(t)
+// TestInspectHostUnknownSessionIsRefused covers newInspectCmd's --host: the
+// session is always resolved LOCALLY first (spec: inspect shows what a
+// teleport of the LOCAL session would move; --host only adds the preflight
+// plan/drift against a candidate destination — it does not inspect a
+// session that merely happens to live on some other host, which was Plan
+// 02's inspectRemote behaviour and is superseded here). A session absent
+// locally must fail before --host is ever consulted.
+func TestInspectHostUnknownSessionIsRefused(t *testing.T) {
+	remoteEnv, _ := testEnv(t)
 	target, opts, localHome := remoteHost(t, remoteEnv)
 	localEnv := []string{"HOME=" + localHome, "USER=alice", "PATH=/bin"}
-	// no such session on the remote -> not-found from the remote resolver
 	var out, errOut bytes.Buffer
 	code := Main(append([]string{"inspect", tsid, "--host", target}, opts...), strings.NewReader(""), &out, &errOut, localEnv)
 	if code == ExitOK || !strings.Contains(errOut.String(), "not") {
 		t.Errorf("exit %d stderr %q", code, errOut.String())
 	}
-	// with a transcript on the remote, inspect lists it
-	proj := filepath.Join(remoteHome, ".claude", "projects", "-home-bob-work")
-	os.MkdirAll(proj, 0o700)
-	os.WriteFile(filepath.Join(proj, tsid+".jsonl"), []byte(`{"type":"user","cwd":"/home/bob/work","sessionId":"`+tsid+`","version":"2.1.247","timestamp":"2026-08-27T10:00:00Z","message":{"role":"user","content":"hi"}}`+"\n"), 0o600)
-	out.Reset()
-	errOut.Reset()
-	code = Main(append([]string{"inspect", tsid, "--host", target}, opts...), strings.NewReader(""), &out, &errOut, localEnv)
-	if code != ExitOK {
-		t.Fatalf("exit %d: %s", code, errOut.String())
+}
+
+// TestInspectHostShowsPlan drives inspect --host against a real (loopback)
+// remote over the sshtest harness: a local session resolves, preflight
+// runs against the destination exactly as a teleport would, and the
+// rendered plan appears in the output.
+func TestInspectHostShowsPlan(t *testing.T) {
+	claudeDir := harness.Build(t)
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", claudeDir+string(os.PathListSeparator)+oldPath)
+	noTmux := filepath.Join(t.TempDir(), "no-tmux-here")
+
+	remoteEnv, remoteHome := testEnv(t)
+	remoteEnv = append(remoteEnv, "TMUX_TMPDIR="+noTmux)
+	os.MkdirAll(filepath.Join(remoteHome, ".claude"), 0o700)
+	target, opts, localHome := remoteHost(t, remoteEnv)
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + noTmux}
+
+	cwd := filepath.Join(localHome, "proj")
+	os.MkdirAll(cwd, 0o755)
+	seed := exec.Command("claude", "-p", "--session-id", tsid, "hi")
+	seed.Dir = cwd
+	seed.Env = append(os.Environ(), "HOME="+localHome, "CLAUDE_CONFIG_DIR="+filepath.Join(localHome, ".claude"), "PATH="+os.Getenv("PATH"))
+	if out, err := seed.CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v\n%s", err, out)
 	}
-	if !strings.Contains(out.String(), tsid+".jsonl") || !strings.Contains(out.String(), "/home/bob/work") {
-		t.Errorf("inspect --host output:\n%s", out.String())
+
+	var out, errOut bytes.Buffer
+	code := Main(append([]string{"inspect", tsid, "--host", target}, opts...), strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitOK {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, out.String(), errOut.String())
+	}
+	for _, want := range []string{"Plan against " + target, "Files", tsid[:8]} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("inspect --host output missing %q:\n%s", want, out.String())
+		}
 	}
 }

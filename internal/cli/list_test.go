@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,8 +29,44 @@ func TestListFixture(t *testing.T) {
 	if code != ExitOK || !strings.Contains(out, `"state": "idle"`) {
 		t.Fatalf("json: %d %s", code, out)
 	}
-	if code, _, stderr := run(t, env, "list", "--host", "big-storage.example"); code != ExitUsage || !strings.Contains(stderr, "not implemented yet") {
-		t.Fatalf("--host: %d %q", code, stderr)
+	// big-storage.example (IANA reserved) has no ssh key/agent available
+	// here, so the dial fails before any network I/O — deterministic exit 4.
+	if code, _, stderr := run(t, env, "list", "--host", "big-storage.example"); code != ExitUnreachable {
+		t.Fatalf("--host unreachable: %d %q", code, stderr)
+	}
+}
+
+// TestListHostShowsRemoteSessions drives `list --host` against a real
+// (loopback) remote over the sshtest harness: the table gets a HOST
+// column, and --json carries the same row shape as the local list with
+// "host" filled in.
+func TestListHostShowsRemoteSessions(t *testing.T) {
+	remoteEnv, remoteHome := testEnv(t)
+	target, opts, localHome := remoteHost(t, remoteEnv)
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PATH=/usr/bin:/bin"}
+
+	proj := filepath.Join(remoteHome, ".claude", "projects", "-home-bob-work")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"type":"user","cwd":"/home/bob/work","sessionId":"` + tsid + `","gitBranch":"main","version":"2.1.247","timestamp":"2026-08-27T11:00:05.000Z","message":{"role":"user","content":"hi"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(proj, tsid+".jsonl"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	args := append([]string{"list", "--host", target}, opts...)
+	code, out, stderr := run(t, localEnv, args...)
+	if code != ExitOK {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	if !strings.Contains(out, target) || !strings.Contains(out, tsid[:8]) || !strings.Contains(out, "/home/bob/work") {
+		t.Errorf("list --host output:\n%s", out)
+	}
+
+	args = append([]string{"list", "--host", target, "--json"}, opts...)
+	code, out, stderr = run(t, localEnv, args...)
+	if code != ExitOK || !strings.Contains(out, `"host": "`+target+`"`) {
+		t.Fatalf("list --host --json: %d\n%s\n%s", code, out, stderr)
 	}
 }
 

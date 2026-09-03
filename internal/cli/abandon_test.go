@@ -9,93 +9,31 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mithro/go-claude-teleport/internal/job"
+	"github.com/mithro/go-claude-teleport/internal/orchestrate"
+	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
-// startSleep spawns `sleep 60` and returns its pid, killing it on cleanup.
-// `sleep` is a universal POSIX utility; this mirrors the same precedent in
-// internal/procx/freezer_test.go rather than dialling a real host or
-// resolving a project binary that might be absent in CI.
-func startSleep(t *testing.T) int {
+// startFakeRunner spawns `sleep 60` with argv[0] rewritten to
+// "internal-runner" (the binary executed is still the real, universally
+// available `sleep`; only the argv the child sees — and /proc/pid/cmdline
+// — changes) and returns its pid, killing it on cleanup. runnerAlive
+// (teleport.go) matches on cmdline containing "internal-runner" to guard
+// against pid reuse, so a plain `sleep` process is not enough to exercise
+// job.RunnerAlive's true branch.
+func startFakeRunner(t *testing.T) int {
 	t.Helper()
 	cmd := exec.Command("sleep", "60")
+	cmd.Args[0] = "internal-runner"
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
 	return cmd.Process.Pid
-}
-
-func TestAbandonMarksAndRemovesStaging(t *testing.T) {
-	env, home := testEnv(t)
-	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
-	j, _ := job.New(dataDir, tsid)
-	j.Direction = "to"
-	j.Save()
-	staging := job.StagingDir(dataDir, tsid)
-	os.MkdirAll(staging, 0o700)
-	os.WriteFile(filepath.Join(staging, "1"), []byte("x"), 0o600)
-
-	var out, errOut bytes.Buffer
-	if code := Main([]string{"abandon", tsid}, strings.NewReader(""), &out, &errOut, env); code != ExitOK {
-		t.Fatalf("exit %d: %s", code, errOut.String())
-	}
-	got, _, _ := job.Open(dataDir, tsid)
-	if got.Outcome != "abandoned" || !got.Finished {
-		t.Errorf("journal = %+v", got)
-	}
-	if _, err := os.Stat(staging); !os.IsNotExist(err) {
-		t.Errorf("staging dir must be removed")
-	}
-	if _, err := os.Stat(j.LogPath()); err == nil {
-		// log may not exist; only assert the job dir survives
-	}
-	if _, err := os.Stat(j.Dir); err != nil {
-		t.Errorf("job dir must survive abandon: %v", err)
-	}
-
-	// source side cannot delete destination files in this plan
-	if code := Main([]string{"abandon", tsid, "--delete-destination-files"}, strings.NewReader(""), &out, &errOut, env); code != ExitFailed || !strings.Contains(errOut.String(), "Plan 03") {
-		t.Errorf("source-side delete: exit %d stderr %q", code, errOut.String())
-	}
-}
-
-func TestAbandonDeleteDestinationFilesLocally(t *testing.T) {
-	env, home := testEnv(t)
-	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
-	cfg := filepath.Join(home, ".claude")
-	j, _ := job.New(dataDir, tsid)
-	j.Direction = "from" // this host is the destination
-	j.Save()
-	installed := filepath.Join(cfg, "projects", "-home-bob-work", tsid+".jsonl")
-	os.MkdirAll(filepath.Dir(installed), 0o700)
-	os.WriteFile(installed, []byte("{}\n"), 0o600)
-	modified := filepath.Join(cfg, "todos", tsid+".json")
-	os.MkdirAll(filepath.Dir(modified), 0o700)
-	os.WriteFile(modified, []byte("changed"), 0o600)
-	m := &transfer.Manifest{Version: 1, JobID: tsid, SessionID: tsid, Entries: []transfer.Entry{
-		{ID: 0, Category: session.CatSession, Dst: filepath.Dir(installed), Mode: uint32(os.ModeDir | 0o700)},
-		{ID: 1, Category: session.CatSession, Dst: installed, Size: 3, Mode: 0o600, SHA256: shaOf("{}\n")},
-		{ID: 2, Category: session.CatSession, Dst: modified, Size: 2, Mode: 0o600, SHA256: shaOf("{}")},
-	}}
-	m.Save(j.ManifestPath())
-
-	var out, errOut bytes.Buffer
-	if code := Main([]string{"abandon", tsid, "--delete-destination-files"}, strings.NewReader(""), &out, &errOut, env); code != ExitOK {
-		t.Fatalf("exit %d: %s", code, errOut.String())
-	}
-	if _, err := os.Stat(installed); !os.IsNotExist(err) {
-		t.Errorf("matching installed file should be removed")
-	}
-	if _, err := os.Stat(modified); err != nil {
-		t.Errorf("modified file must be kept: %v", err)
-	}
-	if !strings.Contains(out.String(), installed) {
-		t.Errorf("removed paths must be printed: %s", out.String())
-	}
 }
 
 func shaOf(s string) string {
@@ -108,11 +46,8 @@ func TestAbandonRefusesWhileRunnerAlive(t *testing.T) {
 	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
 	j, _ := job.New(dataDir, tsid)
 	j.Direction = "to"
-	j.RunnerPID = startSleep(t)
+	j.RunnerPID = startFakeRunner(t)
 	j.Save()
-	staging := job.StagingDir(dataDir, tsid)
-	os.MkdirAll(staging, 0o700)
-	os.WriteFile(filepath.Join(staging, "1"), []byte("x"), 0o600)
 
 	var out, errOut bytes.Buffer
 	code := Main([]string{"abandon", tsid}, strings.NewReader(""), &out, &errOut, env)
@@ -129,37 +64,150 @@ func TestAbandonRefusesWhileRunnerAlive(t *testing.T) {
 	if got.Outcome == "abandoned" || got.Finished {
 		t.Errorf("journal must not be marked abandoned while the runner is alive: %+v", got)
 	}
-	if _, err := os.Stat(staging); err != nil {
-		t.Errorf("staging must survive a refused abandon: %v", err)
+}
+
+func TestAbandonNoJob(t *testing.T) {
+	env, _ := testEnv(t)
+	code, _, stderr := run(t, env, "abandon", tsid)
+	if code != ExitUsage || !strings.Contains(stderr, "no job") {
+		t.Fatalf("exit %d stderr %q", code, stderr)
 	}
 }
 
-func TestAbandonDeleteFlagFailsLoudWithoutManifest(t *testing.T) {
+// TestAbandonNoRecordedPlan covers a journal that was created but never
+// reached a completed preflight (Plan still "null") — this cannot happen
+// on the real runTeleport path (job.New/Save only run after a successful
+// Preflight), but abandon must still fail loudly rather than panic.
+func TestAbandonNoRecordedPlan(t *testing.T) {
 	env, home := testEnv(t)
 	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
 	j, _ := job.New(dataDir, tsid)
-	j.Direction = "from" // this host is the destination
 	j.Save()
-	staging := job.StagingDir(dataDir, tsid)
-	os.MkdirAll(staging, 0o700)
-	os.WriteFile(filepath.Join(staging, "1"), []byte("x"), 0o600)
+
+	code, _, stderr := run(t, env, "abandon", tsid)
+	if code != ExitFailed || !strings.Contains(stderr, "no recorded plan") {
+		t.Fatalf("exit %d stderr %q", code, stderr)
+	}
+}
+
+// TestAbandonDeletesInstalledFilesOnRemoteDestination is Task 23's main
+// case: abandon's destination-side cleanup and --delete-destination-files
+// must work when the destination is a REAL (if loopback) remote host, not
+// just this machine — it dials it exactly as a teleport would
+// (a.endpoints) and drives the new DeleteInstalled remote op over the
+// wire. It also proves the two layers of protection: the CLI only offers
+// ids whose preflight status was Absent (kept.jsonl, status
+// PresentSame, is never a candidate even though its current content also
+// matches the manifest hash), and DeleteInstalled itself re-verifies the
+// hash before removing anything (covered directly by
+// TestLocalDeleteInstalledOnlyNamedIDs and transfer's
+// TestUninstallIDsOnlyNamedEntries; this test exercises the CLI wiring
+// end-to-end).
+func TestAbandonDeletesInstalledFilesOnRemoteDestination(t *testing.T) {
+	remoteEnv, remoteHome := testEnv(t)
+	target, opts, localHome := remoteHost(t, remoteEnv)
+	sshOpts := map[string]string{}
+	for i := 0; i+1 < len(opts); i += 2 {
+		if opts[i] != "-o" {
+			continue
+		}
+		k, v, _ := strings.Cut(opts[i+1], "=")
+		sshOpts[k] = v
+	}
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PATH=/usr/bin:/bin"}
+
+	// Staging on the destination must exist before abandon and be gone
+	// after (spec §7.4: staging is removed by abandon, or after step 10).
+	remoteDataDir := filepath.Join(remoteHome, ".local", "share", "claude-teleport")
+	staging := job.StagingDir(remoteDataDir, tsid)
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "0"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two files already sit on the destination with content that happens
+	// to match the manifest hash: "gone.jsonl" is what THIS job installed
+	// (preflight status Absent — it was not there before); "kept.jsonl"
+	// merely already existed (status PresentSame) and must survive even
+	// though its content also matches.
+	dir := filepath.Join(remoteHome, ".claude", "projects", "-home-bob-work")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gone := filepath.Join(dir, "gone.jsonl")
+	kept := filepath.Join(dir, "kept.jsonl")
+	if err := os.WriteFile(gone, []byte("gone\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(kept, []byte("kept\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &transfer.Manifest{Version: 1, JobID: tsid, SessionID: tsid, Entries: []transfer.Entry{
+		{ID: 0, Category: session.CatSession, Dst: dir, Mode: uint32(os.ModeDir | 0o700)},
+		{ID: 1, Category: session.CatSession, Dst: gone, Size: 5, Mode: 0o600, SHA256: shaOf("gone\n")},
+		{ID: 2, Category: session.CatSession, Dst: kept, Size: 5, Mode: 0o600, SHA256: shaOf("kept\n")},
+	}}
+
+	localDataDir := filepath.Join(localHome, ".local", "share", "claude-teleport")
+	j, err := job.New(localDataDir, tsid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.SessionID, j.Direction = tsid, "to"
+	j.SourceHost, j.DestHost = "src.example", "dest.example"
+	if err := m.Save(j.ManifestPath()); err != nil {
+		t.Fatal(err)
+	}
+	plan := &orchestrate.Plan{
+		JobID:        tsid,
+		Session:      &session.Session{ID: session.ID(tsid)},
+		DestInfo:     remote.HostInfo{Hostname: "dest.example"},
+		ManifestPath: j.ManifestPath(),
+		Statuses:     map[int]transfer.Status{1: transfer.Absent, 2: transfer.PresentSame},
+		Options: orchestrate.Options{
+			Direction: "to", Target: target, SSHOptions: sshOpts,
+			Selector: session.Selector{ID: session.ID(tsid)}, State: "auto",
+			ExitTimeout: 10 * time.Second, StartTimeout: 10 * time.Second,
+		},
+	}
+	if j.Plan, err = plan.ToJSON(); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
 
 	var out, errOut bytes.Buffer
-	code := Main([]string{"abandon", tsid, "--delete-destination-files"}, strings.NewReader(""), &out, &errOut, env)
-	if code == ExitOK {
-		t.Fatalf("exit %d, want non-zero when manifest.json is missing; stdout %s stderr %s", code, out.String(), errOut.String())
-	}
-	if !strings.Contains(errOut.String(), j.ManifestPath()) {
-		t.Errorf("stderr = %q, want it to name the manifest path %s", errOut.String(), j.ManifestPath())
+	code := Main([]string{"abandon", tsid, "--delete-destination-files"}, strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitOK {
+		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
 	if _, err := os.Stat(staging); !os.IsNotExist(err) {
-		t.Errorf("staging must still be removed even though the delete flag failed: %v", err)
+		t.Errorf("destination staging must be removed")
 	}
-	got, _, err := job.Open(dataDir, tsid)
+	if _, err := os.Stat(gone); !os.IsNotExist(err) {
+		t.Errorf("gone.jsonl (status Absent) must be deleted")
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Errorf("kept.jsonl (status PresentSame, pre-existing) must survive: %v", err)
+	}
+	if !strings.Contains(out.String(), gone) {
+		t.Errorf("stdout must name the deleted file:\n%s", out.String())
+	}
+
+	got, _, err := job.Open(localDataDir, tsid)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Outcome != "abandoned" || !got.Finished {
-		t.Errorf("journal must still be marked abandoned even though the delete flag failed: %+v", got)
+		t.Errorf("journal = %+v", got)
+	}
+
+	// `continue` on an abandoned job is a usage error (spec: abandon is
+	// terminal — start a new teleport instead).
+	if code, _, stderr := run(t, localEnv, "continue", tsid); code != ExitUsage {
+		t.Errorf("continue after abandon = %d %q, want ExitUsage", code, stderr)
 	}
 }

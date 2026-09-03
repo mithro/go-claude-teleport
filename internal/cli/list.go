@@ -22,6 +22,7 @@ type listRow struct {
 	Branch string `json:"branch"`
 	Last   string `json:"last_active"`
 	Tmux   string `json:"tmux,omitempty"`
+	Host   string `json:"host,omitempty"` // set only by `list --host`
 }
 
 // listSessions enumerates every transcript under projects/ and marks the
@@ -95,14 +96,14 @@ func listSessions(p session.Paths, probe session.PaneProbe) ([]listRow, error) {
 
 func (a *app) listCmd() *cobra.Command {
 	var host string
+	var via, opts []string
 	cmd := &cobra.Command{
 		Use:   "list [--host <host>]",
 		Short: "list sessions on this host (running / suspended / idle)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if host != "" {
-				// Remote listing rides on the Plan 02 helper protocol.
-				return Exit(ExitUsage, "--host: remote listing not implemented yet")
+				return a.listRemote(cmd.Context(), host, via, opts, a.json())
 			}
 			p, err := a.resolvePaths()
 			if err != nil {
@@ -133,5 +134,6 @@ func (a *app) listCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&host, "host", "", "list sessions on a remote host")
+	remoteFlags(cmd, &via, &opts)
 	return cmd
 }
