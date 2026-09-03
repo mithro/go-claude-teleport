@@ -105,3 +105,28 @@ func TestEnvPaths(t *testing.T) {
 		t.Errorf("missing HOME must be an error")
 	}
 }
+
+// TestRemoteServeWiresTmuxDialer pins Bug 1 (task-25-report.md): the
+// server-side Local built by `remote serve` must carry a real tmux dialer.
+// Without one, remote.Local refuses every tmux op with "tmux is not
+// available on this host" before it even looks for a server, so preflight
+// refuses any destination end state but idle on every real ssh teleport.
+// With the dialer wired the same op reaches spec §9 server discovery and
+// fails (in this empty TMUX_TMPDIR) with discovery's own message instead.
+func TestRemoteServeWiresTmuxDialer(t *testing.T) {
+	env, _ := testEnv(t)
+	sockDir := t.TempDir()
+	env = append(env, "TMUX_TMPDIR="+sockDir)
+	stdin := strings.NewReader(`{"id":1,"op":"inventory-tmux","args":{}}` + "\n")
+	var stdout, stderr bytes.Buffer
+	if code := Main([]string{"remote", "serve"}, stdin, &stdout, &stderr, env); code != ExitOK {
+		t.Fatalf("exit %d, stderr %s", code, stderr.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "tmux is not available on this host") {
+		t.Fatalf("remote serve built its Local without a tmux dialer: %s", out)
+	}
+	if !strings.Contains(out, sockDir) {
+		t.Errorf("expected server discovery to have looked in %s: %s", sockDir, out)
+	}
+}

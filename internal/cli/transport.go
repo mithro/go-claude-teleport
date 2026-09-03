@@ -17,6 +17,7 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/sshx"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 )
 
 // fail is shorthand for Plan 01's cli.Exit: it returns a *cli.ExitError
@@ -72,6 +73,25 @@ func selfExe() string {
 
 // tmuxSocketDir resolves $TMUX_TMPDIR, defaulting to /tmp/tmux-<uid> when
 // unset (internal/cli is the one place allowed to read this).
+// serverLocalOptions builds the remote.LocalOptions used by every
+// server-side / non-app construction of a remote.Local (remote serve,
+// remote stream, compare's local half).
+//
+// Tmux MUST be wired here: remote.Local refuses every tmux op outright
+// when opts.Tmux is nil (local_tmux.go's "unavailable" guard), so a
+// `remote serve` built without it reports "no usable tmux server" for
+// every destination — even one with a live server — and preflight then
+// refuses any end state but idle. That was the single biggest failure in
+// the Docker integration suite (task-25-report.md, Bug 1).
+func serverLocalOptions(env []string, logf func(string, ...any)) remote.LocalOptions {
+	return remote.LocalOptions{
+		ProcRoot:      "/proc",
+		Tmux:          tmuxx.DialControl,
+		TmuxSocketDir: tmuxSocketDir(env),
+		Logf:          logf,
+	}
+}
+
 func tmuxSocketDir(env []string) string {
 	if d := envValue(env, "TMUX_TMPDIR"); d != "" {
 		return d
@@ -163,7 +183,7 @@ func AddTransportCommands(root *cobra.Command) {
 			if err != nil {
 				return fail(ExitUsage, "%v", err)
 			}
-			local := remote.NewLocal(p, selfExe(), remote.LocalOptions{ProcRoot: "/proc", TmuxSocketDir: tmuxSocketDir(e.env), Logf: stderrLogf(e.stderr)})
+			local := remote.NewLocal(p, selfExe(), serverLocalOptions(e.env, stderrLogf(e.stderr)))
 			if err := remote.Serve(cmd.Context(), e.stdin, e.stdout, local); err != nil {
 				return fail(ExitFailed, "remote serve: %v", err)
 			}
@@ -179,7 +199,7 @@ func AddTransportCommands(root *cobra.Command) {
 			if err != nil {
 				return fail(ExitUsage, "%v", err)
 			}
-			local := remote.NewLocal(p, selfExe(), remote.LocalOptions{ProcRoot: "/proc", TmuxSocketDir: tmuxSocketDir(e.env), Logf: stderrLogf(e.stderr)})
+			local := remote.NewLocal(p, selfExe(), serverLocalOptions(e.env, stderrLogf(e.stderr)))
 			if err := remote.ServeStream(cmd.Context(), remote.StreamKind(args[0]), args[1], args[2], e.stdin, e.stdout, local); err != nil {
 				return fail(ExitFailed, "%v", err)
 			}

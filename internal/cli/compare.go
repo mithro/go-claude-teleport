@@ -231,7 +231,7 @@ func (a *app) compareConfigRemote(cmd *cobra.Command, host string, via, opts []s
 	if destCwd != "" {
 		dstCwd = destCwd
 	}
-	local := remote.NewLocal(p, selfExe(), remote.LocalOptions{ProcRoot: "/proc", TmuxSocketDir: tmuxSocketDir(a.envSlice()), Logf: stderrLogf(a.stderr)})
+	local := remote.NewLocal(p, selfExe(), serverLocalOptions(a.envSlice(), stderrLogf(a.stderr)))
 	localInfo, _ := local.Hello(ctx)
 	src, err := local.InventoryHost(ctx, cwd, localInfo.ClaudeVersion)
 	if err != nil {
