@@ -172,6 +172,13 @@ func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, 
 	// unconditionally — before the Deferred short-circuit, before any
 	// Lstat of Dst, regardless of what (if anything) already lives there.
 	captureDst, captureDstErr := canonicalCaptureDst(dataDirFromStagingDir(stagingDir), m.JobID)
+	// Ruling R-P3-B1d: Diff's own mirror of the Roots containment check —
+	// see rootChecker's doc comment for why it is p=nil here (no
+	// session.Paths available) and therefore only the declared-root-
+	// membership and freshness halves, not validRoot's Home/ConfigDir/
+	// DataDir containment (Install's validateDst is authoritative for
+	// that, unconditionally, regardless of what this function says).
+	rc := newRootChecker(m, nil)
 	for _, e := range m.Entries {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -196,6 +203,30 @@ func Diff(ctx context.Context, m *Manifest, stagingDir string) (map[int]Status, 
 		if e.Category == session.CatCapture && (captureDstErr != nil || filepath.Clean(e.Dst) != captureDst) {
 			out[e.ID] = PresentDifferent
 			continue
+		}
+		// Ruling R-P3-B1d: a non-Deferred CatRepo/CatWorktree entry (the
+		// fresh-main/not-a-repo legitimate case — existing-main's dirty
+		// index/worktree files are always Deferred and skip this
+		// entirely, exactly like the Deferred branch below) must lie
+		// under one of the manifest's declared Roots, and that Root must
+		// be fresh (absent, or containing only this manifest's own
+		// entries — see rootForeignContent). Checked before Lstat, before
+		// staging state: an entry outside every declared Root, or under
+		// one that is not fresh, is never a candidate for staged-same.
+		if gitRootCategory(e.Category) && !e.Deferred {
+			root, ok := entryRoot(e.Dst, m.Roots)
+			if !ok {
+				out[e.ID] = PresentDifferent
+				continue
+			}
+			reason, rerr := rc.check(root)
+			if rerr != nil {
+				return nil, fmt.Errorf("check root %s: %w", root, rerr)
+			}
+			if reason != "" {
+				out[e.ID] = PresentDifferent
+				continue
+			}
 		}
 		staged, mismatch, err := stagedState(stagingDir, e)
 		if err != nil {

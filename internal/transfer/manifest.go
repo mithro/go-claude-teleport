@@ -59,7 +59,18 @@ type Manifest struct {
 	PathMap    session.PathMap   `json:"path_map"`
 	Entries    []Entry           `json:"entries"`
 	Skipped    []session.Skipped `json:"skipped"`
-	TmpDir     string            `json:"-"` // where Send writes rewritten temp files ("" = os.TempDir())
+	// Roots is ruling R-P3-B1d: the destination repository root(s) a
+	// CatRepo/CatWorktree entry's Dst must lie under — gitx.Plan's own
+	// DstMain and DstWorktree (not-a-repo: DstWorktree alone, the
+	// destination cwd; see transfer.GitRoots, populated by
+	// internal/orchestrate's annotateManifest). Never trusted at face
+	// value: Diff/Install re-validate every declared Root itself
+	// (containment under Home, outside ConfigDir/DataDir, no dot-prefixed
+	// first component) and require it be either absent or contain only
+	// this manifest's own entries before any CatRepo/CatWorktree entry
+	// under it is treated as installable.
+	Roots  []string `json:"roots,omitempty"`
+	TmpDir string   `json:"-"` // where Send writes rewritten temp files ("" = os.TempDir())
 }
 
 // ErrForbidden is returned by Build when an entry is a never-transferred path.

