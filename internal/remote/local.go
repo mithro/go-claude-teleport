@@ -148,6 +148,10 @@ func (l *Local) InventoryHost(ctx context.Context, cwd, claudeVersion string) (*
 // ConfirmClaude, ExitClaude and ClaudeStatus are implemented in
 // local_claude.go. RunPtyResume is implemented in local_pty.go.
 
+// jobDir/stagingDir/extrasPath join a job id straight into the data dir,
+// so every exported method that reaches them checks the id first with
+// checkJobID (R-P3-23n) — the wire dispatch validates too, but Local is
+// reachable without it.
 func (l *Local) jobDir(jobID string) string     { return job.Dir(l.paths.DataDir, jobID) }
 func (l *Local) stagingDir(jobID string) string { return job.StagingDir(l.paths.DataDir, jobID) }
 func (l *Local) extrasPath(jobID string) string { return filepath.Join(l.jobDir(jobID), "extras.json") }
@@ -155,6 +159,9 @@ func (l *Local) extrasPath(jobID string) string { return filepath.Join(l.jobDir(
 // ManifestDiff persists the manifest under jobs/<id>/ (the tar stream
 // receiver needs it) and classifies every entry.
 func (l *Local) ManifestDiff(ctx context.Context, m *transfer.Manifest, jobID string) (map[int]transfer.Status, error) {
+	if err := checkJobID(jobID); err != nil {
+		return nil, err
+	}
 	if m == nil {
 		return nil, &Error{Code: "usage", Message: "manifest-diff: nil manifest"}
 	}
@@ -169,6 +176,9 @@ func (l *Local) ManifestDiff(ctx context.Context, m *transfer.Manifest, jobID st
 
 // PutInstallExtras stores the merge inputs for Install under jobs/<id>/extras.json.
 func (l *Local) PutInstallExtras(ctx context.Context, jobID string, extra transfer.InstallExtras) error {
+	if err := checkJobID(jobID); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(extra)
 	if err != nil {
 		return err
@@ -183,6 +193,9 @@ func (l *Local) PutInstallExtras(ctx context.Context, jobID string, extra transf
 // keyed by the direction streamID carries).
 
 func (l *Local) Install(ctx context.Context, m *transfer.Manifest, jobID string) (*transfer.InstallReport, error) {
+	if err := checkJobID(jobID); err != nil {
+		return nil, err
+	}
 	st, err := transfer.Diff(ctx, m, l.stagingDir(jobID))
 	if err != nil {
 		return nil, err
@@ -225,12 +238,18 @@ func (l *Local) Thaw(ctx context.Context, pid int) error {
 }
 
 func (l *Local) JournalGet(ctx context.Context, jobID string) (*job.Journal, bool, error) {
+	if err := checkJobID(jobID); err != nil {
+		return nil, false, err
+	}
 	return job.Open(l.paths.DataDir, jobID)
 }
 
 func (l *Local) JournalPut(ctx context.Context, j *job.Journal) error {
 	if j == nil {
 		return &Error{Code: "usage", Message: "journal-put: nil journal"}
+	}
+	if err := checkJobID(j.ID); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(l.jobDir(j.ID), 0o700); err != nil {
 		return err
@@ -240,5 +259,8 @@ func (l *Local) JournalPut(ctx context.Context, j *job.Journal) error {
 }
 
 func (l *Local) Record(ctx context.Context, jobID string, rec job.HistoryRecord) error {
+	if err := checkJobID(jobID); err != nil {
+		return err
+	}
 	return job.AppendHistory(l.jobDir(jobID), rec)
 }

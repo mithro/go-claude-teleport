@@ -18,13 +18,24 @@ const maxLine = 256 << 20
 
 type handler func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error)
 
+// decode is the ONE funnel every handler's arguments pass through, so it
+// is where a wire-supplied job id is validated (R-P3-23n): an args type
+// carrying one implements jobIDCarrier (jobid.go), and a bad id fails here
+// — before the handler has called a single Endpoint method, let alone
+// joined the id into jobs/<id> or staging/<id>.
 func decode[T any](args json.RawMessage) (T, error) {
 	var v T
-	if len(args) == 0 {
-		return v, nil
+	if len(args) > 0 {
+		if err := json.Unmarshal(args, &v); err != nil {
+			return v, &Error{Code: "usage", Message: "bad args: " + err.Error()}
+		}
 	}
-	if err := json.Unmarshal(args, &v); err != nil {
-		return v, &Error{Code: "usage", Message: "bad args: " + err.Error()}
+	if c, ok := any(v).(jobIDCarrier); ok {
+		for _, id := range c.wireJobIDs() {
+			if err := checkJobID(id); err != nil {
+				return v, err
+			}
+		}
 	}
 	return v, nil
 }

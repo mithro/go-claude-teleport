@@ -91,6 +91,9 @@ func (l *Local) entryModes(jobID string) (map[int]fs.FileMode, error) {
 // land with the mode the manifest recorded for that entry id, or the
 // staged copy's own mode when the manifest has no entry for it.
 func (l *Local) GitAttach(ctx context.Context, p *gitx.Plan, jobID string) error {
+	if err := checkJobID(jobID); err != nil {
+		return err
+	}
 	staging := job.StagingDir(l.paths.DataDir, jobID)
 	packPath := ""
 	if p.NeedPack {

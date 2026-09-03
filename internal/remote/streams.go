@@ -89,6 +89,12 @@ func splitStreamID(id string) (dir string, err error) {
 // runStream is the single implementation behind ServeStream and
 // Local.OpenStream.
 func (l *Local) runStream(ctx context.Context, kind StreamKind, jobID, streamID string, r io.Reader, w io.Writer) error {
+	// ServeStream reaches this from `remote stream <kind> <job> <id>`,
+	// whose job id comes off the peer's command line rather than through
+	// the op dispatch, so this is that path's own boundary check.
+	if err := checkJobID(jobID); err != nil {
+		return err
+	}
 	dir, err := splitStreamID(streamID)
 	if err != nil {
 		return err
@@ -163,6 +169,11 @@ func copyFileTo(path string, w io.Writer) error {
 
 // OpenStream (Local) runs the stream in-process.
 func (l *Local) OpenStream(ctx context.Context, kind StreamKind, jobID, streamID string) (io.ReadWriteCloser, error) {
+	// Checked here as well as in runStream so a bad id is reported to the
+	// caller immediately, not asynchronously inside the pipe's goroutine.
+	if err := checkJobID(jobID); err != nil {
+		return nil, err
+	}
 	if _, err := splitStreamID(streamID); err != nil {
 		return nil, err
 	}
