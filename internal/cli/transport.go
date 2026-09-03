@@ -14,6 +14,7 @@ import (
 	"github.com/kevinburke/ssh_config"
 	"github.com/spf13/cobra"
 
+	"github.com/mithro/go-claude-teleport/internal/procx"
 	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/sshx"
@@ -71,11 +72,10 @@ func selfExe() string {
 	return exe
 }
 
-// tmuxSocketDir resolves $TMUX_TMPDIR, defaulting to /tmp/tmux-<uid> when
-// unset (internal/cli is the one place allowed to read this).
 // serverLocalOptions builds the remote.LocalOptions used by every
 // server-side / non-app construction of a remote.Local (remote serve,
-// remote stream, compare's local half).
+// remote stream, compare's local half) — and, through a.localEndpoint,
+// this host's own endpoint too, so the two can never drift apart.
 //
 // Tmux MUST be wired here: remote.Local refuses every tmux op outright
 // when opts.Tmux is nil (local_tmux.go's "unavailable" guard), so a
@@ -83,15 +83,51 @@ func selfExe() string {
 // every destination — even one with a live server — and preflight then
 // refuses any end state but idle. That was the single biggest failure in
 // the Docker integration suite (task-25-report.md, Bug 1).
-func serverLocalOptions(env []string, logf func(string, ...any)) remote.LocalOptions {
-	return remote.LocalOptions{
-		ProcRoot:      "/proc",
-		Tmux:          tmuxx.DialControl,
+//
+// The pane Probe must be wired here too (finding A4): remote.NewLocal
+// derives none of its own, so without it every SUSPENDED session on this
+// host reads as idle over the wire — selector rule 4 (<tmux-session>
+// <window>) cannot resolve there, a placeholder pane is invisible to a
+// remote ResolveSession/InspectSession, and `--from host` silently
+// downgrades the end state. The socket is $TMUX first, then spec §9
+// discovery, exactly as an interactive invocation resolves it; the
+// returned closeFn releases the control connection the probe holds (a
+// no-op when there is no reachable server).
+func serverLocalOptions(ctx context.Context, env []string, logf func(string, ...any)) (remote.LocalOptions, func()) {
+	opts := remote.LocalOptions{
+		ProcRoot: "/proc",
+		// tmuxx.Dial, not tmuxx.DialControl directly: it is the package's
+		// one swappable dialer (tmuxx.FindServer's own liveness probe
+		// already goes through it) and defaults to DialControl.
+		Tmux:          func(ctx context.Context, sock string) (tmuxx.Transport, error) { return tmuxx.Dial(ctx, sock) },
 		TmuxSocketDir: tmuxSocketDir(env),
 		Logf:          logf,
 	}
+	noop := func() {}
+	sock := ""
+	if t := envValue(env, "TMUX"); t != "" {
+		sock = strings.SplitN(t, ",", 2)[0]
+	} else if s, err := tmuxx.FindServer(opts.TmuxSocketDir, "", ""); err == nil {
+		sock = s
+	}
+	if sock == "" {
+		return opts, noop
+	}
+	tr, err := tmuxx.Dial(ctx, sock)
+	if err != nil {
+		return opts, noop
+	}
+	procs, err := procx.Scan(opts.ProcRoot)
+	if err != nil {
+		tr.Close()
+		return opts, noop
+	}
+	opts.Probe = tmuxx.Prober(ctx, tr, procs, sock)
+	return opts, func() { tr.Close() }
 }
 
+// tmuxSocketDir resolves $TMUX_TMPDIR, defaulting to /tmp/tmux-<uid> when
+// unset (internal/cli is the one place allowed to read this).
 func tmuxSocketDir(env []string) string {
 	if d := envValue(env, "TMUX_TMPDIR"); d != "" {
 		return d
@@ -183,7 +219,9 @@ func AddTransportCommands(root *cobra.Command) {
 			if err != nil {
 				return fail(ExitUsage, "%v", err)
 			}
-			local := remote.NewLocal(p, selfExe(), serverLocalOptions(e.env, stderrLogf(e.stderr)))
+			opts, closeProbe := serverLocalOptions(cmd.Context(), e.env, stderrLogf(e.stderr))
+			defer closeProbe()
+			local := remote.NewLocal(p, selfExe(), opts)
 			if err := remote.Serve(cmd.Context(), e.stdin, e.stdout, local); err != nil {
 				return fail(ExitFailed, "remote serve: %v", err)
 			}
@@ -199,7 +237,9 @@ func AddTransportCommands(root *cobra.Command) {
 			if err != nil {
 				return fail(ExitUsage, "%v", err)
 			}
-			local := remote.NewLocal(p, selfExe(), serverLocalOptions(e.env, stderrLogf(e.stderr)))
+			opts, closeProbe := serverLocalOptions(cmd.Context(), e.env, stderrLogf(e.stderr))
+			defer closeProbe()
+			local := remote.NewLocal(p, selfExe(), opts)
 			if err := remote.ServeStream(cmd.Context(), remote.StreamKind(args[0]), args[1], args[2], e.stdin, e.stdout, local); err != nil {
 				return fail(ExitFailed, "%v", err)
 			}

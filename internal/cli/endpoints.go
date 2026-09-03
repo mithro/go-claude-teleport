@@ -3,13 +3,10 @@ package cli
 
 import (
 	"context"
-	"strings"
 
 	"github.com/mithro/go-claude-teleport/internal/orchestrate"
-	"github.com/mithro/go-claude-teleport/internal/procx"
 	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
-	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 )
 
 // envSlice reconstructs a "KEY=VALUE" slice from a.env, for the free
@@ -24,26 +21,14 @@ func envSlice(m map[string]string) []string {
 }
 
 // localEndpoint builds this host's Local with a pane probe when a tmux
-// server is reachable ($TMUX first, then spec §9 discovery). Any dialled
-// control connection is released by a.closers (Main runs them after
+// server is reachable ($TMUX first, then spec §9 discovery) — the same
+// options `remote serve` builds on the far side, from the one function
+// that knows how (transport.go's serverLocalOptions). Any dialled control
+// connection is released by a.closers (Main runs them after
 // root.Execute()).
 func (a *app) localEndpoint(ctx context.Context, p session.Paths) *remote.Local {
-	env := envSlice(a.env)
-	opts := remote.LocalOptions{ProcRoot: "/proc", Tmux: tmuxx.DialControl, TmuxSocketDir: tmuxSocketDir(env), Logf: a.logf}
-	sock := ""
-	if t := a.env["TMUX"]; t != "" {
-		sock = strings.SplitN(t, ",", 2)[0]
-	} else if s, err := tmuxx.FindServer(opts.TmuxSocketDir, "", ""); err == nil {
-		sock = s
-	}
-	if sock != "" {
-		if tr, err := tmuxx.DialControl(ctx, sock); err == nil {
-			if procs, err := procx.Scan("/proc"); err == nil {
-				opts.Probe = tmuxx.Prober(ctx, tr, procs, sock)
-				a.closers = append(a.closers, tr.Close)
-			}
-		}
-	}
+	opts, closeProbe := serverLocalOptions(ctx, envSlice(a.env), a.logf)
+	a.closers = append(a.closers, func() error { closeProbe(); return nil })
 	return remote.NewLocal(p, a.selfExe, opts)
 }
 

@@ -231,7 +231,9 @@ func (a *app) compareConfigRemote(cmd *cobra.Command, host string, via, opts []s
 	if destCwd != "" {
 		dstCwd = destCwd
 	}
-	local := remote.NewLocal(p, selfExe(), serverLocalOptions(a.envSlice(), stderrLogf(a.stderr)))
+	localOpts, closeProbe := serverLocalOptions(ctx, a.envSlice(), stderrLogf(a.stderr))
+	defer closeProbe()
+	local := remote.NewLocal(p, selfExe(), localOpts)
 	localInfo, _ := local.Hello(ctx)
 	src, err := local.InventoryHost(ctx, cwd, localInfo.ClaudeVersion)
 	if err != nil {
