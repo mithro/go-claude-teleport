@@ -72,8 +72,11 @@ func (a *app) localChecks() []check {
 	} else {
 		cs = append(cs, check{"tmux servers", fmt.Sprintf("%d under %s (%s)", len(servers), socketDir, strings.Join(servers, ", ")), true})
 	}
+	// R-P3-23g: a missing SSH_AUTH_SOCK is a WARNING, never a reason to
+	// fail doctor on its own — an IdentityFile-only setup (no agent) is a
+	// perfectly normal, fully working configuration.
 	sock := a.env["SSH_AUTH_SOCK"]
-	cs = append(cs, check{"SSH_AUTH_SOCK", sockDetail(sock), sock != ""})
+	cs = append(cs, check{"SSH_AUTH_SOCK", sockDetail(sock), true})
 	return cs
 }
 

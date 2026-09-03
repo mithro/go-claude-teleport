@@ -16,14 +16,15 @@ func TestDoctorPassesWithFakeClaude(t *testing.T) {
 	root := t.TempDir()
 	cfg := filepath.Join(root, ".claude")
 	os.MkdirAll(filepath.Join(cfg, "projects"), 0o700)
-	// SSH_AUTH_SOCK need not point at a real socket for doctor's presence
-	// check (ruling R-P3-23c) — it is never dialled here.
-	env := harness.Env(t, root, cfg, "XDG_DATA_HOME="+filepath.Join(root, "data"), "SSH_AUTH_SOCK=/nonexistent/agent.sock")
+	// SSH_AUTH_SOCK is deliberately left UNSET: ruling R-P3-23g requires a
+	// missing agent to be a warning only, never a reason doctor fails —
+	// this is the direct regression test for that (exit must still be OK).
+	env := harness.Env(t, root, cfg, "XDG_DATA_HOME="+filepath.Join(root, "data"))
 	code, out, stderr := run(t, env, "doctor")
 	if code != ExitOK {
 		t.Fatalf("exit %d\n%s%s", code, out, stderr)
 	}
-	for _, w := range []string{"ok    claude on PATH", "2.1.247", "ok    config dir", "ok    data dir writable", "ok    tmux servers", "ok    SSH_AUTH_SOCK"} {
+	for _, w := range []string{"ok    claude on PATH", "2.1.247", "ok    config dir", "ok    data dir writable", "ok    tmux servers", "ok    SSH_AUTH_SOCK", "fine if every remote uses -o IdentityFile"} {
 		if !strings.Contains(out, w) {
 			t.Errorf("missing %q:\n%s", w, out)
 		}
@@ -40,10 +41,11 @@ func TestDoctorFailsWithoutClaude(t *testing.T) {
 		t.Fatalf("exit %d\n%s", code, out)
 	}
 	// ruling R-P3-23c: tmux servers and SSH_AUTH_SOCK are brief-mandated
-	// local checks; SSH_AUTH_SOCK is genuinely unset in this env, so it
-	// must show as a real FAIL, not be silently absent from the report.
-	if !strings.Contains(out, "tmux servers") || !strings.Contains(out, "FAIL  SSH_AUTH_SOCK") {
-		t.Fatalf("doctor output missing the tmux-servers/SSH_AUTH_SOCK checks:\n%s", out)
+	// local checks. SSH_AUTH_SOCK is genuinely unset in this env, but per
+	// ruling R-P3-23g that must show as "ok" with an explanatory note —
+	// never FAIL — even while other checks (claude, config dir) do fail.
+	if !strings.Contains(out, "tmux servers") || !strings.Contains(out, "ok    SSH_AUTH_SOCK") || strings.Contains(out, "FAIL  SSH_AUTH_SOCK") {
+		t.Fatalf("doctor output missing the tmux-servers check, or SSH_AUTH_SOCK is not a warning:\n%s", out)
 	}
 	// big-storage.example (IANA reserved, guaranteed not to resolve/accept a
 	// connection) also has no ssh key/agent available here, so the dial
