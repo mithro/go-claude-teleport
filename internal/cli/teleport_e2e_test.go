@@ -23,12 +23,25 @@ var builtTeleportExe string
 // buildTeleportExe builds cmd/claude-teleport once per test binary; the
 // real orchestrate.RunJob path is only reachable through a real process
 // (internal-runner is a self re-exec, spawned via procx.SpawnDetached).
+//
+// The build output must NOT live under t.TempDir(): that directory is
+// removed once the CALLING test (and its subtests) finish, but
+// builtTeleportExe is a package-level cache shared by every test in this
+// binary — a second test reusing the cached path after the first test's
+// TempDir was already cleaned up would fail with "no such file or
+// directory" (observed once a second caller, abandon_test.go's real-
+// teleport test, was added). os.MkdirTemp mirrors
+// test/fakeclaude/harness.Build's own process-lifetime cache for exactly
+// this reason.
 func buildTeleportExe(t *testing.T) string {
 	t.Helper()
 	if builtTeleportExe != "" {
 		return builtTeleportExe
 	}
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp("", "claude-teleport-exe-")
+	if err != nil {
+		t.Fatalf("mkdir for claude-teleport build: %v", err)
+	}
 	out := filepath.Join(dir, "claude-teleport")
 	cmd := exec.Command("go", "build", "-o", out, "github.com/mithro/go-claude-teleport/cmd/claude-teleport")
 	if out, err := cmd.CombinedOutput(); err != nil {

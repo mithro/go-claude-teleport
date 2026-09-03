@@ -1,25 +1,67 @@
 package cli
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/mithro/go-claude-teleport/internal/claudecfg"
 	"github.com/mithro/go-claude-teleport/internal/gitx"
+	"github.com/mithro/go-claude-teleport/internal/job"
 	"github.com/mithro/go-claude-teleport/internal/orchestrate"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
+
+// planSummary is the JSON-safe subset of orchestrate.Plan that inspect
+// --host exposes (ruling R-P3-23d): never Plan.Extras (the raw
+// ~/.claude.json project entry — including mcpServers env/auth headers —
+// and the transcript History lines PutInstallExtras carries) or Plan.Files
+// (redundant with the top-level inspectReport.Files/Memory, and no safer
+// to expose raw) — only destination/target facts, file-transfer COUNTS and
+// the drift report. claudecfg.Report.Diffs are already hash/short-redacted
+// at construction (see claudecfg.configHash) so the full Report is safe to
+// include as-is.
+type planSummary struct {
+	DestHost         string           `json:"dest_host"`
+	TargetState      string           `json:"target_state"`
+	FilesToSend      int              `json:"files_to_send"`
+	FilesPresent     int              `json:"files_present"`
+	FilesFastForward int              `json:"files_fast_forward"`
+	FilesStaged      int              `json:"files_already_staged"`
+	Drift            claudecfg.Report `json:"drift"`
+}
+
+func summarizePlan(p *orchestrate.Plan) *planSummary {
+	s := &planSummary{DestHost: p.DestInfo.Hostname, TargetState: p.TargetState, Drift: p.Drift}
+	for _, st := range p.Statuses {
+		switch st {
+		case transfer.Absent, transfer.StagedMismatch:
+			s.FilesToSend++
+		case transfer.FFCandidate:
+			s.FilesToSend++
+			s.FilesFastForward++
+		case transfer.PresentSame:
+			s.FilesPresent++
+		case transfer.StagedSame:
+			s.FilesStaged++
+		}
+	}
+	return s
+}
 
 // inspectReport is everything `inspect` can show: the local inventory
 // (files a teleport would move, git state) always, and — with --host —
-// the preflight plan and drift table against that destination, or the
-// refusal reason.
+// a safe summary of the preflight plan and drift table against that
+// destination, or the refusal reason.
 type inspectReport struct {
 	ID         string              `json:"id"`
 	State      string              `json:"state"`
@@ -38,7 +80,7 @@ type inspectReport struct {
 	Usage      *session.Usage      `json:"usage"`
 	Git        *gitx.Info          `json:"git,omitempty"`
 	GitError   string              `json:"git_error,omitempty"`
-	Plan       *orchestrate.Plan   `json:"plan,omitempty"`
+	Plan       *planSummary        `json:"plan,omitempty"`
 	Refused    string              `json:"refused,omitempty"`
 }
 
@@ -52,6 +94,20 @@ func keys(m map[string]bool) string {
 		return "(none)"
 	}
 	return strings.Join(ks, ", ")
+}
+
+// throwawayJobID returns a fresh, collision-free id for inspect --host's
+// own preflight run (ruling R-P3-23b): Preflight writes
+// jobs/<jobID>/manifest.json on BOTH hosts (via ManifestDiff on the
+// destination, and directly on the driver side), so running it under the
+// session's REAL id would clobber an interrupted job's manifest that
+// `continue`'s git-attach and `abandon` depend on.
+func throwawayJobID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("throwaway job id: %w", err)
+	}
+	return fmt.Sprintf("inspect-%x", b), nil
 }
 
 // newInspectCmd subsumes Plan 01's local-only inspect and Plan 02's
@@ -69,7 +125,10 @@ and what would be skipped.
 
 With --host, also runs preflight against that destination (--via/-o work
 as they do for a teleport) and renders the plan and drift table exactly as
-a real teleport would show it, or the refusal reason (exit 3).`,
+a real teleport would show it, or the refusal reason (exit 3). This uses a
+throwaway job id, not the session's own — the destination need not have
+anything to do with this session's teleport history, and any interrupted
+job's own manifest is left untouched.`,
 		Args: cobra.MaximumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -103,10 +162,15 @@ a real teleport would show it, or the refusal reason (exit 3).`,
 			}
 
 			code := ExitOK
+			var plan *orchestrate.Plan // kept for Render(); never marshaled raw (ruling R-P3-23d)
 			if host != "" {
 				sshOpts, err := parseSSHOptions(opts)
 				if err != nil {
 					return usageErr(err)
+				}
+				jobID, err := throwawayJobID()
+				if err != nil {
+					return Exit(ExitFailed, "%v", err)
 				}
 				o := orchestrate.Options{
 					Direction: "to", Target: host, Via: via, SSHOptions: sshOpts,
@@ -118,15 +182,29 @@ a real teleport would show it, or the refusal reason (exit 3).`,
 					return exitErr(a.fail(err))
 				}
 				defer closeFn()
-				plan, err := orchestrate.Preflight(ctx, o, src, dst, string(sess.ID))
+				// Best-effort clean-up of the throwaway job dir on both
+				// hosts, regardless of preflight's outcome below — a
+				// failure here is a warning, never a reason to change
+				// inspect's own exit code.
+				defer func() {
+					if cerr := dst.Cleanup(ctx, jobID); cerr != nil {
+						a.logf("inspect --host: destination clean-up of throwaway job %s: %v", jobID, cerr)
+					}
+					if rerr := os.RemoveAll(job.Dir(a.paths.DataDir, jobID)); rerr != nil {
+						a.logf("inspect --host: local clean-up of throwaway job %s: %v", jobID, rerr)
+					}
+				}()
+				var perr error
+				plan, perr = orchestrate.Preflight(ctx, o, src, dst, jobID)
 				var re *orchestrate.RefusedError
 				switch {
-				case errors.As(err, &re):
+				case errors.As(perr, &re):
 					rep.Refused, code = re.Reason, ExitRefused
-				case err != nil:
-					return exitErr(a.fail(err))
+					plan = nil
+				case perr != nil:
+					return exitErr(a.fail(perr))
 				default:
-					rep.Plan = plan
+					rep.Plan = summarizePlan(plan)
 				}
 			}
 
@@ -138,7 +216,7 @@ a real teleport would show it, or the refusal reason (exit 3).`,
 				fmt.Fprintln(a.stdout, string(b))
 				return exitErr(code)
 			}
-			renderInspect(a.stdout, rep, host)
+			renderInspect(a.stdout, rep, host, plan)
 			return exitErr(code)
 		},
 	}
@@ -148,8 +226,11 @@ a real teleport would show it, or the refusal reason (exit 3).`,
 }
 
 // renderInspect writes the human-readable report; a.json() short-circuits
-// to JSON before this is ever called.
-func renderInspect(w io.Writer, rep *inspectReport, host string) {
+// to JSON before this is ever called. plan (the real, un-redacted
+// orchestrate.Plan — safe here since Render only ever prints counts and
+// claudecfg's own already-redacted drift table, never raw Extras/Files)
+// is nil unless preflight against --host actually succeeded.
+func renderInspect(w io.Writer, rep *inspectReport, host string, plan *orchestrate.Plan) {
 	shortID := session.ID(rep.ID).Short()
 	fmt.Fprintf(w, "session    %s (%s)\n", shortID, rep.State)
 	if rep.Name != "" {
@@ -215,9 +296,9 @@ func renderInspect(w io.Writer, rep *inspectReport, host string) {
 	}
 
 	switch {
-	case rep.Plan != nil:
+	case plan != nil:
 		fmt.Fprintf(w, "\nPlan against %s\n", host)
-		rep.Plan.Render(w)
+		plan.Render(w)
 	case rep.Refused != "":
 		fmt.Fprintf(w, "\nTeleport to %s would be refused: %s\n", host, rep.Refused)
 	case host == "":

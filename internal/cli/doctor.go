@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/mithro/go-claude-teleport/internal/orchestrate"
 	"github.com/mithro/go-claude-teleport/internal/remote"
+	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/version"
 )
 
@@ -60,7 +62,26 @@ func (a *app) localChecks() []check {
 		os.Remove(f.Name())
 		cs = append(cs, check{"data dir writable", paths.DataDir, true})
 	}
+	// ruling R-P3-23c: two brief-mandated checks missing from the first
+	// round — tmux servers reachable under the socket dir, and an ssh
+	// agent available (needed for any remote host that isn't purely
+	// IdentityFile-authenticated).
+	socketDir := tmuxSocketDir(env)
+	if servers, err := tmuxx.ListServers(socketDir); err != nil {
+		cs = append(cs, check{"tmux servers", err.Error(), false})
+	} else {
+		cs = append(cs, check{"tmux servers", fmt.Sprintf("%d under %s (%s)", len(servers), socketDir, strings.Join(servers, ", ")), true})
+	}
+	sock := a.env["SSH_AUTH_SOCK"]
+	cs = append(cs, check{"SSH_AUTH_SOCK", sockDetail(sock), sock != ""})
 	return cs
+}
+
+func sockDetail(sock string) string {
+	if sock == "" {
+		return "not set (agent keys unavailable; fine if every remote uses -o IdentityFile)"
+	}
+	return sock
 }
 
 // remoteChecks dials host and runs the same kind of checks against it: it
@@ -75,11 +96,22 @@ func remoteChecks(ctx context.Context, ep remote.Endpoint, host string) ([]check
 	}
 	var cs []check
 	cs = append(cs, check{"remote claude-teleport", fmt.Sprintf("%s (local %s)", hi.Version, version.Version), hi.Version == version.Version})
-	cs = append(cs, check{"remote claude", hi.ClaudeVersion, hi.HasClaude})
+	// M2: hi.ClaudeVersionErr ("claude --version" failed even though the
+	// binary was found) must be surfaced, not swallowed by only checking
+	// HasClaude.
+	claudeDetail := hi.ClaudeVersion
+	if hi.ClaudeVersionErr != "" {
+		claudeDetail = fmt.Sprintf("found but --version failed: %s", hi.ClaudeVersionErr)
+	}
+	cs = append(cs, check{"remote claude", claudeDetail, hi.HasClaude && hi.ClaudeVersionErr == ""})
 	cs = append(cs, check{"remote tmux", fmt.Sprintf("present: %v", hi.HasTmux), true})
 	cs = append(cs, check{"remote claude-resume", fmt.Sprintf("present: %v; home %s; config %s", hi.HasClaudeResume, hi.Home, hi.ConfigDir), true})
-	rows, err := ep.ListSessions(ctx)
-	cs = append(cs, check{"remote sessions", fmt.Sprintf("%d listable", len(rows)), err == nil})
+	rows, lerr := ep.ListSessions(ctx)
+	sessDetail := fmt.Sprintf("%d listable", len(rows))
+	if lerr != nil {
+		sessDetail = lerr.Error()
+	}
+	cs = append(cs, check{"remote sessions", sessDetail, lerr == nil})
 	return cs, nil
 }
 

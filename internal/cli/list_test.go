@@ -62,6 +62,15 @@ func TestListHostShowsRemoteSessions(t *testing.T) {
 	if !strings.Contains(out, target) || !strings.Contains(out, tsid[:8]) || !strings.Contains(out, "/home/bob/work") {
 		t.Errorf("list --host output:\n%s", out)
 	}
+	// M4: the remote table keeps the local table's PID and TMUX columns
+	// alongside the extra HOST column (tabwriter renders tabs as aligned
+	// spaces, so check the header words individually, in order).
+	header := strings.SplitN(out, "\n", 2)[0]
+	for _, col := range []string{"HOST", "ID", "STATE", "NAME", "PID", "CWD", "BRANCH", "TMUX", "LAST ACTIVE"} {
+		if !strings.Contains(header, col) {
+			t.Errorf("list --host header %q missing column %q", header, col)
+		}
+	}
 
 	args = append([]string{"list", "--host", target, "--json"}, opts...)
 	code, out, stderr = run(t, localEnv, args...)

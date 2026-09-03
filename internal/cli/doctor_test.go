@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/mithro/go-claude-teleport/internal/remote"
+	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/test/fakeclaude/harness"
 )
 
@@ -13,12 +16,14 @@ func TestDoctorPassesWithFakeClaude(t *testing.T) {
 	root := t.TempDir()
 	cfg := filepath.Join(root, ".claude")
 	os.MkdirAll(filepath.Join(cfg, "projects"), 0o700)
-	env := harness.Env(t, root, cfg, "XDG_DATA_HOME="+filepath.Join(root, "data"))
+	// SSH_AUTH_SOCK need not point at a real socket for doctor's presence
+	// check (ruling R-P3-23c) — it is never dialled here.
+	env := harness.Env(t, root, cfg, "XDG_DATA_HOME="+filepath.Join(root, "data"), "SSH_AUTH_SOCK=/nonexistent/agent.sock")
 	code, out, stderr := run(t, env, "doctor")
 	if code != ExitOK {
 		t.Fatalf("exit %d\n%s%s", code, out, stderr)
 	}
-	for _, w := range []string{"ok    claude on PATH", "2.1.247", "ok    config dir", "ok    data dir writable"} {
+	for _, w := range []string{"ok    claude on PATH", "2.1.247", "ok    config dir", "ok    data dir writable", "ok    tmux servers", "ok    SSH_AUTH_SOCK"} {
 		if !strings.Contains(out, w) {
 			t.Errorf("missing %q:\n%s", w, out)
 		}
@@ -33,6 +38,12 @@ func TestDoctorFailsWithoutClaude(t *testing.T) {
 	code, out, _ := run(t, []string{"HOME=" + root, "PATH=" + t.TempDir()}, "doctor")
 	if code != ExitFailed || !strings.Contains(out, "FAIL  claude on PATH") || !strings.Contains(out, "FAIL  config dir") {
 		t.Fatalf("exit %d\n%s", code, out)
+	}
+	// ruling R-P3-23c: tmux servers and SSH_AUTH_SOCK are brief-mandated
+	// local checks; SSH_AUTH_SOCK is genuinely unset in this env, so it
+	// must show as a real FAIL, not be silently absent from the report.
+	if !strings.Contains(out, "tmux servers") || !strings.Contains(out, "FAIL  SSH_AUTH_SOCK") {
+		t.Fatalf("doctor output missing the tmux-servers/SSH_AUTH_SOCK checks:\n%s", out)
 	}
 	// big-storage.example (IANA reserved, guaranteed not to resolve/accept a
 	// connection) also has no ssh key/agent available here, so the dial
@@ -56,7 +67,7 @@ func TestDoctorRemoteHostReportsChecks(t *testing.T) {
 	target, opts, localHome := remoteHost(t, remoteEnv)
 	cfg := filepath.Join(localHome, ".claude")
 	os.MkdirAll(filepath.Join(cfg, "projects"), 0o700)
-	localEnv := []string{"HOME=" + localHome, "USER=alice", "CLAUDE_CONFIG_DIR=" + cfg, "PATH=" + os.Getenv("PATH")}
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "CLAUDE_CONFIG_DIR=" + cfg, "PATH=" + os.Getenv("PATH"), "SSH_AUTH_SOCK=/nonexistent/agent.sock"}
 
 	args := append([]string{"doctor", target}, opts...)
 	code, out, stderr := run(t, localEnv, args...)
@@ -67,5 +78,59 @@ func TestDoctorRemoteHostReportsChecks(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("doctor %s output missing %q:\n%s", target, want, out)
 		}
+	}
+}
+
+// TestRemoteChecksSurfacesClaudeVersionErrAndListSessionsError is folded
+// minor M2: hi.ClaudeVersionErr and a ListSessions failure must be
+// surfaced in the check detail, not swallowed into a bare pass/fail.
+func TestRemoteChecksSurfacesClaudeVersionErrAndListSessionsError(t *testing.T) {
+	dir := t.TempDir()
+	binDir := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A "claude" that exists (HasClaude=true) but fails --version.
+	claudePath := filepath.Join(binDir, "claude")
+	if err := os.WriteFile(claudePath, []byte("#!/bin/sh\nexit 7\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+oldPath)
+
+	home := filepath.Join(dir, "home", "bob")
+	cfg := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(filepath.Join(cfg, "projects", "keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// projects/ itself unreadable so ListSessions' os.ReadDir fails with
+	// something other than "not exist".
+	if err := os.Chmod(filepath.Join(cfg, "projects"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(filepath.Join(cfg, "projects"), 0o700) })
+
+	paths := session.Paths{Home: home, ConfigDir: cfg, GlobalJSON: filepath.Join(home, ".claude.json"), DataDir: filepath.Join(home, ".local", "share", "claude-teleport"), ProcRoot: "/proc"}
+	ep := remote.NewLocal(paths, "x", remote.LocalOptions{ProcRoot: "/proc"})
+
+	cs, err := remoteChecks(context.Background(), ep, "bob@dest.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claudeDetail, sessDetail string
+	var claudeOK, sessOK bool
+	for _, c := range cs {
+		switch c.name {
+		case "remote claude":
+			claudeDetail, claudeOK = c.detail, c.ok
+		case "remote sessions":
+			sessDetail, sessOK = c.detail, c.ok
+		}
+	}
+	if claudeOK || !strings.Contains(claudeDetail, "version failed") {
+		t.Errorf("remote claude check = %q ok=%v, want the --version failure surfaced", claudeDetail, claudeOK)
+	}
+	if sessOK || sessDetail == "" {
+		t.Errorf("remote sessions check = %q ok=%v, want the ListSessions error surfaced, not swallowed", sessDetail, sessOK)
 	}
 }

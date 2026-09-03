@@ -2,11 +2,14 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +19,7 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/transfer"
+	"github.com/mithro/go-claude-teleport/test/fakeclaude/harness"
 )
 
 // startFakeRunner spawns `sleep 60` with argv[0] rewritten to
@@ -96,13 +100,15 @@ func TestAbandonNoRecordedPlan(t *testing.T) {
 // just this machine — it dials it exactly as a teleport would
 // (a.endpoints) and drives the new DeleteInstalled remote op over the
 // wire. It also proves the two layers of protection: the CLI only offers
-// ids whose preflight status was Absent (kept.jsonl, status
-// PresentSame, is never a candidate even though its current content also
-// matches the manifest hash), and DeleteInstalled itself re-verifies the
-// hash before removing anything (covered directly by
+// ids listed in Plan.InstalledIDs (kept.jsonl, never recorded as
+// installed by this job, is never a candidate even though its current
+// content also matches the manifest hash), and DeleteInstalled itself
+// re-verifies the hash before removing anything (covered directly by
 // TestLocalDeleteInstalledOnlyNamedIDs and transfer's
 // TestUninstallIDsOnlyNamedEntries; this test exercises the CLI wiring
-// end-to-end).
+// end-to-end). See TestAbandonDeleteDestinationFilesAfterRealTeleport for
+// the same mechanism driven by a real runner (R-P3-23a) rather than a
+// hand-authored Plan.
 func TestAbandonDeletesInstalledFilesOnRemoteDestination(t *testing.T) {
 	remoteEnv, remoteHome := testEnv(t)
 	target, opts, localHome := remoteHost(t, remoteEnv)
@@ -129,9 +135,9 @@ func TestAbandonDeletesInstalledFilesOnRemoteDestination(t *testing.T) {
 
 	// Two files already sit on the destination with content that happens
 	// to match the manifest hash: "gone.jsonl" is what THIS job installed
-	// (preflight status Absent — it was not there before); "kept.jsonl"
-	// merely already existed (status PresentSame) and must survive even
-	// though its content also matches.
+	// (its id is in InstalledIDs); "kept.jsonl" merely already existed
+	// (never recorded as installed) and must survive even though its
+	// content also matches.
 	dir := filepath.Join(remoteHome, ".claude", "projects", "-home-bob-work")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -165,7 +171,7 @@ func TestAbandonDeletesInstalledFilesOnRemoteDestination(t *testing.T) {
 		Session:      &session.Session{ID: session.ID(tsid)},
 		DestInfo:     remote.HostInfo{Hostname: "dest.example"},
 		ManifestPath: j.ManifestPath(),
-		Statuses:     map[int]transfer.Status{1: transfer.Absent, 2: transfer.PresentSame},
+		InstalledIDs: []int{1},
 		Options: orchestrate.Options{
 			Direction: "to", Target: target, SSHOptions: sshOpts,
 			Selector: session.Selector{ID: session.ID(tsid)}, State: "auto",
@@ -209,5 +215,312 @@ func TestAbandonDeletesInstalledFilesOnRemoteDestination(t *testing.T) {
 	// terminal — start a new teleport instead).
 	if code, _, stderr := run(t, localEnv, "continue", tsid); code != ExitUsage {
 		t.Errorf("continue after abandon = %d %q, want ExitUsage", code, stderr)
+	}
+}
+
+const abandonE2ESID = "6f5e4d3c-2b1a-4c9d-8e7f-0a1b2c3d4e5f"
+
+// TestAbandonDeleteDestinationFilesAfterRealTeleport is ruling R-P3-23a's
+// regression test: it drives a REAL teleport through the production path
+// (a.endpoints / orchestrate.Preflight / a.spawnAndFollow, Options.LocalDest
+// as the sanctioned test hook — same as TestTeleportEndToEndLocalToLocal),
+// so Plan.InstalledIDs is populated by the real install step, never
+// hand-authored. Plan.Statuses is NOT usable here: capture, verifyTransfer
+// and runTransfer all re-diff and persist a fresh Statuses map, so by the
+// time the job finishes every entry reads back PresentSame/StagedSame and a
+// Statuses-based id selection is empty — abandon must read InstalledIDs.
+// It then tampers with one installed file's content (simulating "changed
+// since install") and asserts it survives the delete while a genuinely
+// installed, untouched file is removed.
+func TestAbandonDeleteDestinationFilesAfterRealTeleport(t *testing.T) {
+	exe := buildTeleportExe(t)
+	claudeDir := harness.Build(t)
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", claudeDir+string(os.PathListSeparator)+oldPath)
+
+	root := t.TempDir()
+	srcHome := filepath.Join(root, "src", "home", "alice")
+	dstHome := filepath.Join(root, "dst", "home", "bob")
+	os.MkdirAll(srcHome, 0o700)
+	os.MkdirAll(dstHome, 0o700)
+	srcPaths := session.Paths{Home: srcHome, ConfigDir: filepath.Join(srcHome, ".claude"), GlobalJSON: filepath.Join(srcHome, ".claude.json"), DataDir: filepath.Join(srcHome, ".local", "share", "claude-teleport"), ProcRoot: "/proc"}
+	dstPaths := session.Paths{Home: dstHome, ConfigDir: filepath.Join(dstHome, ".claude"), GlobalJSON: filepath.Join(dstHome, ".claude.json"), DataDir: filepath.Join(dstHome, ".local", "share", "claude-teleport"), ProcRoot: "/proc"}
+	os.MkdirAll(srcPaths.ConfigDir, 0o700)
+	os.MkdirAll(dstPaths.ConfigDir, 0o700)
+
+	cwd := filepath.Join(srcHome, "x")
+	os.MkdirAll(cwd, 0o755)
+	seed := exec.Command("claude", "-p", "--session-id", abandonE2ESID, "remember the word pineapple")
+	seed.Dir = cwd
+	seed.Env = append(os.Environ(), "HOME="+srcHome, "CLAUDE_CONFIG_DIR="+srcPaths.ConfigDir, "PATH="+claudeDir+string(os.PathListSeparator)+oldPath)
+	if out, err := seed.CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v\n%s", err, out)
+	}
+
+	env := []string{"HOME=" + srcHome, "PATH=" + claudeDir + string(os.PathListSeparator) + oldPath, "TMUX_TMPDIR=" + filepath.Join(root, "no-tmux-here")}
+	a := &app{env: parseEnv(env), selfExe: exe, logf: t.Logf}
+	if err := a.ensurePaths(); err != nil {
+		t.Fatal(err)
+	}
+
+	o := orchestrate.Options{
+		Direction: "to", Selector: session.Selector{ID: session.ID(abandonE2ESID)}, State: "idle",
+		ExitTimeout: 10 * time.Second, StartTimeout: 20 * time.Second, LocalDest: &dstPaths,
+	}
+	ctx := context.Background()
+	src, dst, closeFn, err := a.endpoints(ctx, o)
+	if err != nil {
+		t.Fatalf("endpoints: %v", err)
+	}
+	sess, err := src.ResolveSession(ctx, o.Selector)
+	if err != nil {
+		closeFn()
+		t.Fatalf("ResolveSession: %v", err)
+	}
+	jobID := string(sess.ID)
+	plan, err := orchestrate.Preflight(ctx, o, src, dst, jobID)
+	if err != nil {
+		closeFn()
+		t.Fatalf("Preflight: %v", err)
+	}
+	j, err := job.New(a.paths.DataDir, jobID)
+	if err != nil {
+		closeFn()
+		t.Fatal(err)
+	}
+	j.SessionID, j.Direction = jobID, o.Direction
+	j.SourceHost, j.DestHost = plan.SourceInfo.Hostname, plan.DestInfo.Hostname
+	j.CreatedAt, j.UpdatedAt = time.Now(), time.Now()
+	if j.Plan, err = plan.ToJSON(); err != nil {
+		closeFn()
+		t.Fatal(err)
+	}
+	if err := j.Save(); err != nil {
+		closeFn()
+		t.Fatal(err)
+	}
+	closeFn()
+
+	var out bytes.Buffer
+	a.stdout, a.stderr = &out, &out
+	code := a.spawnAndFollow(ctx, j, false)
+	if code != ExitOK {
+		t.Fatalf("spawnAndFollow = %d, log:\n%s", code, out.String())
+	}
+
+	j2, ok, err := job.Open(a.paths.DataDir, jobID)
+	if err != nil || !ok || j2.Outcome != "success" {
+		t.Fatalf("journal after teleport = %+v ok=%v err=%v", j2, ok, err)
+	}
+	finishedPlan, err := orchestrate.PlanFromJournal(j2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(finishedPlan.InstalledIDs) == 0 {
+		t.Fatalf("a real, successful teleport must populate InstalledIDs")
+	}
+	m, err := transfer.Load(finishedPlan.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transcriptID := -1
+	for _, id := range finishedPlan.InstalledIDs {
+		e, _ := m.ByID(id)
+		if e.Category == session.CatSession && strings.HasSuffix(e.Dst, ".jsonl") {
+			transcriptID = id
+			break
+		}
+	}
+	if transcriptID < 0 {
+		t.Fatal("no installed transcript entry found among InstalledIDs")
+	}
+	transcriptEntry, _ := m.ByID(transcriptID)
+
+	// Pick a second installed regular-file entry to tamper with (simulate
+	// "changed since install") — it must survive the delete.
+	tamperedID := -1
+	for _, id := range finishedPlan.InstalledIDs {
+		if id == transcriptID {
+			continue
+		}
+		if e, _ := m.ByID(id); e.IsRegular() {
+			tamperedID = id
+			break
+		}
+	}
+	var tamperedEntry transfer.Entry
+	if tamperedID >= 0 {
+		tamperedEntry, _ = m.ByID(tamperedID)
+		if err := os.WriteFile(tamperedEntry.Dst, []byte("tampered after install\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	code2, out2, errOut2 := run(t, env, "abandon", jobID, "--delete-destination-files")
+	if code2 != ExitOK {
+		t.Fatalf("abandon: exit %d\nstdout: %s\nstderr: %s", code2, out2, errOut2)
+	}
+	if _, err := os.Stat(transcriptEntry.Dst); !os.IsNotExist(err) {
+		t.Errorf("genuinely installed, unmodified transcript must be deleted: %v", err)
+	}
+	if !strings.Contains(out2, transcriptEntry.Dst) {
+		t.Errorf("abandon must name the deleted file:\n%s", out2)
+	}
+	if tamperedID >= 0 {
+		if _, err := os.Stat(tamperedEntry.Dst); err != nil {
+			t.Errorf("tampered (hash-mismatched) installed file must survive: %v", err)
+		}
+	}
+	j3, _, err := job.Open(a.paths.DataDir, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j3.Outcome != "abandoned" || !j3.Finished {
+		t.Errorf("journal after abandon = %+v", j3)
+	}
+}
+
+// TestAbandonDeleteRefusesWhileDestinationSessionLive is ruling R-P3-23e:
+// --delete-destination-files must check dst.ClaudeStatus first and refuse
+// (exit 3, no override) while the destination session is still running —
+// deleting files a live Claude process might still have open is unsafe.
+func TestAbandonDeleteRefusesWhileDestinationSessionLive(t *testing.T) {
+	env, home := testEnv(t)
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+
+	dstHome := filepath.Join(t.TempDir(), "home", "bob")
+	dstPaths := session.Paths{Home: dstHome, ConfigDir: filepath.Join(dstHome, ".claude"), GlobalJSON: filepath.Join(dstHome, ".claude.json"), DataDir: filepath.Join(dstHome, ".local", "share", "claude-teleport"), ProcRoot: "/proc"}
+	if err := os.MkdirAll(dstPaths.ConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// A real, long-lived process stands in for the destination's Claude —
+	// dst.ClaudeStatus needs a REAL pid + matching /proc start time (a.
+	// localEndpoint always uses ProcRoot "/proc"), not a fake table.
+	pid := startFakeRunner(t)
+	start, err := session.ProcStartTime("/proc", pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dstPaths.SessionsDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reg, _ := json.Marshal(map[string]any{
+		"pid": pid, "sessionId": tsid, "cwd": "/home/bob/work", "procStart": start,
+		"version": "2.1.247", "status": "busy", "tmux": "", "updatedAt": time.Now().UnixMilli(),
+	})
+	if err := os.WriteFile(filepath.Join(dstPaths.SessionsDir(), strconv.Itoa(pid)+".json"), reg, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	j, err := job.New(dataDir, tsid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.SessionID, j.Direction = tsid, "to"
+	j.SourceHost, j.DestHost = "src.example", "dest.example"
+	m := &transfer.Manifest{Version: 1, JobID: tsid, SessionID: tsid}
+	if err := m.Save(j.ManifestPath()); err != nil {
+		t.Fatal(err)
+	}
+	plan := &orchestrate.Plan{
+		JobID: tsid, Session: &session.Session{ID: session.ID(tsid)},
+		DestInfo: remote.HostInfo{Hostname: "dest.example"}, ManifestPath: j.ManifestPath(),
+		Options: orchestrate.Options{
+			Direction: "to", Selector: session.Selector{ID: session.ID(tsid)}, State: "auto",
+			LocalDest: &dstPaths, ExitTimeout: 10 * time.Second, StartTimeout: 10 * time.Second,
+		},
+	}
+	if j.Plan, err = plan.ToJSON(); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, stderr := run(t, env, "abandon", tsid, "--delete-destination-files")
+	if code != ExitRefused {
+		t.Fatalf("exit %d, want ExitRefused; stdout %s stderr %s", code, out, stderr)
+	}
+	for _, want := range []string{"still running", "/exit"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr = %q, want it to mention %q", stderr, want)
+		}
+	}
+	got, _, err := job.Open(dataDir, tsid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Outcome == "abandoned" || got.Finished {
+		t.Errorf("journal must not be touched by a refused delete: %+v", got)
+	}
+}
+
+// TestAbandonCompletesLocalSideWhenDestinationUnreachable is ruling
+// R-P3-23f: the destination being unreachable must not block the local
+// side (journal marked abandoned) — exit 4, message says destination
+// clean-up is pending. Re-running abandon afterward is allowed and
+// retries only the destination side (still unreachable here), without
+// re-doing (or re-announcing) the already-completed local side.
+func TestAbandonCompletesLocalSideWhenDestinationUnreachable(t *testing.T) {
+	env, home := testEnv(t)
+	dataDir := filepath.Join(home, ".local", "share", "claude-teleport")
+
+	j, err := job.New(dataDir, tsid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.SessionID, j.Direction = tsid, "to"
+	j.SourceHost, j.DestHost = "src.example", "dest.example"
+	m := &transfer.Manifest{Version: 1, JobID: tsid, SessionID: tsid}
+	if err := m.Save(j.ManifestPath()); err != nil {
+		t.Fatal(err)
+	}
+	plan := &orchestrate.Plan{
+		JobID: tsid, Session: &session.Session{ID: session.ID(tsid)},
+		DestInfo: remote.HostInfo{Hostname: "dest.example"}, ManifestPath: j.ManifestPath(),
+		Options: orchestrate.Options{
+			// 127.0.0.1:1 (loopback, nothing listening) with no ssh
+			// agent/keys in env fails fast and deterministically, with no
+			// real network or DNS dependency (sshx checks for available
+			// auth before ever attempting the TCP connect).
+			Direction: "to", Target: "bob@127.0.0.1:1",
+			Selector: session.Selector{ID: session.ID(tsid)}, State: "auto",
+			ExitTimeout: 5 * time.Second, StartTimeout: 5 * time.Second,
+		},
+	}
+	if j.Plan, err = plan.ToJSON(); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	code, out, stderr := run(t, env, "abandon", tsid)
+	if code != ExitUnreachable {
+		t.Fatalf("exit %d, want ExitUnreachable; stdout %s stderr %s", code, out, stderr)
+	}
+	if !strings.Contains(out, "abandoned locally") {
+		t.Errorf("stdout = %q, want it to say the local side completed", out)
+	}
+	if !strings.Contains(stderr, "clean-up is pending") {
+		t.Errorf("stderr = %q, want it to say destination clean-up is pending", stderr)
+	}
+	got, _, err := job.Open(dataDir, tsid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Outcome != "abandoned" || !got.Finished {
+		t.Errorf("local side must complete even though the destination is unreachable: %+v", got)
+	}
+
+	// Retry: allowed, retries only the (still unreachable) destination
+	// side — no second "abandoned locally".
+	code2, out2, stderr2 := run(t, env, "abandon", tsid)
+	if code2 != ExitUnreachable {
+		t.Fatalf("retry exit %d, want ExitUnreachable; stdout %s stderr %s", code2, out2, stderr2)
+	}
+	if strings.Contains(out2, "abandoned locally") {
+		t.Errorf("retry must not re-mark the already-abandoned local side: %s", out2)
 	}
 }

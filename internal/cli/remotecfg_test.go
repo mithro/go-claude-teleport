@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net"
 	"os"
@@ -188,5 +189,166 @@ func TestInspectHostShowsPlan(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("inspect --host output missing %q:\n%s", want, out.String())
 		}
+	}
+}
+
+// TestInspectHostDoesNotClobberExistingJobManifest is ruling R-P3-23b:
+// orchestrate.Preflight writes jobs/<jobID>/manifest.json on BOTH hosts, so
+// running it under the session's REAL id (an interrupted job might already
+// have one there, which `continue`'s git-attach and abandon depend on)
+// would clobber it. inspect --host must use a throwaway jobID instead —
+// seed a manifest.json under the real session id on both hosts first and
+// assert both are byte-identical before and after.
+func TestInspectHostDoesNotClobberExistingJobManifest(t *testing.T) {
+	claudeDir := harness.Build(t)
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", claudeDir+string(os.PathListSeparator)+oldPath)
+	noTmux := filepath.Join(t.TempDir(), "no-tmux-here")
+
+	remoteEnv, remoteHome := testEnv(t)
+	remoteEnv = append(remoteEnv, "TMUX_TMPDIR="+noTmux)
+	os.MkdirAll(filepath.Join(remoteHome, ".claude"), 0o700)
+	target, opts, localHome := remoteHost(t, remoteEnv)
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + noTmux}
+
+	cwd := filepath.Join(localHome, "proj")
+	os.MkdirAll(cwd, 0o755)
+	seed := exec.Command("claude", "-p", "--session-id", tsid, "hi")
+	seed.Dir = cwd
+	seed.Env = append(os.Environ(), "HOME="+localHome, "CLAUDE_CONFIG_DIR="+filepath.Join(localHome, ".claude"), "PATH="+os.Getenv("PATH"))
+	if out, err := seed.CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v\n%s", err, out)
+	}
+
+	// An existing, interrupted job under the SAME session id, with its own
+	// manifest.json, on both hosts.
+	localManifest := filepath.Join(localHome, ".local", "share", "claude-teleport", "jobs", tsid, "manifest.json")
+	remoteManifest := filepath.Join(remoteHome, ".local", "share", "claude-teleport", "jobs", tsid, "manifest.json")
+	os.MkdirAll(filepath.Dir(localManifest), 0o700)
+	os.MkdirAll(filepath.Dir(remoteManifest), 0o700)
+	localMarker := []byte(`{"marker":"local-interrupted-job","version":1}`)
+	remoteMarker := []byte(`{"marker":"remote-interrupted-job","version":1}`)
+	if err := os.WriteFile(localManifest, localMarker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(remoteManifest, remoteMarker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Main(append([]string{"inspect", tsid, "--host", target}, opts...), strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitOK {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, out.String(), errOut.String())
+	}
+
+	gotLocal, err := os.ReadFile(localManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotLocal) != string(localMarker) {
+		t.Errorf("local jobs/%s/manifest.json was clobbered: got %s, want %s", tsid, gotLocal, localMarker)
+	}
+	gotRemote, err := os.ReadFile(remoteManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotRemote) != string(remoteMarker) {
+		t.Errorf("remote jobs/%s/manifest.json was clobbered: got %s, want %s", tsid, gotRemote, remoteMarker)
+	}
+}
+
+// TestInspectHostNeverLeaksProjectEntrySecrets is ruling R-P3-23d: `inspect
+// --host` runs a real preflight, which populates Plan.Extras.ProjectEntry
+// from the LOCAL ~/.claude.json project entry verbatim (mcpServers env,
+// auth headers, ...) — inspect must never surface it, text or --json.
+func TestInspectHostNeverLeaksProjectEntrySecrets(t *testing.T) {
+	claudeDir := harness.Build(t)
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", claudeDir+string(os.PathListSeparator)+oldPath)
+	noTmux := filepath.Join(t.TempDir(), "no-tmux-here")
+
+	remoteEnv, remoteHome := testEnv(t)
+	remoteEnv = append(remoteEnv, "TMUX_TMPDIR="+noTmux)
+	os.MkdirAll(filepath.Join(remoteHome, ".claude"), 0o700)
+	target, opts, localHome := remoteHost(t, remoteEnv)
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + noTmux}
+
+	cwd := filepath.Join(localHome, "proj")
+	os.MkdirAll(cwd, 0o755)
+	seed := exec.Command("claude", "-p", "--session-id", tsid, "hi")
+	seed.Dir = cwd
+	seed.Env = append(os.Environ(), "HOME="+localHome, "CLAUDE_CONFIG_DIR="+filepath.Join(localHome, ".claude"), "PATH="+os.Getenv("PATH"))
+	if out, err := seed.CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v\n%s", err, out)
+	}
+
+	const secret = "hunter2-example"
+	globalJSON := filepath.Join(localHome, ".claude.json")
+	doc := map[string]any{"projects": map[string]any{cwd: map[string]any{
+		"mcpServers": map[string]any{"myserver": map[string]any{
+			"command": "npx", "args": []any{"myserver"},
+			"env": map[string]any{"SECRET_TOKEN": secret},
+		}},
+	}}}
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(globalJSON, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Main(append([]string{"inspect", tsid, "--host", target}, opts...), strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitOK {
+		t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, out.String(), errOut.String())
+	}
+	if strings.Contains(out.String(), secret) || strings.Contains(out.String(), "SECRET_TOKEN") {
+		t.Errorf("inspect --host text output leaked the mcpServers secret:\n%s", out.String())
+	}
+
+	out.Reset()
+	errOut.Reset()
+	code = Main(append([]string{"inspect", tsid, "--host", target, "--json"}, opts...), strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitOK {
+		t.Fatalf("--json exit %d\nstdout: %s\nstderr: %s", code, out.String(), errOut.String())
+	}
+	if strings.Contains(out.String(), secret) || strings.Contains(out.String(), "SECRET_TOKEN") {
+		t.Errorf("inspect --host --json leaked the mcpServers secret:\n%s", out.String())
+	}
+}
+
+// TestInspectHostRefusedOnBlockingDrift pins folded minor M6: a genuine
+// orchestrate.RefusedError from Preflight (here, blocking hook drift) must
+// surface through inspect --host as exit 3, with the reason explained.
+func TestInspectHostRefusedOnBlockingDrift(t *testing.T) {
+	claudeDir := harness.Build(t)
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", claudeDir+string(os.PathListSeparator)+oldPath)
+	noTmux := filepath.Join(t.TempDir(), "no-tmux-here")
+
+	remoteEnv, remoteHome := testEnv(t)
+	remoteEnv = append(remoteEnv, "TMUX_TMPDIR="+noTmux)
+	os.MkdirAll(filepath.Join(remoteHome, ".claude"), 0o700)
+	target, opts, localHome := remoteHost(t, remoteEnv)
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PATH=" + os.Getenv("PATH"), "TMUX_TMPDIR=" + noTmux}
+
+	cwd := filepath.Join(localHome, "proj")
+	os.MkdirAll(cwd, 0o755)
+	writeSettings(t, filepath.Join(localHome, ".claude"), `{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo local"}]}]}`)
+	seed := exec.Command("claude", "-p", "--session-id", tsid, "hi")
+	seed.Dir = cwd
+	seed.Env = append(os.Environ(), "HOME="+localHome, "CLAUDE_CONFIG_DIR="+filepath.Join(localHome, ".claude"), "PATH="+os.Getenv("PATH"))
+	if out, err := seed.CombinedOutput(); err != nil {
+		t.Fatalf("seed: %v\n%s", err, out)
+	}
+
+	var out, errOut bytes.Buffer
+	code := Main(append([]string{"inspect", tsid, "--host", target}, opts...), strings.NewReader(""), &out, &errOut, localEnv)
+	if code != ExitRefused {
+		t.Fatalf("exit %d, want ExitRefused\nstdout: %s\nstderr: %s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "would be refused") {
+		t.Errorf("output must explain the refusal:\n%s", out.String())
 	}
 }

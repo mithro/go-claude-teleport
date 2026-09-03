@@ -33,10 +33,14 @@ func renderRemoteSessions(ctx context.Context, w io.Writer, ep remote.Endpoint, 
 		fmt.Fprintln(w, string(b))
 		return nil
 	}
+	// M4: keep the local table's PID and TMUX columns (listRow carries
+	// both) alongside the extra HOST column — PID is always blank here
+	// (remote.SessionSummary has no pid field: only the LOCAL registry
+	// scan can name one), TMUX comes straight from SessionSummary.Tmux.
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "HOST\tID\tSTATE\tNAME\tCWD\tBRANCH\tLAST ACTIVE")
+	fmt.Fprintln(tw, "HOST\tID\tSTATE\tNAME\tPID\tCWD\tBRANCH\tTMUX\tLAST ACTIVE")
 	for _, r := range rows {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", host, r.ID.Short(), r.State, r.Name, r.Cwd, r.Branch, r.LastTS)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", host, r.ID.Short(), r.State, r.Name, "", r.Cwd, r.Branch, r.Tmux, r.LastTS)
 	}
 	return tw.Flush()
 }
