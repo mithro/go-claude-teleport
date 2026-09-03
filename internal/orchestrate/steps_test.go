@@ -345,7 +345,7 @@ func TestInstallVerifyRequiresMergePhaseNotJustFilePlacement(t *testing.T) {
 	if err := r.runTransfer(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	im, err := r.installManifest()
+	im, err := r.installManifest(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -911,7 +911,7 @@ func TestContinueTreatsALiveDestSessionAsDestinationOwned(t *testing.T) {
 		}
 	}
 	// And nothing session-shaped may reach install or the tar stream.
-	im, err := r.installManifest()
+	im, err := r.installManifest(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

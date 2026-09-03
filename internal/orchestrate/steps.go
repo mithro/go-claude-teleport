@@ -170,7 +170,7 @@ func (r *runner) noteDestOwned(ctx context.Context) (map[int]bool, error) {
 	for _, id := range ids {
 		set[id] = true
 	}
-	if len(ids) > 0 && len(ids) != len(r.p.DestOwnedIDs) {
+	if len(ids) > 0 && !sameIDs(ids, r.p.DestOwnedIDs) {
 		r.logf("the destination Claude is live in %s: its %d session file(s) are destination-owned and will not be captured, transferred or installed again", tmuxx.RefString(r.p.DestRef), len(ids))
 		r.p.DestOwnedIDs = ids
 		if err := r.persist(ctx); err != nil {
@@ -285,6 +285,20 @@ func (r *runner) verifyTransfer(ctx context.Context) (bool, error) {
 	return len(pending) == 0, nil
 }
 
+// sameIDs compares two id lists element-wise (both are built in manifest
+// order, so no sorting is needed).
+func sameIDs(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // notOwned drops the destination-owned ids from a list of manifest ids.
 func notOwned(ids []int, owned map[int]bool) []int {
 	if len(owned) == 0 {
@@ -394,12 +408,12 @@ func (r *runner) foldInstalledIDs(rep *transfer.InstallReport) {
 // installManifest is the manifest the install step actually places: the
 // full one minus git-attach's own entries (deferred) and minus anything
 // the destination now owns (R-P3-TRUST-1 item 3).
-func (r *runner) installManifest() (*transfer.Manifest, error) {
+func (r *runner) installManifest(ctx context.Context) (*transfer.Manifest, error) {
 	m, err := r.manifest()
 	if err != nil {
 		return nil, err
 	}
-	owned, err := r.noteDestOwned(context.Background())
+	owned, err := r.noteDestOwned(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -499,7 +513,7 @@ func (r *runner) verifyInstall(ctx context.Context) (bool, error) {
 }
 
 func (r *runner) runInstall(ctx context.Context) error {
-	im, err := r.installManifest()
+	im, err := r.installManifest(ctx)
 	if err != nil {
 		return err
 	}
