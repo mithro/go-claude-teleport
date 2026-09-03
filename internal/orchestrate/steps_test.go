@@ -52,6 +52,97 @@ func TestFreezeAndThawVerifySkipWhenSourceNotRunning(t *testing.T) {
 	}
 }
 
+// newThawExitRunner starts a real fakeclaude session in a fake-tmux pane on
+// a fresh source host and returns a runner wired to drive thaw+exit against
+// it — ExitClaude's own WaitGone then confirms a REAL pid going away,
+// exactly as PROOF2-1's real-host repro did (a source Claude launched with
+// `exec claude`, so the pane, window, session and tmux server all evaporate
+// with it).
+func newThawExitRunner(t *testing.T) (r *runner, src *host, ref *session.TmuxRef, reg *session.Registry) {
+	t.Helper()
+	src = newHost(t, "laptop.example", "alice", newFakeTmux())
+	dst := newHost(t, "big-storage.example", "bob", nil)
+	cwd := filepath.Join(src.paths.Home, "proj")
+	seedSession(t, src, cwd)
+	ref = startClaudeInPane(t, src, "claude", cwd)
+	reg = waitRegistry(t, src, "idle")
+	p := &Plan{
+		JobID:       sid,
+		Session:     &session.Session{ID: session.ID(sid), State: session.StateRunning, Registry: reg, Tmux: ref},
+		TargetState: "running",
+		Options:     Options{ExitTimeout: 5 * time.Second},
+	}
+	r = &runner{p: p, j: &job.Journal{ID: sid}, src: src.ep, dst: dst.ep, logf: t.Logf}
+	return r, src, ref, reg
+}
+
+// TestRunThawExitCompletesWhenSourcePaneLeavesWithClaude is PROOF2-1: a
+// real-host proof run (desktop -> ten64) launched the source Claude with
+// `exec claude` in the only pane of a one-window tmux server, so /exit
+// took the pane, the session and the whole server down with it; runThawExit
+// then called PaneState on the dead socket and got
+// "unavailable: stale socket ...: no tmux server" — the step FAILED even
+// though the move was complete. Ruling R-P3-PROOF-1: once the source is
+// confirmed exited, a source pane that is not-found OR unavailable is a
+// legitimate end state ("the pane left with Claude"), not an error.
+func TestRunThawExitCompletesWhenSourcePaneLeavesWithClaude(t *testing.T) {
+	t.Run("tmux server unavailable (exec claude took the whole server with it)", func(t *testing.T) {
+		r, src, _, reg := newThawExitRunner(t)
+		src.tmux.runWhenPIDExits(t, reg.PID, func() {
+			src.tmux.mu.Lock()
+			src.tmux.gone = true
+			src.tmux.mu.Unlock()
+		})
+		if err := r.runThawExit(context.Background()); err != nil {
+			t.Fatalf("runThawExit = %v, want success (the source pane left WITH claude)", err)
+		}
+	})
+	t.Run("pane not-found (window closed, session/server still up)", func(t *testing.T) {
+		r, src, ref, reg := newThawExitRunner(t)
+		src.tmux.runWhenPIDExits(t, reg.PID, func() {
+			src.ep.KillWindow(context.Background(), ref)
+		})
+		if err := r.runThawExit(context.Background()); err != nil {
+			t.Fatalf("runThawExit = %v, want success (the source pane left WITH claude)", err)
+		}
+	})
+}
+
+// TestVerifyThawExitDoneWhenSourcePaneLeftWithClaude covers the `continue`
+// path of PROOF2-1: a job whose thaw+exit already confirmed the source
+// exited, but then failed on the resulting dead pane/socket before
+// (pre-fix) runThawExit could return, left `continue` unable to finish
+// either — verifyThawExit forgave only not-found, never unavailable. Both
+// must report done once the source is confirmed exited.
+func TestVerifyThawExitDoneWhenSourcePaneLeftWithClaude(t *testing.T) {
+	t.Run("tmux server unavailable", func(t *testing.T) {
+		r, src, _, reg := newThawExitRunner(t)
+		if err := src.ep.ExitClaude(context.Background(), r.p.Session.Tmux, reg.PID, reg.ProcStart, r.p.Options.ExitTimeout); err != nil {
+			t.Fatalf("test setup: ExitClaude = %v", err)
+		}
+		src.tmux.mu.Lock()
+		src.tmux.gone = true
+		src.tmux.mu.Unlock()
+		done, err := r.verifyThawExit(context.Background())
+		if err != nil || !done {
+			t.Fatalf("verifyThawExit = %v %v, want done (the source pane left with claude)", done, err)
+		}
+	})
+	t.Run("pane not-found", func(t *testing.T) {
+		r, src, ref, reg := newThawExitRunner(t)
+		if err := src.ep.ExitClaude(context.Background(), r.p.Session.Tmux, reg.PID, reg.ProcStart, r.p.Options.ExitTimeout); err != nil {
+			t.Fatalf("test setup: ExitClaude = %v", err)
+		}
+		if err := src.ep.KillWindow(context.Background(), ref); err != nil {
+			t.Fatalf("test setup: KillWindow = %v", err)
+		}
+		done, err := r.verifyThawExit(context.Background())
+		if err != nil || !done {
+			t.Fatalf("verifyThawExit = %v %v, want done (the source pane left with claude)", done, err)
+		}
+	})
+}
+
 func TestRecordVerifyUsesJournal(t *testing.T) {
 	src := newHost(t, "laptop.example", "alice", nil)
 	dst := newHost(t, "big-storage.example", "bob", nil)

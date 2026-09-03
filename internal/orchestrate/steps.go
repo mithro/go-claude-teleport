@@ -798,6 +798,20 @@ func (r *runner) sourceAlive(ctx context.Context) (bool, error) {
 	return reg.PID == r.p.Session.Registry.PID, nil
 }
 
+// sourcePaneGone reports whether err is a code a source pane can
+// legitimately end in once its Claude has been confirmed exited (ruling
+// R-P3-PROOF-1, fix-proof2): a source Claude that IS the pane's own command
+// (`exec claude`, or a pane opened with `tmux new-window claude`) takes the
+// pane down with it when it exits — not-found — and, being the tmux
+// server's last session, can take the window, session and server down with
+// it too — unavailable (tmuxx.ErrNoServer, mapped in local_tmux.go). Both
+// mean "the pane left with Claude", not a failure. Callers must only
+// consult this once the source is confirmed exited (sourceAlive == false)
+// — a wrong socket path must still fail loudly while Claude lives.
+func sourcePaneGone(err error) bool {
+	return isCode(err, "not-found") || isCode(err, "unavailable")
+}
+
 func (r *runner) verifyThawExit(ctx context.Context) (bool, error) {
 	if r.p.sourceState() != session.StateRunning {
 		return true, nil
@@ -810,7 +824,7 @@ func (r *runner) verifyThawExit(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	st, err := r.src.PaneState(ctx, r.p.Session.Tmux)
-	if isCode(err, "not-found") {
+	if sourcePaneGone(err) {
 		return true, nil
 	}
 	if err != nil {
@@ -845,6 +859,10 @@ func (r *runner) runThawExit(ctx context.Context) error {
 		return nil
 	}
 	st, err := r.src.PaneState(ctx, r.p.Session.Tmux)
+	if sourcePaneGone(err) {
+		r.logf("exit: source pane is gone (%v), nothing to place the placeholder in", err)
+		return nil
+	}
 	if err != nil {
 		return err
 	}

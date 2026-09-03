@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"testing"
+	"time"
 
 	"github.com/creack/pty"
 )
@@ -29,6 +31,15 @@ type fakeTmux struct {
 	nextW    int
 	nextP    int
 	env      func(paneID, sess, win string) []string
+	// gone marks that the fake server itself has "died", as tmux's default
+	// exit-empty behaviour does when a detached server with no client
+	// attached loses its last session (PROOF2-1: a source Claude launched
+	// with `exec claude`, or via `tmux new-window claude`, IS the pane's
+	// own command, so it takes the pane, the window, the session and the
+	// whole server down with it when it exits). fixture_test.go's
+	// newHost wires this into opts.Tmux so every dial after that point
+	// fails exactly as a real dead socket does (tmuxx.ErrNoServer).
+	gone bool
 }
 
 type fakeWindow struct {
@@ -318,4 +329,32 @@ func (f *fakeTmux) killAll() {
 		p.stdin.Close()
 		p.cmd.Wait()
 	}
+}
+
+// runWhenPIDExits polls pid (a plain liveness probe — not procx's own
+// start-time-guarded Alive, which is fine here: the poll window in these
+// short-lived tests is far too small for the pid to be reused) and calls fn
+// once it is gone, then stops. It exists to land the "gone" and "not-found"
+// fake-tmux modes at the exact point PROOF2-1's real-host repro hit them:
+// the instant ExitClaude's own WaitGone confirms the source claude pid has
+// exited — a point production code (steps.go's runThawExit) reaches with no
+// hook in between for a test to act at directly.
+func (f *fakeTmux) runWhenPIDExits(t *testing.T, pid int, fn func()) {
+	t.Helper()
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if syscall.Kill(pid, 0) != nil {
+				fn()
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
 }
