@@ -89,9 +89,13 @@ func (p *prober) resolveSessionName(typed string) (string, error) {
 			return name, nil
 		}
 	}
+	// The STORED spellings, deliberately not decoded (B7): decoding is what
+	// makes these two indistinguishable, so a decoded list would repeat the
+	// typed text back at the user. The stored form is also the one that
+	// works as a `-t` target.
 	names := make([]string, 0, len(found))
 	for name := range found {
-		names = append(names, UnvisName(name))
+		names = append(names, name)
 	}
 	sort.Strings(names)
 	return "", fmt.Errorf("%q is ambiguous between sessions: %s", typed, strings.Join(names, ", "))

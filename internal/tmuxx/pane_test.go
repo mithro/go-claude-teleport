@@ -182,6 +182,32 @@ func TestFindWindowAmbiguousBetweenSpellings(t *testing.T) {
 	}
 }
 
+// TestFindWindowAmbiguityNamesStoredSpellings covers B7. The candidates in
+// the ambiguity message used to be run back through UnvisName — but
+// decoding them is exactly what made the two indistinguishable, so the
+// message read "ambiguous between sessions: a b, a b" and told the user
+// nothing about which `-t` target would disambiguate. The stored spellings
+// are the only useful thing to print.
+func TestFindWindowAmbiguityNamesStoredSpellings(t *testing.T) {
+	tb := fakeProc(t, nil)
+	f := &Fake{Replies: map[string][]string{
+		// Two different vis encodings of the same text, "a b".
+		listSessionsCmd: {`a\040b` + "\tg1", `a\sb` + "\tg2"},
+	}}
+	p := Prober(context.Background(), f, tb, "/tmp/tmux-1000/default")
+	_, err := p.FindWindow("a b", "2")
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("FindWindow(ambiguous name) err = %v, want an ambiguity error", err)
+	}
+	_, list, ok := strings.Cut(err.Error(), "sessions: ")
+	if !ok {
+		t.Fatalf("err = %v, want it to list the candidate sessions", err)
+	}
+	if list != `a\040b, a\sb` {
+		t.Errorf("candidate list = %q, want the two stored spellings", list)
+	}
+}
+
 // TestProberListPanesKeepsStoredSessionNames replaces the Task 10 fixture
 // that asserted tmux reports a space as `\s` (I2). It does not: a space is
 // printable and vis leaves it alone, so the old space-separated format split
