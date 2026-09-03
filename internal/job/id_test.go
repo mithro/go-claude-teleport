@@ -1,6 +1,9 @@
 package job
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestValidateID is ruling R-P3-23n's charset: a job id is used verbatim to
 // build jobs/<id>/ and staging/<id>/ on whichever host receives it over the
@@ -59,16 +62,7 @@ func TestValidateIDErrorNamesTheID(t *testing.T) {
 	if err == nil {
 		t.Fatal("want an error")
 	}
-	if !contains(err.Error(), "../etc") {
+	if !strings.Contains(err.Error(), "../etc") {
 		t.Errorf("error %q does not name the offending id", err)
 	}
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

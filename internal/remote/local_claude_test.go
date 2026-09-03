@@ -359,3 +359,82 @@ func TestConfirmClaudeDialsTmuxOnce(t *testing.T) {
 		t.Errorf("dialed tmux %d times over %d polls, want exactly 1", dials, slept)
 	}
 }
+
+// TestConfirmClaudeAcceptsPrintModeThatExitedBetweenPolls covers B11. A
+// `-p` run removes its registry entry the moment it finishes, so the poll
+// can easily miss the "busy with a completed turn" window entirely: one
+// iteration sees busy+print, the next sees no live entry at all, and the
+// confirm then burns the whole --start-timeout on a run that in fact
+// succeeded. Entry gone + the transcript grown past this call's baseline
+// is that same evidence, one poll late.
+func TestConfirmClaudeAcceptsPrintModeThatExitedBetweenPolls(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	proj := filepath.Join(p.ProjectsDir(), "-home-alice-x")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(proj, sid+".jsonl")
+	if err := os.WriteFile(transcript, []byte(`{"type":"user"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The first poll sees the busy print run; the sleep between polls is
+	// when it finishes, removes its entry and leaves the extra turn behind.
+	exited := false
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Sleep: func(time.Duration) {
+		if exited {
+			return
+		}
+		exited = true
+		if err := os.Remove(filepath.Join(p.SessionsDir(), "5150.json")); err != nil {
+			t.Errorf("remove registry: %v", err)
+		}
+		f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			t.Errorf("append transcript: %v", err)
+			return
+		}
+		defer f.Close()
+		f.WriteString(`{"type":"assistant"}` + "\n")
+	}})
+	writeRegistryKind(t, p, 5150, "busy", "", "print")
+
+	reg, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 5*time.Second)
+	if err != nil {
+		t.Fatalf("err = %v, want the finished print-mode run to be accepted", err)
+	}
+	if reg == nil || reg.Kind != "print" {
+		t.Fatalf("reg = %+v, want the print run's own last registry entry", reg)
+	}
+}
+
+// TestConfirmClaudeDoesNotAcceptAVanishedInteractiveRun is the guard on the
+// case above: the lost-race acceptance is for print runs only. An
+// interactive Claude whose registry entry disappears has NOT resumed,
+// however much its transcript grew on the way down.
+func TestConfirmClaudeDoesNotAcceptAVanishedInteractiveRun(t *testing.T) {
+	p := testPaths(t)
+	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
+	proj := filepath.Join(p.ProjectsDir(), "-home-alice-x")
+	os.MkdirAll(proj, 0o700)
+	transcript := filepath.Join(proj, sid+".jsonl")
+	os.WriteFile(transcript, []byte(`{"type":"user"}`+"\n"), 0o600)
+	gone := false
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Sleep: func(time.Duration) {
+		if gone {
+			return
+		}
+		gone = true
+		os.Remove(filepath.Join(p.SessionsDir(), "5150.json"))
+		f, err := os.OpenFile(transcript, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err == nil {
+			f.WriteString(`{"type":"assistant"}` + "\n")
+			f.Close()
+		}
+	}})
+	writeRegistryKind(t, p, 5150, "busy", "", "interactive")
+	_, err := l.ConfirmClaude(context.Background(), nil, session.ID(sid), 300*time.Millisecond)
+	if err == nil || !strings.Contains(err.Error(), "not confirmed within") {
+		t.Fatalf("err = %v, want a timeout", err)
+	}
+}

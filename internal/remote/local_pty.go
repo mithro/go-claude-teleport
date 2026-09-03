@@ -45,8 +45,11 @@ func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, tim
 	cmd.Dir = cwd
 	// HOME and CLAUDE_CONFIG_DIR are appended (not merely conditionally
 	// added) so they win over whatever this process's own os.Environ()
-	// carries: a later duplicate entry in exec's env slice overrides an
-	// earlier one (verified against this platform's execve/getenv).
+	// carries: os/exec deduplicates Cmd.Env before the exec and keeps the
+	// LAST entry for a name (dedupEnv in os/exec), so appending wins. The
+	// kernel and libc have no say in it — execve passes the array through
+	// verbatim and getenv would return the FIRST match — which is why this
+	// relies on os/exec's behaviour specifically.
 	// Un-conditioning this also fixes an in-process, two-host test fixture
 	// (Task 21's RunJob test) where l.paths.Home differs from the real
 	// process $HOME on both the "source" and "destination" Local — the old

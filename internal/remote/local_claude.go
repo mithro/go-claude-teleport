@@ -101,7 +101,22 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 	// detectability gap: whether a live registry entry's Kind reliably
 	// distinguishes a print run from an interactive one could not be
 	// verified against real Claude Code from here.
+	// Baselined once, up front, rather than at the first busy+print
+	// sighting: the growth that matters is growth since this call began.
 	transcriptBaseline := int64(-1)
+	if n, terr := l.transcriptSize(id); terr == nil {
+		transcriptBaseline = n
+	}
+	// B11: a print run removes its registry entry the moment it finishes,
+	// so the poll can miss the busy-with-a-completed-turn window entirely —
+	// one iteration sees it, the next sees nothing, and the confirm then
+	// burns the whole --start-timeout on a run that in fact succeeded.
+	// Remembering the print entry we DID see lets the same evidence (its
+	// transcript grew past the baseline) be accepted one poll late. Only a
+	// run seen to be print-kind qualifies: an interactive Claude whose
+	// entry disappears has not resumed, however much it wrote on the way
+	// down.
+	var lastPrintReg *session.Registry
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -130,12 +145,19 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 		}
 		switch {
 		case !ok:
+			if lastPrintReg != nil && transcriptBaseline >= 0 {
+				if n, terr := l.transcriptSize(id); terr == nil && n > transcriptBaseline {
+					l.opts.Logf("confirm: the print-mode run for %s exited between polls; its transcript grew %d -> %d bytes, so its turn completed", id, transcriptBaseline, n)
+					return lastPrintReg, nil
+				}
+			}
 			last = "no live registry entry for the session"
 		case wantTmux != "" && reg.Tmux != wantTmux:
 			last = fmt.Sprintf("registry pane %q is not our pane %q", reg.Tmux, wantTmux)
 		case reg.Status == "idle":
 			return reg, nil
 		case reg.Status == "busy" && strings.EqualFold(reg.Kind, "print"):
+			lastPrintReg = reg
 			if n, terr := l.transcriptSize(id); terr == nil {
 				if transcriptBaseline < 0 {
 					transcriptBaseline = n
