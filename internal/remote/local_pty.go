@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -38,28 +39,52 @@ func (r *ring) String() string {
 	return string(r.buf)
 }
 
+// claudeEnv is the environment a claude process this host starts must see,
+// derived from base (normally os.Environ()).
+//
+// HOME is appended rather than conditionally replaced so it wins over
+// whatever base carries: os/exec deduplicates Cmd.Env before the exec and
+// keeps the LAST entry for a name (dedupEnv in os/exec), so appending wins.
+// The kernel and libc have no say in it — execve passes the array through
+// verbatim and getenv would return the FIRST match — which is why this
+// relies on os/exec's behaviour specifically. Overriding it matters for the
+// in-process, two-host test fixtures where paths.Home differs from the real
+// process $HOME; in production they are already equal.
+//
+// CLAUDE_CONFIG_DIR is the T26-2 case and is NOT unconditional. Claude Code
+// chooses its global config file by whether that variable is present at all
+// — set (to anything, the default path included) it reads and writes
+// $CLAUDE_CONFIG_DIR/.claude.json, absent it reads $HOME/.claude.json — so
+// exporting a variable nobody set would send the Claude we start to a file
+// the destination's project entry (session.Paths.GlobalJSON, where install
+// merged it) was never written to, silently losing the trust-dialog and
+// mcpServers state the teleport carried over. It is therefore exported only
+// when the environment is what put ConfigDir where it is, or when ConfigDir
+// is not the $HOME/.claude default and so cannot be communicated any other
+// way; otherwise any inherited value is dropped, since the claude we start
+// must not see one.
+func claudeEnv(base []string, p session.Paths) []string {
+	export := p.ConfigDirFromEnv || p.ConfigDir != filepath.Join(p.Home, ".claude")
+	env := make([]string, 0, len(base)+2)
+	for _, e := range base {
+		if !export && strings.HasPrefix(e, "CLAUDE_CONFIG_DIR=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	env = append(env, "HOME="+p.Home)
+	if export {
+		env = append(env, "CLAUDE_CONFIG_DIR="+p.ConfigDir)
+	}
+	return env
+}
+
 // RunPtyResume runs `claude --resume <id>` under a pty in cwd, confirms
 // per spec §6.2, then exits it (spec §9, no-tmux destination).
 func (l *Local) RunPtyResume(ctx context.Context, id session.ID, cwd string, timeout time.Duration) error {
 	cmd := exec.CommandContext(ctx, "claude", "--resume", string(id))
 	cmd.Dir = cwd
-	// HOME and CLAUDE_CONFIG_DIR are appended (not merely conditionally
-	// added) so they win over whatever this process's own os.Environ()
-	// carries: os/exec deduplicates Cmd.Env before the exec and keeps the
-	// LAST entry for a name (dedupEnv in os/exec), so appending wins. The
-	// kernel and libc have no say in it — execve passes the array through
-	// verbatim and getenv would return the FIRST match — which is why this
-	// relies on os/exec's behaviour specifically.
-	// Un-conditioning this also fixes an in-process, two-host test fixture
-	// (Task 21's RunJob test) where l.paths.Home differs from the real
-	// process $HOME on both the "source" and "destination" Local — the old
-	// conditional compared l.paths.ConfigDir to l.paths.Home+"/.claude"
-	// (always equal, since both derive from the same paths.Home), so it
-	// never actually fired and `claude` always resumed against the real
-	// machine's $HOME/.claude instead of the fixture's. In production
-	// l.paths.Home already equals the process's real $HOME, so this is a
-	// no-op there.
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "HOME="+l.paths.Home, "CLAUDE_CONFIG_DIR="+l.paths.ConfigDir)
+	cmd.Env = append(claudeEnv(os.Environ(), l.paths), "TERM=xterm-256color")
 	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 40, Cols: 120})
 	if err != nil {
 		return &Error{Code: "internal", Message: fmt.Sprintf("pty-resume: start claude: %v", err)}

@@ -108,7 +108,7 @@ func (f *fakeProbe) SocketPath() string { return f.socket }
 // placeholder pane must mark its session suspended, but a live registry
 // entry for the same session id still wins.
 func TestListSuspendedViaProbe(t *testing.T) {
-	p := session.NewPaths("/home/alice", "../session/testdata/config", "/tmp/xdg")
+	p := session.NewPaths("/home/alice", "../session/testdata/config", "/tmp/xdg", true)
 	p.ProcRoot = "../session/testdata/proc"
 
 	// pid 41234 (session 3f9c...) is alive in the fixture /proc, so its

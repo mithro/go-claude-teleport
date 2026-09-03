@@ -149,5 +149,11 @@ func (a *app) resolvePaths() (session.Paths, error) {
 	if a.configDir != "" {
 		cfg = a.configDir
 	}
-	return session.NewPaths(home, cfg, a.env["XDG_DATA_HOME"]), nil
+	// The fourth argument is whether the config dir came from the
+	// environment rather than defaulting to ~/.claude (T26-2): Claude Code
+	// puts its global .claude.json inside CLAUDE_CONFIG_DIR whenever that
+	// variable is set, even to the default path. --config-dir counts as
+	// set — it names the config dir of a Claude Code that runs with the
+	// variable exported.
+	return session.NewPaths(home, cfg, a.env["XDG_DATA_HOME"], cfg != ""), nil
 }

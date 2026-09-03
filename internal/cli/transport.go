@@ -38,7 +38,11 @@ func envPaths(env []string) (session.Paths, error) {
 	if home == "" {
 		return session.Paths{}, errors.New("HOME is not set")
 	}
-	return session.NewPaths(home, envValue(env, "CLAUDE_CONFIG_DIR"), envValue(env, "XDG_DATA_HOME")), nil
+	// The fourth argument is CLAUDE_CONFIG_DIR's PRESENCE (T26-2): an env
+	// slice cannot carry "set to empty" meaningfully — Claude Code treats
+	// an empty value as unset — so a non-empty value is exactly presence.
+	cfg := envValue(env, "CLAUDE_CONFIG_DIR")
+	return session.NewPaths(home, cfg, envValue(env, "XDG_DATA_HOME"), cfg != ""), nil
 }
 
 // cmdEnv is how Plan 01's Main hands the env slice and stdio to commands:

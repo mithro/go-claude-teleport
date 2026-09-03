@@ -14,8 +14,8 @@ import (
 
 const cwd = "/home/alice/github/example/widget"
 
-func srcPaths() session.Paths { return session.NewPaths("/home/alice", "testdata/src", "/tmp/x") }
-func dstPaths() session.Paths { return session.NewPaths("/home/alice", "testdata/dst", "/tmp/x") }
+func srcPaths() session.Paths { return session.NewPaths("/home/alice", "testdata/src", "/tmp/x", true) }
+func dstPaths() session.Paths { return session.NewPaths("/home/alice", "testdata/dst", "/tmp/x", true) }
 
 func TestCollectSrc(t *testing.T) {
 	inv, err := Collect(srcPaths(), cwd, "laptop.example", "2.1.247")
@@ -63,7 +63,7 @@ func TestCollectDstMissingFilesAreNotErrors(t *testing.T) {
 		inv.Plugins["superpowers@claude-plugins-official"].Version != "6.2.0" || len(inv.Env) != 0 {
 		t.Fatalf("%+v", inv)
 	}
-	empty, err := Collect(session.NewPaths("/home/nobody", t.TempDir(), "/tmp/x"), cwd, "h", "")
+	empty, err := Collect(session.NewPaths("/home/nobody", t.TempDir(), "/tmp/x", true), cwd, "h", "")
 	if err != nil || empty.HooksHash != "" || empty.ProjectPresent {
 		t.Fatalf("%+v %v", empty, err)
 	}
@@ -85,11 +85,11 @@ func TestHooksNeverLeakRawContent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(srcDir, "settings.json"), []byte(srcSettings), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	src, err := Collect(session.NewPaths("/home/alice", srcDir, "/tmp/x"), cwd, "laptop.example", "2.1.247")
+	src, err := Collect(session.NewPaths("/home/alice", srcDir, "/tmp/x", true), cwd, "laptop.example", "2.1.247")
 	if err != nil {
 		t.Fatal(err)
 	}
-	dst, err := Collect(session.NewPaths("/home/bob", dstDir, "/tmp/x"), cwd, "big-storage.example", "2.1.247")
+	dst, err := Collect(session.NewPaths("/home/bob", dstDir, "/tmp/x", true), cwd, "big-storage.example", "2.1.247")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestHooksNeverLeakRawContent(t *testing.T) {
 func TestCollectMalformedIsError(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "settings.json"), []byte("{nope"), 0o600)
-	if _, err := Collect(session.NewPaths("/home/alice", dir, "/tmp/x"), cwd, "h", ""); err == nil {
+	if _, err := Collect(session.NewPaths("/home/alice", dir, "/tmp/x", true), cwd, "h", ""); err == nil {
 		t.Fatal("malformed settings.json must be an error")
 	}
 }
@@ -140,7 +140,7 @@ func TestCollectPluginHashesAndSkills(t *testing.T) {
 	os.WriteFile(filepath.Join(plug, "agents", "explorer.md"), []byte("# explorer"), 0o600)
 	os.WriteFile(filepath.Join(dir, "plugins", "installed_plugins.json"),
 		[]byte(`{"version":2,"plugins":{"p@m":[{"version":"1.0.0","installPath":"`+plug+`"}]}}`), 0o600)
-	inv, err := Collect(session.NewPaths("/home/alice", dir, "/tmp/x"), cwd, "h", "")
+	inv, err := Collect(session.NewPaths("/home/alice", dir, "/tmp/x", true), cwd, "h", "")
 	if err != nil {
 		t.Fatal(err)
 	}
