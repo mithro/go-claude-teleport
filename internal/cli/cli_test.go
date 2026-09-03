@@ -3,8 +3,11 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/mithro/go-claude-teleport/internal/version"
 )
 
 // errWriter always fails to write, so a command that writes its result
@@ -25,7 +28,7 @@ func TestVersionCommand(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("exit %d", code)
 	}
-	if !strings.HasPrefix(out, "claude-teleport dev (protocol 2)") {
+	if !strings.HasPrefix(out, fmt.Sprintf("claude-teleport dev (protocol %d)", version.Protocol)) {
 		t.Fatalf("stdout = %q", out)
 	}
 }

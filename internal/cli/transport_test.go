@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/mithro/go-claude-teleport/internal/job"
+	"github.com/mithro/go-claude-teleport/internal/version"
 )
 
 const tsid = "3d2c1b0a-9f8e-4d7c-b6a5-4f3e2d1c0b9a"
@@ -24,7 +26,7 @@ func testEnv(t *testing.T) ([]string, string) {
 
 func TestRemoteServeOverStdio(t *testing.T) {
 	env, home := testEnv(t)
-	stdin := strings.NewReader(`{"id":1,"op":"hello","args":{"version":"dev","protocol":2}}` + "\n" + `{"id":2,"op":"paths","args":{}}` + "\n")
+	stdin := strings.NewReader(fmt.Sprintf(`{"id":1,"op":"hello","args":{"version":"dev","protocol":%d}}`, version.Protocol) + "\n" + `{"id":2,"op":"paths","args":{}}` + "\n")
 	var stdout, stderr bytes.Buffer
 	code := Main([]string{"remote", "serve"}, stdin, &stdout, &stderr, env)
 	if code != ExitOK {
