@@ -611,3 +611,60 @@ func TestWorktreeSessionTeleportsToOtherUserHome(t *testing.T) {
 		t.Errorf("source pane should show the placeholder banner for %s:\n%s", sid, pane)
 	}
 }
+
+// scenario 9 (ruling R-P3-TRUST-1): the destination has NO trusted project
+// entry for the session's cwd, so its Claude stops at the first-run trust
+// dialog and writes no registry entry — the shape of the first real
+// teleport's failure. The source's own trust travels with the session, so
+// the confirm step recognises the dialog and answers it in the job's own
+// pane, and the teleport completes.
+func TestTrustPromptOnDestIsAutoAcceptedFromTheSourcesTrust(t *testing.T) {
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpDiagnostics(t)
+		}
+	})
+	reset(t)
+	trustJump(t, "source", "alice")
+	// The tmux SERVER carries the variable: a pane inherits the server's
+	// environment, and `docker compose exec`/ssh env never reaches a
+	// window opened in an already-running server. reset() has just killed
+	// every server, so this one is ours.
+	sh(t, "dest", "alice", "FAKECLAUDE_TRUST_PROMPT=1 tmux new-session -d -s _keepalive -n idle")
+	sid := newSID(t)
+	seed(t, "source", "alice", "/home/alice/proj", sid)
+	// The source accepted the trust dialog for this cwd; the destination
+	// has no ~/.claude.json at all (reset removed it).
+	sh(t, "source", "alice", `printf '%s' '{"projects": {"/home/alice/proj": {"hasTrustDialogAccepted": true}}}' > ~/.claude.json`)
+	if _, code := shCode(t, "dest", "alice", "test -e /home/alice/.claude.json"); code == 0 {
+		t.Fatal("the destination must start with no global config for this scenario")
+	}
+	startInTmux(t, "source", "alice", "/home/alice/proj", sid, "main", "")
+
+	out, code := teleport(t, "source", "alice", sid+" --to dest --state running")
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	reg := waitRegistry(t, "dest", "alice", sid, "idle")
+	if !strings.Contains(reg, `"tmux":"main:`) {
+		t.Errorf("dest registry tmux field: %s", reg)
+	}
+	if cmd := strings.TrimSpace(sh(t, "dest", "alice", "tmux list-panes -t main:claude -F '#{pane_current_command}'")); cmd != "claude" {
+		t.Errorf("dest pane should be running claude, got pane_current_command=%q", cmd)
+	}
+	// The dialog was really shown and really answered in that pane.
+	if pane := sh(t, "dest", "alice", "tmux capture-pane -p -t main:claude"); !strings.Contains(pane, "Quick safety check") || !strings.Contains(pane, "Yes, I trust this folder") {
+		t.Errorf("dest pane should show the answered trust dialog:\n%s", pane)
+	}
+	if log := sh(t, "source", "alice", "cat ~/.local/share/claude-teleport/jobs/"+sid+"/log.txt"); !strings.Contains(log, "trust prompt") {
+		t.Errorf("the job log should record answering the trust prompt:\n%s", log)
+	}
+	// The carried trust landed in the file the destination's Claude reads.
+	if got := sh(t, "dest", "alice", "cat /home/alice/.claude.json"); !strings.Contains(got, `"hasTrustDialogAccepted": true`) {
+		t.Errorf("dest ~/.claude.json should carry the source's trust:\n%s", got)
+	}
+	// And the source was released as any successful teleport releases it.
+	if registry(t, "source", "alice", sid) != "" {
+		t.Error("source claude still registered after the teleport")
+	}
+}
