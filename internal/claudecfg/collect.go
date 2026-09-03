@@ -37,7 +37,7 @@ type Permissions struct {
 type Inventory struct {
 	Host                                          string
 	ClaudeVersion                                 string
-	Hooks                                         string // canonical JSON of settings.hooks ("" if absent)
+	HooksHash                                     string // sha256 of canonical(settings.hooks), "" if absent — never the raw content: a hook command can carry a secret
 	Permissions                                   Permissions
 	Env                                           map[string]string
 	EnabledPlugins                                map[string]bool
@@ -217,7 +217,7 @@ func Collect(p session.Paths, cwd, host, claudeVersion string) (*Inventory, erro
 		return nil, err
 	} else if ok {
 		if hooks, present := s["hooks"]; present {
-			inv.Hooks = canonical(hooks)
+			inv.HooksHash = configHash(canonical(hooks))
 		}
 		if perm, _ := s["permissions"].(map[string]any); perm != nil {
 			inv.Permissions = Permissions{DefaultMode: stringOf(perm["defaultMode"]),

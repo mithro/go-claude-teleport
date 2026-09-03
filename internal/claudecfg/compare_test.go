@@ -10,7 +10,7 @@ import (
 )
 
 func base() *Inventory {
-	return &Inventory{Host: "laptop.example", ClaudeVersion: "2.1.247", Hooks: `{"a":1}`,
+	return &Inventory{Host: "laptop.example", ClaudeVersion: "2.1.247", HooksHash: "hooksA",
 		Permissions: Permissions{DefaultMode: "acceptEdits", Allow: []string{"x"}, Deny: []string{"d"}},
 		Env:         map[string]string{"A": "1"}, EnabledPlugins: map[string]bool{"p@m": true}, Model: "opus", Effort: "high",
 		MCPServers: map[string]string{"playwright": "cfg1", "unused": "u"}, ProjectPresent: true,
@@ -41,7 +41,7 @@ func TestCompareClassification(t *testing.T) {
 	dst := base()
 	dst.Host = "big-storage.example"
 	dst.ClaudeVersion = "2.1.250"
-	dst.Hooks = `{"a":2}`
+	dst.HooksHash = "hooksB"
 	dst.MCPServers = map[string]string{"playwright": "cfg2", "extra": "e"} // playwright differs, unused absent, extra only on dst
 	dst.ProjectMCP = map[string]string{}                                   // filesystem absent
 	dst.Plugins = map[string]PluginInfo{"p@m": {Version: "1", HooksHash: "h2"}, "q@m": {Version: "3"}}
@@ -160,7 +160,7 @@ func TestClassJSONRoundTrips(t *testing.T) {
 		t.Fatal("unknown class string must error, not silently zero out")
 	}
 	src, dst := base(), base()
-	src.Hooks = `{"a":2}`
+	src.HooksHash = "different"
 	r := Compare(src, dst, nil)
 	if len(r.Diffs) == 0 {
 		t.Fatal("fixture must produce at least one diff")

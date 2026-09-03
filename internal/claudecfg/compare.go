@@ -211,8 +211,8 @@ func Compare(src, dst *Inventory, usage *session.Usage) Report {
 	if src.ClaudeVersion != dst.ClaudeVersion {
 		add(Warn, "claude.version", short(src.ClaudeVersion), short(dst.ClaudeVersion), "Claude Code version differs")
 	}
-	if src.Hooks != dst.Hooks {
-		add(Block, "hooks", short(src.Hooks), short(dst.Hooks), "settings.json hooks differ")
+	if src.HooksHash != dst.HooksHash {
+		add(Block, "hooks", hashShort(src.HooksHash), hashShort(dst.HooksHash), "settings.json hooks differ")
 	}
 	if src.Permissions.DefaultMode != dst.Permissions.DefaultMode {
 		add(Block, "permissions.defaultMode", short(src.Permissions.DefaultMode), short(dst.Permissions.DefaultMode), "permission mode differs")
