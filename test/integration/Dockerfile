@@ -29,5 +29,20 @@ RUN if [ -n "$CLAUDE_VERSION" ]; then \
     fi
 USER root
 
+# Task 26 adaptation (disclosed): the native installer puts real claude at
+# ~/.local/bin/claude, only on alice's PATH via a shell-config line it
+# suggests adding, which no `docker compose exec` session sources (that's
+# not a login/interactive shell). entrypoint.sh already carries an
+# equivalent PATH into the tool's own ssh sessions via
+# ~/.ssh/environment, but that mechanism doesn't reach a bare `docker
+# compose exec ... claude ...` the way this test suite calls claude on
+# source/dest directly. An image-level ENV, unlike ~/.ssh/environment,
+# reaches every process the container starts, `exec` included (verified:
+# without this, "claude --version" via exec was "command not found" the
+# moment the layer-1 fakeclaude bind-mount — which happened to also land
+# at /usr/local/bin/claude, already on PATH — was correctly dropped by
+# docker-compose.realclaude.yml).
+ENV PATH="/home/alice/.local/bin:${PATH}"
+
 EXPOSE 22
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -1,12 +1,22 @@
 # test/integration/docker-compose.realclaude.yml
 # Overrides source/dest to drop the fakeclaude bind-mount so the real
 # Claude Code installed in the layer-2 image (CLAUDE_VERSION set) is used.
+#
+# Task 26 adaptation (disclosed): plain YAML list merge in Compose v2
+# (2.26.1 here) UNIONS a service's "volumes" entries across -f files
+# instead of replacing them — verified with `docker compose ... config`,
+# which showed the base file's fakeclaude bind-mount
+# (../../dist/fakeclaude:/usr/local/bin/claude:ro) still present even
+# under this override, so real claude never ran; only the fake one did.
+# The Compose Specification's merge-type tag "!override" (supported since
+# Compose 2.24) replaces the list wholesale instead of unioning it — the
+# smallest fix that makes this file do what its own comment always said.
 services:
   source:
-    volumes:
+    volumes: !override
       - ./keys:/run/keys:ro
       - ../../dist/claude-teleport:/usr/local/bin/claude-teleport:ro
   dest:
-    volumes:
+    volumes: !override
       - ./keys:/run/keys:ro
       - ../../dist/claude-teleport:/usr/local/bin/claude-teleport:ro

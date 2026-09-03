@@ -28,8 +28,31 @@ for u in alice bob; do
 done
 sed -i 's/^#\?PermitUserEnvironment.*/PermitUserEnvironment yes/' /etc/ssh/sshd_config || true
 grep -q PermitUserEnvironment /etc/ssh/sshd_config || echo 'PermitUserEnvironment yes' >> /etc/ssh/sshd_config
-# Real Claude (layer 2) lives in alice's ~/.local/bin; put it on PATH for sshd sessions.
+# Real Claude (layer 2) lives in alice's ~/.local/bin; put it on PATH for
+# sshd sessions.
+#
+# Task 26 adaptation (disclosed): a real teleport's every claude process on
+# dest is started by the tool's OWN runner, itself spawned over ssh (never
+# a `docker compose exec`, which is the only thing that sees the
+# container's own `environment:` block) — so a fresh, non-interactive ssh
+# session's minimal environment never carried ANTHROPIC_BASE_URL/
+# ANTHROPIC_API_KEY/DISABLE_*/CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:
+# real claude on dest tried api.anthropic.com for real ("Unable to connect
+# to Anthropic services... ETIMEOUT" in the job log) the first time this
+# was run without this block. Re-exporting entrypoint.sh's OWN inherited
+# values (set once, by docker-compose.yml's `environment:`, the single
+# source of truth for the fakeapi URL and dummy key) keeps controller
+# requirement A intact: nothing here is a hardcoded credential, and a
+# missing/empty value is simply not written.
 if [ -x /home/alice/.local/bin/claude ]; then
-  echo 'PATH=/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin' >> /home/alice/.ssh/environment
+  {
+    echo 'PATH=/home/alice/.local/bin:/usr/local/bin:/usr/bin:/bin'
+    [ -n "${ANTHROPIC_BASE_URL:-}" ] && echo "ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL"
+    [ -n "${ANTHROPIC_API_KEY:-}" ] && echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+    [ -n "${DISABLE_AUTOUPDATER:-}" ] && echo "DISABLE_AUTOUPDATER=$DISABLE_AUTOUPDATER"
+    [ -n "${DISABLE_TELEMETRY:-}" ] && echo "DISABLE_TELEMETRY=$DISABLE_TELEMETRY"
+    [ -n "${DISABLE_ERROR_REPORTING:-}" ] && echo "DISABLE_ERROR_REPORTING=$DISABLE_ERROR_REPORTING"
+    [ -n "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-}" ] && echo "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+  } >> /home/alice/.ssh/environment
 fi
 exec /usr/sbin/sshd -D -e

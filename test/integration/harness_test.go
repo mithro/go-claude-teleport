@@ -18,8 +18,15 @@ import (
 // never collide with this one's).
 var projectName = fmt.Sprintf("ct25-%d-%d", os.Getpid(), time.Now().UnixNano())
 
+// composeFiles is the -f/--profile prefix every compose invocation shares.
+// Layer 1 (this file) uses just docker-compose.yml; realclaude_test.go's
+// init() (build tags integration && realclaude) overrides it to also layer
+// docker-compose.realclaude.yml and enable the "realclaude" profile so the
+// fakeapi service comes up and the fakeclaude bind-mounts are dropped.
+var composeFiles = []string{"-f", "docker-compose.yml"}
+
 func composeArgs(args ...string) []string {
-	return append([]string{"compose", "-p", projectName, "-f", "docker-compose.yml"}, args...)
+	return append(append([]string{"compose", "-p", projectName}, composeFiles...), args...)
 }
 
 func compose(t testing.TB, args ...string) string {
