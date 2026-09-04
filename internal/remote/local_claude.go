@@ -268,8 +268,34 @@ func (l *Local) transcriptSize(id session.ID) (int64, error) {
 	return fi.Size(), nil
 }
 
+// exitSigtermGrace and exitSigkillGrace are R-P3-PROOF-7's fixed windows
+// for the signal fallback below, once a typed /exit does not take within
+// its own share (the caller's full timeout — see ExitClaude). They are
+// small and deliberately NOT derived from timeout: the ruling's own words
+// are "the SIGTERM grace + SIGKILL grace live INSIDE a sensible total,
+// they do not stack a fresh 30s on top" — a fixed 5s+3s added to whatever
+// timeout already was stays sensible (38s total for the 30s default)
+// without shrinking the graceful wait that already worked before this
+// fallback existed.
+const (
+	exitSigtermGrace = 5 * time.Second
+	exitSigkillGrace = 3 * time.Second
+)
+
 // ExitClaude implements spec §6.3: in tmux, /exit + Enter then wait for
 // the pid to go; without a pane, SIGTERM then wait.
+//
+// R-P3-PROOF-7 (deliberate spec extension — §6.3 does not itself say this):
+// a real-host validation run left a completed move's source Claude
+// stranded because a typed /exit landed while an update banner had changed
+// its input state, so Enter never submitted it (see fix-exit-brief.md).
+// Since a typed /exit can fail to take for ANY reason — that banner, a
+// modal, an extended-keys quirk — the pane path below now falls back to
+// the no-pane path's own signal escalation (SIGTERM, then SIGKILL) rather
+// than give up after one unconfirmed keystroke. Each signal is guarded by
+// the start-time Alive check (see signalIfAlive) so a recycled pid is
+// never touched, and only a pid still alive after SIGKILL's own grace
+// returns the conflict error.
 func (l *Local) ExitClaude(ctx context.Context, ref *session.TmuxRef, pid int, startTime string, timeout time.Duration) error {
 	if ref != nil {
 		// A pane can still be sent keys after its foreground process has
@@ -287,21 +313,54 @@ func (l *Local) ExitClaude(ctx context.Context, ref *session.TmuxRef, pid int, s
 		if err := tmuxx.SendKeys(ctx, t, ref.PaneID, "Enter"); err != nil {
 			return err
 		}
-	} else {
-		// No pane: signal the pid directly. Guard against ESRCH on an
-		// already-gone pid — WaitGone below still confirms either way.
-		procs, err := l.procs()
-		if err != nil {
+		// The graceful /exit gets the caller's WHOLE timeout, exactly as
+		// it always has — unchanged for the ordinary case where it takes.
+		if err := procx.WaitGone(l.procs, pid, startTime, timeout, confirmPoll, l.opts.Sleep); err == nil {
+			return nil
+		}
+		l.opts.Logf("exit: /exit did not take within %s; sending SIGTERM to pid %d", timeout, pid)
+		if err := l.signalIfAlive(pid, startTime, syscall.SIGTERM, "SIGTERM"); err != nil {
 			return err
 		}
-		if procs.Alive(pid, startTime) {
-			if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
-				return fmt.Errorf("SIGTERM pid %d: %w", pid, err)
-			}
+		if err := procx.WaitGone(l.procs, pid, startTime, exitSigtermGrace, confirmPoll, l.opts.Sleep); err == nil {
+			return nil
 		}
+		l.opts.Logf("exit: pid %d still running %s after SIGTERM; sending SIGKILL", pid, exitSigtermGrace)
+		if err := l.signalIfAlive(pid, startTime, syscall.SIGKILL, "SIGKILL"); err != nil {
+			return err
+		}
+		if err := procx.WaitGone(l.procs, pid, startTime, exitSigkillGrace, confirmPoll, l.opts.Sleep); err != nil {
+			total := timeout + exitSigtermGrace + exitSigkillGrace
+			return &Error{Code: "conflict", Message: fmt.Sprintf("claude (pid %d) still running after %s (/exit, then SIGTERM, then SIGKILL all tried): %v", pid, total, err)}
+		}
+		return nil
+	}
+	// No pane: signal the pid directly. signalIfAlive guards against
+	// ESRCH on an already-gone pid — WaitGone below still confirms
+	// either way. Unchanged from before this fix.
+	if err := l.signalIfAlive(pid, startTime, syscall.SIGTERM, "SIGTERM"); err != nil {
+		return err
 	}
 	if err := procx.WaitGone(l.procs, pid, startTime, timeout, confirmPoll, l.opts.Sleep); err != nil {
 		return &Error{Code: "conflict", Message: fmt.Sprintf("claude (pid %d) still running after %s: %v", pid, timeout, err)}
+	}
+	return nil
+}
+
+// signalIfAlive sends sig to pid, but only when procs still reports it
+// alive with EXACTLY startTime (never a recycled pid) — shared by
+// ExitClaude's no-pane branch and its pane-branch signal fallback
+// (R-P3-PROOF-7). name is the signal's name for the wrapped error text.
+func (l *Local) signalIfAlive(pid int, startTime string, sig syscall.Signal, name string) error {
+	procs, err := l.procs()
+	if err != nil {
+		return err
+	}
+	if !procs.Alive(pid, startTime) {
+		return nil
+	}
+	if err := syscall.Kill(pid, sig); err != nil {
+		return fmt.Errorf("%s pid %d: %w", name, pid, err)
 	}
 	return nil
 }

@@ -225,16 +225,13 @@ func TestExitClaudeInTmuxTypesSlashExit(t *testing.T) {
 	}
 }
 
-func TestExitClaudeTimesOut(t *testing.T) {
-	p := testPaths(t)
-	proc := fakeProcRoot(t, [][4]string{{"5150", "1", "claude", "claude\x00"}})
-	f := &tmuxx.Fake{Default: []string{}}
-	l := NewLocal(p, "x", LocalOptions{ProcRoot: proc, Tmux: fakeDialer(f), Sleep: func(time.Duration) {}})
-	err := l.ExitClaude(context.Background(), &session.TmuxRef{SocketPath: "/s", PaneID: "%7"}, 5150, "777", 300*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "5150") {
-		t.Fatalf("err = %v, want timeout naming the pid", err)
-	}
-}
+// TestExitClaudeTimesOut used to pin the pre-fix pane-branch behaviour: no
+// fallback at all, so a pid that never goes away just times out. Since
+// R-P3-PROOF-7 (this fix) the pane branch signals the pid, which a purely
+// FAKE /proc entry (no real OS process behind pid 5150) cannot safely be
+// the target of — see TestExitClaudeExhaustsEscalationThenErrors in
+// exitclaude_fallback_test.go, which pins the same "still stuck, still
+// errors" behaviour against a real, safely-signallable process instead.
 
 // startSleep spawns a real, short-lived `sleep 60` process this test owns
 // (mirrors internal/procx/freezer_test.go's startSleep) so ExitClaude's
