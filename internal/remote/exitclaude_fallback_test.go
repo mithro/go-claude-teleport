@@ -330,3 +330,25 @@ func TestExitClaudeExhaustsEscalationThenErrors(t *testing.T) {
 		t.Errorf("expected both SIGTERM and SIGKILL escalation logged before giving up: %v", logs())
 	}
 }
+
+// TestExitClaudeNoPaneEscalatesToSIGKILL pins the no-pane branch's own
+// escalation, which fix-fr2's thaw+exit signal-exit (a nil ref, ruling
+// R-P3-PROOF-8 item 3) relies on: a source that ignores SIGTERM must still
+// be ended by SIGKILL rather than merely timing out. Before fix-fr2 this
+// branch sent SIGTERM only and returned a conflict when it was ignored.
+func TestExitClaudeNoPaneEscalatesToSIGKILL(t *testing.T) {
+	p := testPaths(t)
+	pid, startTime, _ := startExitHelper(t, true) // ignores SIGTERM; only SIGKILL ends it
+	logf, logs := capturedLogs()
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc", Sleep: func(time.Duration) {}, Logf: logf})
+
+	if err := l.ExitClaude(context.Background(), nil, pid, startTime, exitFallbackTimeout); err != nil {
+		t.Fatalf("ExitClaude: %v", err)
+	}
+	if alive(pid) {
+		t.Errorf("pid %d still alive after ExitClaude returned; no-pane SIGKILL escalation missing", pid)
+	}
+	if !anyContains(logs(), "SIGKILL") {
+		t.Errorf("expected SIGKILL escalation logged: %v", logs())
+	}
+}
