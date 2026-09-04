@@ -65,13 +65,47 @@ func TestTypeCommandLeadingSpaceAndShellQuoting(t *testing.T) {
 	// one backslash when it reaches the pane — verified directly against
 	// ShellQuote+Quote's actual output. Two backslashes here is correct;
 	// see task-11-report.md for the trace.
-	want := `send-keys -t "%7" " 'claude-teleport' 'placeholder' '--resume' '3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c' '--saved-output' '/home/bob/it'\\''s.txt' '--now'" Enter`
-	f := &Fake{Replies: map[string][]string{want: {}}}
+	//
+	// The text goes in as literal bytes and the newline as the literal CR
+	// byte (ruling R-P3-PROOF-5 item 2): a pane whose stopped Claude left
+	// the terminal in extended-keys mode makes tmux encode key NAMES in a
+	// form the shell that inherited it cannot read.
+	want := []string{
+		`send-keys -l -t "%7" " 'claude-teleport' 'placeholder' '--resume' '3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c' '--saved-output' '/home/bob/it'\\''s.txt' '--now'"`,
+		`send-keys -H -t "%7" 0d`,
+	}
+	f := &Fake{Replies: map[string][]string{want[0]: {}, want[1]: {}}}
 	err := TypeCommand(context.Background(), f, "%7", []string{"claude-teleport", "placeholder", "--resume", "3f2a9c1e-7b4d-4e8a-9c6f-1d2e3f4a5b6c", "--saved-output", "/home/bob/it's.txt", "--now"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if diff := cmp.Diff([]string{want}, f.Calls); diff != "" {
+	if diff := cmp.Diff(want, f.Calls); diff != "" {
+		t.Errorf("(-want +got):\n%s", diff)
+	}
+}
+
+// TestSendReturnIsTheLiteralCRByte pins the newline half of R-P3-PROOF-5
+// item 2: `send-keys -H 0d`, the byte a terminal's Enter key produces,
+// never the "Enter" key NAME (which tmux re-encodes for an application
+// that turned extended keys on) and never C-u/C-c to clear a line.
+func TestSendReturnIsTheLiteralCRByte(t *testing.T) {
+	f := &Fake{Replies: map[string][]string{`send-keys -H -t "%7" 0d`: {}}}
+	if err := SendReturn(context.Background(), f, "%7"); err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff([]string{`send-keys -H -t "%7" 0d`}, f.Calls); diff != "" {
+		t.Errorf("(-want +got):\n%s", diff)
+	}
+}
+
+// TestSendLiteralDoesNotInterpretKeyNames: text that happens to spell a
+// tmux key name is still just text under -l.
+func TestSendLiteralDoesNotInterpretKeyNames(t *testing.T) {
+	f := &Fake{Default: []string{}}
+	if err := SendLiteral(context.Background(), f, "%7", "Enter C-u"); err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff([]string{`send-keys -l -t "%7" "Enter C-u"`}, f.Calls); diff != "" {
 		t.Errorf("(-want +got):\n%s", diff)
 	}
 }
@@ -292,6 +326,8 @@ func TestTargetIDSigilRequired(t *testing.T) {
 		}{
 			{"Capture", func(f *Fake) error { _, err := Capture(ctx, f, bad); return err }},
 			{"SendKeys", func(f *Fake) error { return SendKeys(ctx, f, bad, "Enter") }},
+			{"SendLiteral", func(f *Fake) error { return SendLiteral(ctx, f, bad, "fg") }},
+			{"SendReturn", func(f *Fake) error { return SendReturn(ctx, f, bad) }},
 			{"TypeCommand", func(f *Fake) error { return TypeCommand(ctx, f, bad, []string{"echo", "hi"}) }},
 			{"State", func(f *Fake) error { _, err := State(ctx, f, bad, tb); return err }},
 		} {

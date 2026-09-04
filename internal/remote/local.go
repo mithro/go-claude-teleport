@@ -348,7 +348,23 @@ func (l *Local) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {
 	// so the resumed Claude re-stopped on SIGTTIN and spec §6.3's "/exit"
 	// was typed into the shell instead (B2). restoreForeground's own
 	// guards no-op when there is genuinely nothing to restore.
+	//
+	// ORDER (ruling R-P3-PROOF-5 item 1): the pane's shell is asked to
+	// `fg` the job BEFORE anything continues it. bash's `fg` does both —
+	// it hands the terminal over and then continues the job — whereas a
+	// SIGCONT first gives the still-stopped Claude a chance to re-issue
+	// its colour-scheme query, whose answer tmux writes into the pane's
+	// input for the shell to read as typed text; the ` 'fg'` typed after
+	// that lands on the polluted line and never runs. A real return leg
+	// died exactly that way, Claude left stopped in the background.
+	rerr := l.restoreForeground(ctx, pid, ref)
 	if ok {
+		// The explicit SIGCONT, which is now the FALLBACK: it covers the
+		// pane that has no job-control shell to ask (restoreForeground
+		// no-ops there) and the `fg` that did not take, and it is the
+		// only thing that reaps the freezer helper, so it runs either
+		// way. Freezer.Thaw is idempotent, and a SIGCONT to a job `fg`
+		// already continued is a no-op.
 		if err := f.Thaw(); err != nil {
 			return err
 		}
@@ -361,11 +377,12 @@ func (l *Local) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {
 			l.opts.Logf("thaw: the freezer for pid %d reported: %s", pid, w)
 		}
 	}
-	return l.restoreForeground(ctx, pid, ref)
+	return rerr
 }
 
-// restoreForeground gives the thawed job the pty back by asking the pane's
-// own shell to `fg` it — see tmuxx.RestoreForeground, which is the single
+// restoreForeground gives the frozen job the pty back by asking the pane's
+// own shell to `fg` it — which continues it as well, and is why this runs
+// before the freezer is released. See tmuxx.RestoreForeground, the single
 // implementation of that dance, shared with the freezer helper's
 // owner-died path (ruling R-P3-F1). Local's part is the dialling, the
 // injected /proc root, sleep and logger, and turning the "never came back"

@@ -123,7 +123,10 @@ func (a *app) teleport(ctx context.Context, o orchestrate.Options, dryRun bool) 
 			return ExitOK
 		}
 		fmt.Fprintf(a.stdout, "job %s is %s at step %s; continuing it to %s (use `abandon` to start over)\n", sess.ID.Short(), stateWord(j), firstIncompleteName(j), storedDest(j))
-		return a.continueJob(ctx, j, o.BangMode)
+		// The same question continueJob asks, asked once here so the
+		// flag notes can say whether a runner is already past reading
+		// its plan (F-PROOF2-6).
+		return a.continueJob(ctx, a.noteContinueFlags(j, o, j.RunnerAlive(a.runnerAlive)), o.BangMode)
 	}
 	plan, err := orchestrate.Preflight(ctx, o, src, dst, jobID)
 	if err != nil {
@@ -176,6 +179,98 @@ func (a *app) continueBang(j *job.Journal) bool {
 		return false
 	}
 	return bangMode(a.env, p.Session.Registry)
+}
+
+// continueFlags compares the options of a fresh `teleport --to/--from`
+// with the ones the job it CONTINUES stored, and says what to do about
+// each difference (F-PROOF2-6).
+//
+// --force and --allow-config-drift are pure user consent: they only ever
+// widen what preflight is willing to accept, and no step that already ran
+// can be invalidated by granting them late — so a newly given one is
+// folded into the stored options and honoured from here on. Everything
+// else describes a plan that has already been acted on (the destination
+// pane was opened on the stored --tmux-socket, files were staged for the
+// stored destination), so it is reported and the job keeps its own.
+// Nothing is silently ignored either way.
+//
+// An omitted flag never retracts consent the job already recorded:
+// leaving it off a continue is not a request to withdraw it.
+//
+// liveRunner says a runner for this job is already in flight. That runner
+// decoded its plan once at start (orchestrate.RunJob) and never re-reads
+// it, so consent added now is written to the journal but cannot reach the
+// steps it is already running — it applies from the next run of the job.
+// Saying "honouring it from here on" in that case would be a promise the
+// tool cannot keep, so the note says which it is.
+func continueFlags(stored, given orchestrate.Options, liveRunner bool) (notes []string, updated orchestrate.Options, changed bool) {
+	updated = stored
+	when := "honouring it from here on"
+	if liveRunner {
+		when = "recorded; it applies from the next run of this job (the runner already in flight read its plan at start)"
+	}
+	if given.Force && !stored.Force {
+		updated.Force, changed = true, true
+		notes = append(notes, "  --force: this job was planned without it; "+when)
+	}
+	if given.AllowDrift && !stored.AllowDrift {
+		updated.AllowDrift, changed = true, true
+		notes = append(notes, "  --allow-config-drift: this job was planned without it; "+when)
+	}
+	if given.TmuxSocket != "" && given.TmuxSocket != stored.TmuxSocket {
+		was := stored.TmuxSocket
+		if was == "" {
+			was = "the default socket"
+		}
+		notes = append(notes, fmt.Sprintf("  --tmux-socket %s: this job was planned against %s and keeps it (abandon it to start over elsewhere)", given.TmuxSocket, was))
+	}
+	return notes, updated, changed
+}
+
+// noteContinueFlags prints continueFlags' notes and persists the options
+// it says to honour, returning the journal to continue with.
+//
+// Failures here are reported and then let go: they change what a later
+// step is allowed to do, never whether the continue may proceed, and
+// refusing to continue a half-moved session over a journal write would be
+// a far worse answer than continuing under the options already stored.
+func (a *app) noteContinueFlags(j *job.Journal, o orchestrate.Options, liveRunner bool) *job.Journal {
+	p, err := orchestrate.PlanFromJournal(j)
+	if err != nil {
+		return j
+	}
+	notes, updated, changed := continueFlags(p.Options, o, liveRunner)
+	if len(notes) > 0 {
+		fmt.Fprintln(a.stdout, "flags given now that this job was not planned with:")
+		for _, n := range notes {
+			fmt.Fprintln(a.stdout, n)
+		}
+	}
+	if !changed {
+		return j
+	}
+	p.Options = updated
+	// The install step reads the destination's force consent from the
+	// plan's Extras, not from Options (Preflight copies it across, and a
+	// continued job never re-runs Preflight), so honouring --force means
+	// updating both — otherwise the flag would be recorded and still do
+	// nothing on the one step that asks for it.
+	if p.Extras != nil {
+		p.Extras.Force = updated.Force
+	}
+	raw, err := p.ToJSON()
+	if err != nil {
+		fmt.Fprintf(a.stderr, "claude-teleport: could not record the new flags on job %s: %v\n", j.ID, err)
+		return j
+	}
+	// SaveMerged, not a plain Save: a runner for this job may already be
+	// live and writing step states into the same file.
+	jj, err := job.SaveMerged(a.paths.DataDir, j.ID, func(m *job.Journal) { m.Plan = raw })
+	if err != nil {
+		fmt.Fprintf(a.stderr, "claude-teleport: could not record the new flags on job %s: %v\n", j.ID, err)
+		return j
+	}
+	return jj
 }
 
 func stateWord(j *job.Journal) string {

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/mithro/go-claude-teleport/internal/session"
 	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 )
@@ -66,14 +68,15 @@ func TestThawRestoresForegroundWhenThisLocalNeverFroze(t *testing.T) {
 	if err := l.Thaw(context.Background(), 5150, ref); err != nil {
 		t.Fatalf("Thaw: %v", err)
 	}
-	var typed string
+	var typed []string
 	for _, c := range f.Calls {
 		if strings.HasPrefix(c, "send-keys ") {
-			typed = c
+			typed = append(typed, c)
 		}
 	}
-	if !strings.Contains(typed, "fg") || !strings.Contains(typed, `%7`) {
-		t.Errorf("Thaw typed %q into the pane; want an `fg` sent to %%7 (calls: %v)", typed, f.Calls)
+	want := []string{`send-keys -l -t "%7" " 'fg'"`, `send-keys -H -t "%7" 0d`}
+	if diff := cmp.Diff(want, typed); diff != "" {
+		t.Errorf("Thaw typed the wrong thing into the pane (-want +got):\n%s\ncalls: %v", diff, f.Calls)
 	}
 	if !restored {
 		t.Errorf("Thaw never waited for the foreground to come back")

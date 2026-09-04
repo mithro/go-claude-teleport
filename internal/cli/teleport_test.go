@@ -15,6 +15,7 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/orchestrate"
 	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/session"
+	"github.com/mithro/go-claude-teleport/internal/transfer"
 )
 
 func TestTeleportUsageErrors(t *testing.T) {
@@ -429,5 +430,115 @@ func TestStartFailureHintNeverBlamesLoginForTheTrustPrompt(t *testing.T) {
 	startFailureHint(&buf, fixtureSID, `step start: conflict: destination Claude did not resume: pane shows "Not logged in"`)
 	if got := buf.String(); !strings.Contains(got, "/login") {
 		t.Errorf("a genuine login failure must still advise /login:\n%s", got)
+	}
+}
+
+// storedPlanJob is unfinishedJob plus a stored plan carrying opts — the
+// only place a continued job remembers what it was asked to do.
+func storedPlanJob(t *testing.T, a *app, sid string, opts orchestrate.Options) *job.Journal {
+	t.Helper()
+	j := unfinishedJob(t, a, sid)
+	p := &orchestrate.Plan{JobID: sid, Options: opts, Extras: &transfer.InstallExtras{}}
+	raw, err := p.ToJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.Plan = raw
+	if err := j.Save(); err != nil {
+		t.Fatal(err)
+	}
+	return j
+}
+
+// TestContinueFlagsHonoursConsentAndReportsTheRest is F-PROOF2-6's rule:
+// --force and --allow-config-drift are pure user consent and are folded
+// into the stored options; a --tmux-socket the job was not planned with
+// cannot be applied, so it is reported instead of silently dropped. An
+// omitted flag never retracts consent the job already recorded.
+func TestContinueFlagsHonoursConsentAndReportsTheRest(t *testing.T) {
+	stored := orchestrate.Options{TmuxSocket: "/run/tmux-1000/default"}
+	given := orchestrate.Options{Force: true, AllowDrift: true, TmuxSocket: "/run/tmux-1000/other"}
+	notes, updated, changed := continueFlags(stored, given, false)
+	if !changed || !updated.Force || !updated.AllowDrift {
+		t.Errorf("continueFlags did not honour the consent flags: %+v (changed %v)", updated, changed)
+	}
+	if updated.TmuxSocket != stored.TmuxSocket {
+		t.Errorf("--tmux-socket must not be retargeted mid-job: %q", updated.TmuxSocket)
+	}
+	all := strings.Join(notes, "\n")
+	for _, want := range []string{"--force", "--allow-config-drift", "--tmux-socket", "/run/tmux-1000/other", "/run/tmux-1000/default", "honouring it from here on"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("the notes never mention %q:\n%s", want, all)
+		}
+	}
+
+	// A runner already in flight decoded its plan at start and never
+	// re-reads it, so consent added now cannot reach the steps it is
+	// running — the note must not promise otherwise (review round 1).
+	live, _, _ := continueFlags(stored, given, true)
+	liveAll := strings.Join(live, "\n")
+	if !strings.Contains(liveAll, "applies from the next run of this job") {
+		t.Errorf("with a runner in flight the notes must not claim the flags take effect now:\n%s", liveAll)
+	}
+	if strings.Contains(liveAll, "honouring it from here on") {
+		t.Errorf("with a runner in flight the notes overstate what the flags do:\n%s", liveAll)
+	}
+
+	// Nothing new given: nothing to say, nothing to change — and the
+	// consent already stored survives being left off the command line.
+	consented := orchestrate.Options{Force: true, AllowDrift: true}
+	notes, updated, changed = continueFlags(consented, orchestrate.Options{}, false)
+	if changed || len(notes) != 0 {
+		t.Errorf("an invocation adding no flags said %v (changed %v)", notes, changed)
+	}
+	if !updated.Force || !updated.AllowDrift {
+		t.Errorf("omitting a flag retracted stored consent: %+v", updated)
+	}
+}
+
+// TestTeleportOverAnExistingJobAnnouncesNewFlags pins the other half of
+// F-PROOF2-6: the flags reach the user AND the journal, not /dev/null.
+// The fake runner here exits without touching the journal on purpose, so
+// what the continue branch stored is still there to read.
+func TestTeleportOverAnExistingJobAnnouncesNewFlags(t *testing.T) {
+	a, out := fixtureApp(t)
+	dir := t.TempDir()
+	script := filepath.Join(dir, "idle-runner.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	a.selfExe = script
+	storedPlanJob(t, a, fixtureSID, orchestrate.Options{Direction: "to", Target: "big-storage.example", TmuxSocket: "/run/tmux-1000/default"})
+
+	o := orchestrate.Options{Direction: "to", Target: "big-storage.example",
+		Selector: session.Selector{ID: session.ID(fixtureSID)}, State: "auto", LocalDest: &a.paths,
+		Force: true, AllowDrift: true, TmuxSocket: "/run/tmux-1000/other"}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a.teleport(ctx, o, false)
+
+	for _, want := range []string{"continuing it to", "--force", "--allow-config-drift", "--tmux-socket", "honouring it from here on"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("continuing an existing job never mentioned %q:\n%s", want, out.String())
+		}
+	}
+	j, ok, err := job.Open(a.paths.DataDir, fixtureSID)
+	if err != nil || !ok {
+		t.Fatalf("job.Open = %v %v", ok, err)
+	}
+	p, err := orchestrate.PlanFromJournal(j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.Options.Force || !p.Options.AllowDrift {
+		t.Errorf("the consent flags were not stored on the job: %+v", p.Options)
+	}
+	if p.Options.TmuxSocket != "/run/tmux-1000/default" {
+		t.Errorf("--tmux-socket retargeted a job already in flight: %q", p.Options.TmuxSocket)
+	}
+	// The install step's own consent flag, which is where --force
+	// actually lands on the destination.
+	if p.Extras == nil || !p.Extras.Force {
+		t.Errorf("--force never reached the plan's install extras: %+v", p.Extras)
 	}
 }
