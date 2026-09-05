@@ -4,10 +4,11 @@ name: release
 #   1. test   — full suite (tmux installed for the integration tests)
 #   2. version — HEAD's vX.Y tag if it has one, else the next patch tag
 #                (latest reachable vX.Y + 1), created and pushed here
-#   3. build  — static linux amd64 + arm64 binaries (-X version.Version=<tag>)
-#                and nfpm .debs (version X.Y)
-#   4. release — GitHub Release <tag> with binaries, debs, checksums
-#   5. apt    — signed apt repository on GitHub Pages
+#   3. binaries — fat multi-arch claude-teleport (packaging/fatbuild.py):
+#                one native per arch + the shared FATBLOB, so each carries all
+#   4. debs   — one nfpm .deb per Debian arch, wrapping its canonical binary
+#   5. release — GitHub Release <tag> with binaries, debs, checksums
+#   6. apt    — signed apt repository on GitHub Pages
 # Tags are always vXX.ZZZ (the repo's tag ruleset); git describe on a released
 # commit is therefore exactly the release tag.
 
@@ -83,56 +84,79 @@ jobs:
           echo "deb=$DEB" >> "$GITHUB_OUTPUT"
           echo "release tag: $TAG (deb $DEB)"
 
-  build:
+  # One job builds every architecture's native claude-teleport and staples the
+  # shared FATBLOB onto each (packaging/fatbuild.py), so every released
+  # claude-teleport-linux-<arch> is a fat binary carrying all architectures and
+  # can install the matching helper onto a different-arch remote with no
+  # pre-install (the zero-install teleport path).
+  binaries:
     needs: version
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # `arch` is the Debian name (used by nfpm and in the .deb filename);
-          # `goarch`/`goarm` are what the Go toolchain wants.
-          - {arch: amd64, goarch: amd64, goarm: ""}
-          - {arch: arm64, goarch: arm64, goarm: ""}
-          - {arch: armhf, goarch: arm, goarm: "7"}
-          - {arch: riscv64, goarch: riscv64, goarm: ""}
     env:
       TAG: ${{ needs.version.outputs.tag }}
-      DEBVER: ${{ needs.version.outputs.deb }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Build static binary
+      - name: Build fat multi-arch binaries
         run: |
           set -euo pipefail
-          mkdir -p dist
-          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
-          GOARM=${{ matrix.goarm }} \
-            go build -trimpath \
-              -ldflags "-s -w -X ${GO_MODULE}/internal/version.Version=${TAG}" \
-              -o dist/claude-teleport ./cmd/claude-teleport
+          python3 packaging/fatbuild.py --version "${TAG}"
           ls -l dist/
+          # Sanity: the amd64 canonical must run and report the injected tag.
+          test "$(./dist/claude-teleport-linux-amd64 version | awk '{print $2}')" = "${TAG}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-bin
+          path: dist/claude-teleport-linux-*
+          if-no-files-found: error
+
+  # Package a .deb per Debian architecture from the matching fat canonical
+  # binary. The binary carries every arch regardless; the .deb's Architecture
+  # names the native ELF it wraps.
+  debs:
+    needs: [version, binaries]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `arch` is the Debian name; `binarch` is the fatbuild.py arch id
+          # whose canonical binary this .deb wraps.
+          - {arch: amd64, binarch: amd64}
+          - {arch: arm64, binarch: arm64}
+          - {arch: armhf, binarch: arm}
+          - {arch: riscv64, binarch: riscv64}
+    env:
+      DEBVER: ${{ needs.version.outputs.deb }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-bin
+          path: dist/
       - name: Install nfpm
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/nfpm.deb \
+          curl -fsSL -o nfpm.deb \
             "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb"
-          sudo dpkg -i /tmp/nfpm.deb
+          sudo dpkg -i nfpm.deb
           nfpm --version
       - name: Build deb
         run: |
           set -euo pipefail
+          cp "dist/claude-teleport-linux-${{ matrix.binarch }}" dist/claude-teleport
+          chmod +x dist/claude-teleport
           VERSION="$DEBVER" ARCH="${{ matrix.arch }}" nfpm package -p deb -f nfpm.yaml -t dist/
-          mv dist/claude-teleport "dist/claude-teleport-linux-${{ matrix.arch }}"
-          ls -l dist/
+          rm -f dist/claude-teleport
           dpkg-deb -I dist/*_${{ matrix.arch }}.deb | head -20
           dpkg-deb -c dist/*_${{ matrix.arch }}.deb
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.arch }}
-          path: dist/
+          name: dist-deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
 
       # The static binary is suite-independent, so the same .deb is published
       # for every suite rather than rebuilt per suite.
@@ -149,7 +173,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [version, build]
+    needs: [version, binaries, debs]
     runs-on: ubuntu-latest
     permissions:
       contents: write   # create the GitHub Release
@@ -178,7 +202,7 @@ jobs:
             gh release create "$TAG" dist/* \
               --title "$TAG" \
               --generate-notes \
-              --notes "Static linux binaries (amd64, arm64), Debian packages and SHA256SUMS. Apt repository: https://mith.ro/go-claude-teleport/ (see index for setup)."
+              --notes "Fat static linux binaries (386, amd64, armhf, arm64, riscv64 — each carries every arch and can install itself onto a different-arch remote), Debian packages and SHA256SUMS. Apt repository: https://mith.ro/go-claude-teleport/ (see index for setup)."
           fi
 
   apt:
@@ -191,7 +215,7 @@ jobs:
       id-token: write
     # Build on PRs to validate, but never publish from one.
     if: github.event_name != 'pull_request'
-    needs: build
+    needs: debs
     uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
     with:
       suites: "trixie sid"
