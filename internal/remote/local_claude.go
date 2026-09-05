@@ -335,14 +335,25 @@ func (l *Local) ExitClaude(ctx context.Context, ref *session.TmuxRef, pid int, s
 		}
 		return nil
 	}
-	// No pane: signal the pid directly. signalIfAlive guards against
-	// ESRCH on an already-gone pid — WaitGone below still confirms
-	// either way. Unchanged from before this fix.
+	// No pane: signal the pid directly, escalating exactly as the pane
+	// branch does — SIGTERM, then SIGKILL as the guaranteed stop. fix-fr2's
+	// thaw+exit signal-exit (orchestrate.runThawExit, ruling R-P3-PROOF-8
+	// item 3) calls this branch with a nil ref when the source pane could
+	// not be foregrounded for a graceful quit, and relies on SIGKILL to end
+	// a source that ignores SIGTERM. signalIfAlive guards each signal
+	// against a recycled pid; WaitGone confirms the exit between them.
 	if err := l.signalIfAlive(pid, startTime, syscall.SIGTERM, "SIGTERM"); err != nil {
 		return err
 	}
-	if err := procx.WaitGone(l.procs, pid, startTime, timeout, confirmPoll, l.opts.Sleep); err != nil {
-		return &Error{Code: "conflict", Message: fmt.Sprintf("claude (pid %d) still running after %s: %v", pid, timeout, err)}
+	if err := procx.WaitGone(l.procs, pid, startTime, timeout, confirmPoll, l.opts.Sleep); err == nil {
+		return nil
+	}
+	l.opts.Logf("exit: pid %d still running %s after SIGTERM; sending SIGKILL", pid, timeout)
+	if err := l.signalIfAlive(pid, startTime, syscall.SIGKILL, "SIGKILL"); err != nil {
+		return err
+	}
+	if err := procx.WaitGone(l.procs, pid, startTime, exitSigkillGrace, confirmPoll, l.opts.Sleep); err != nil {
+		return &Error{Code: "conflict", Message: fmt.Sprintf("claude (pid %d) still running after SIGTERM then SIGKILL: %v", pid, err)}
 	}
 	return nil
 }

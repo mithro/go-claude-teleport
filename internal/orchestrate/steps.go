@@ -812,6 +812,21 @@ func sourcePaneGone(err error) bool {
 	return isCode(err, "not-found") || isCode(err, "unavailable")
 }
 
+// isForegroundRestoreFailure reports whether err is Thaw's signal that the
+// source pid is alive but its pane's foreground could not be handed back:
+// on a heavily-loaded source tmux server the `fg` typed to restore the
+// terminal loses the DSR race (claude's colour query is answered into the
+// shell's input, so the shell runs the polluted line instead of `fg`), and
+// RestoreForeground times out. remote.Local.Thaw maps that
+// tmuxx.ErrNotRestored to a "conflict"-coded remote.Error, and it is Thaw's
+// ONLY conflict-coded error — so the code alone identifies it (fix-fr2,
+// ruling R-P3-PROOF-8). It is deliberately distinct from sourcePaneGone's
+// not-found/unavailable (there the pane or server is gone); here the source
+// is still running and must be signal-exited.
+func isForegroundRestoreFailure(err error) bool {
+	return isCode(err, "conflict")
+}
+
 func (r *runner) verifyThawExit(ctx context.Context) (bool, error) {
 	if r.p.sourceState() != session.StateRunning {
 		return true, nil
@@ -830,8 +845,15 @@ func (r *runner) verifyThawExit(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	_, ok := procx.IsPlaceholderArgv(st.Argv)
-	return ok, nil
+	// The source claude is confirmed exited (checked above). The pane now
+	// holds either the placeholder this step typed (the graceful path) or
+	// the bare shell it was left at when its foreground could not be
+	// restored for a graceful quit (fix-fr2, ruling R-P3-PROOF-8 item 4):
+	// both are acceptable end states for a source that is gone.
+	if _, ok := procx.IsPlaceholderArgv(st.Argv); ok {
+		return true, nil
+	}
+	return tmuxx.IsShell(st.Command), nil
 }
 
 func (r *runner) runThawExit(ctx context.Context) error {
@@ -840,22 +862,57 @@ func (r *runner) runThawExit(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// foregroundRestoreFailed records that Thaw could not hand the source
+	// pane's terminal back for a graceful quit (fix-fr2, ruling
+	// R-P3-PROOF-8): the source is still alive and must be exited, but by
+	// SIGNAL — a /exit typed into a pane we could not foreground would not
+	// be read.
+	foregroundRestoreFailed := false
 	if alive {
-		if err := r.src.Thaw(ctx, reg.PID, r.p.Session.Tmux); err != nil && !isCode(err, "not-found") {
+		switch err := r.src.Thaw(ctx, reg.PID, r.p.Session.Tmux); {
+		case err == nil, isCode(err, "not-found"):
+			r.logf("thaw: SIGCONT pid %d", reg.PID)
+		case isForegroundRestoreFailure(err):
+			foregroundRestoreFailed = true
+			r.logf("thaw: could not restore the source pane's foreground (%v); exiting the source by signal instead", err)
+		default:
 			return err
 		}
-		r.logf("thaw: SIGCONT pid %d", reg.PID)
-		if r.p.Options.BangMode {
+		// !-mode's waitSourceIdle watches the restored foreground record the
+		// command's result; when the foreground could not be restored we are
+		// killing the source outright rather than letting it record, so skip
+		// the wait and go straight to the signal exit.
+		if r.p.Options.BangMode && !foregroundRestoreFailed {
 			if err := r.waitSourceIdle(ctx); err != nil {
 				return err
 			}
 		}
-		r.logf("exit: asking the source claude (pid %d) to exit", reg.PID)
-		if err := r.src.ExitClaude(ctx, r.p.Session.Tmux, reg.PID, reg.ProcStart, r.p.Options.ExitTimeout); err != nil {
-			return err
+		if foregroundRestoreFailed {
+			// A nil ref selects ExitClaude's no-pane signal escalation
+			// (SIGTERM → grace → SIGKILL → grace, each Alive-guarded): the
+			// source was SIGCONT'd before RestoreForeground failed, so it is
+			// running and takes SIGTERM, with SIGKILL the guaranteed stop.
+			r.logf("exit: signal-exiting the source claude (pid %d); its pane could not be foregrounded", reg.PID)
+			if err := r.src.ExitClaude(ctx, nil, reg.PID, reg.ProcStart, r.p.Options.ExitTimeout); err != nil {
+				return err
+			}
+		} else {
+			r.logf("exit: asking the source claude (pid %d) to exit", reg.PID)
+			if err := r.src.ExitClaude(ctx, r.p.Session.Tmux, reg.PID, reg.ProcStart, r.p.Options.ExitTimeout); err != nil {
+				return err
+			}
 		}
 	}
 	if r.p.Session.Tmux == nil {
+		return nil
+	}
+	if foregroundRestoreFailed {
+		// The pane is a shell whose input may still hold the DSR answer that
+		// lost us the `fg` race; typing the placeholder there is unreliable,
+		// so leave the pane at its shell — an acceptable end state (fix-fr2,
+		// ruling R-P3-PROOF-8 item 4; the same class as R-P3-PROOF-1's "pane
+		// left with claude"). verifyThawExit accepts it.
+		r.logf("exit: source pane could not be restored; leaving it at its shell (placeholder skipped)")
 		return nil
 	}
 	st, err := r.src.PaneState(ctx, r.p.Session.Tmux)

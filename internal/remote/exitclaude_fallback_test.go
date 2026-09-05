@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -72,6 +73,13 @@ func runExitHelper(args []string) {
 	if len(args) > 0 && args[0] == "--ignore-term" {
 		signal.Ignore(syscall.SIGTERM)
 	}
+	// Readiness handshake (ruling R-P3-PROOF-8a): only now — with the
+	// SIGTERM disposition installed and about to block on stdin — tell the
+	// parent (startExitHelper) it is safe to signal us. Before this, a
+	// slower CI runner could deliver SIGTERM before signal.Ignore took, so
+	// the child died at the SIGTERM stage, the SIGKILL escalation never ran
+	// and the assertion saw empty logs (the observed flake on PR #16).
+	fmt.Fprintln(os.Stdout, "READY")
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
 		if sc.Text() == "/exit" {
@@ -79,6 +87,29 @@ func runExitHelper(args []string) {
 		}
 	}
 	select {}
+}
+
+// awaitReady blocks until the exit-helper child writes its "READY" token
+// (bounded, so a child that never comes up fails fast instead of hanging).
+func awaitReady(r io.Reader) error {
+	done := make(chan error, 1)
+	go func() {
+		line, err := bufio.NewReader(r).ReadString('\n')
+		switch {
+		case err != nil:
+			done <- fmt.Errorf("read ready token: %w", err)
+		case strings.TrimSpace(line) != "READY":
+			done <- fmt.Errorf("unexpected ready token %q", line)
+		default:
+			done <- nil
+		}
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("timed out waiting for ready token")
+	}
 }
 
 // startExitHelper spawns this test binary as `exit-helper` (TestMain above
@@ -102,6 +133,10 @@ func startExitHelper(t *testing.T, ignoreTerm bool) (pid int, startTime string, 
 	if err != nil {
 		t.Fatal(err)
 	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("spawn exit-helper: %v", err)
 	}
@@ -112,6 +147,14 @@ func startExitHelper(t *testing.T, ignoreTerm bool) (pid int, startTime string, 
 		in.Close()
 		<-reaped
 	})
+	// Block until the child has installed its signal disposition and is
+	// about to read stdin (runExitHelper's "READY"), so no caller signals
+	// it before it is ready (R-P3-PROOF-8a). Reading the single ready line
+	// here completes before the reaper's Wait can close the pipe (the child
+	// stays alive, blocked on stdin, until a test signals it).
+	if err := awaitReady(out); err != nil {
+		t.Fatalf("exit-helper never signalled ready: %v", err)
+	}
 	st, err := procx.StartTime("/proc", cmd.Process.Pid)
 	if err != nil {
 		t.Fatal(err)
@@ -146,9 +189,18 @@ func (k *keyRelayTransport) Run(ctx context.Context, cmd string) ([]string, erro
 // capturedLogs collects LocalOptions.Logf output into lines, for asserting
 // which escalation steps ExitClaude actually took.
 func capturedLogs() (logf func(string, ...any), lines func() []string) {
+	var mu sync.Mutex
 	var got []string
-	return func(format string, a ...any) { got = append(got, fmt.Sprintf(format, a...)) },
-		func() []string { return got }
+	return func(format string, a ...any) {
+			mu.Lock()
+			got = append(got, fmt.Sprintf(format, a...))
+			mu.Unlock()
+		},
+		func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]string(nil), got...)
+		}
 }
 
 func anyContains(lines []string, substr string) bool {
@@ -328,5 +380,27 @@ func TestExitClaudeExhaustsEscalationThenErrors(t *testing.T) {
 	}
 	if !anyContains(logs(), "SIGTERM") || !anyContains(logs(), "SIGKILL") {
 		t.Errorf("expected both SIGTERM and SIGKILL escalation logged before giving up: %v", logs())
+	}
+}
+
+// TestExitClaudeNoPaneEscalatesToSIGKILL pins the no-pane branch's own
+// escalation, which fix-fr2's thaw+exit signal-exit (a nil ref, ruling
+// R-P3-PROOF-8 item 3) relies on: a source that ignores SIGTERM must still
+// be ended by SIGKILL rather than merely timing out. Before fix-fr2 this
+// branch sent SIGTERM only and returned a conflict when it was ignored.
+func TestExitClaudeNoPaneEscalatesToSIGKILL(t *testing.T) {
+	p := testPaths(t)
+	pid, startTime, _ := startExitHelper(t, true) // ignores SIGTERM; only SIGKILL ends it
+	logf, logs := capturedLogs()
+	l := NewLocal(p, "x", LocalOptions{ProcRoot: "/proc", Sleep: func(time.Duration) {}, Logf: logf})
+
+	if err := l.ExitClaude(context.Background(), nil, pid, startTime, exitFallbackTimeout); err != nil {
+		t.Fatalf("ExitClaude: %v", err)
+	}
+	if alive(pid) {
+		t.Errorf("pid %d still alive after ExitClaude returned; no-pane SIGKILL escalation missing", pid)
+	}
+	if !anyContains(logs(), "SIGKILL") {
+		t.Errorf("expected SIGKILL escalation logged: %v", logs())
 	}
 }

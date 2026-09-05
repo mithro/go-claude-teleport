@@ -4,6 +4,7 @@ package orchestrate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,6 +142,73 @@ func TestVerifyThawExitDoneWhenSourcePaneLeftWithClaude(t *testing.T) {
 			t.Fatalf("verifyThawExit = %v %v, want done (the source pane left with claude)", done, err)
 		}
 	})
+}
+
+// foregroundFailEndpoint wraps a real endpoint but makes Thaw report the
+// foreground-restore failure remote.Local.Thaw returns when `fg` loses the
+// DSR race on a loaded source tmux server (fix-fr2, ruling R-P3-PROOF-8),
+// so runThawExit's signal-exit fallback can be driven against a REAL,
+// still-alive source claude without having to reproduce that
+// timing-dependent race for real. Every other call is the real one.
+type foregroundFailEndpoint struct {
+	remote.Endpoint
+	thawErr error
+}
+
+func (e *foregroundFailEndpoint) Thaw(ctx context.Context, pid int, ref *session.TmuxRef) error {
+	return e.thawErr
+}
+
+// TestRunThawExitSignalExitsWhenForegroundRestoreFails is fix-fr2's core:
+// on a heavily-loaded source tmux server RestoreForeground can lose the
+// DSR/`fg` race, so Thaw returns a "did not get its terminal back"
+// conflict while the source claude is still alive (the move already
+// succeeded before this step ran). runThawExit must NOT fail on it: it
+// signal-exits the still-live source and leaves the pane at its shell
+// (placeholder skipped), rather than returning the foreground-restore
+// error the pre-fix code did (ruling R-P3-PROOF-8 items 1-4).
+func TestRunThawExitSignalExitsWhenForegroundRestoreFails(t *testing.T) {
+	r, src, ref, reg := newThawExitRunner(t)
+	fgErr := &remote.Error{Code: "conflict", Message: fmt.Sprintf("thawed claude (pid %d) did not get its terminal back within 10s", reg.PID)}
+	r.src = &foregroundFailEndpoint{Endpoint: src.ep, thawErr: fgErr}
+
+	if err := r.runThawExit(context.Background()); err != nil {
+		t.Fatalf("runThawExit = %v, want success via signal-exit (foreground restore lost the fg race)", err)
+	}
+	// The real source claude must be gone — SIGTERM'd through ExitClaude's
+	// no-pane escalation, not left running because a graceful /exit could
+	// not be typed into an un-foregrounded pane.
+	if _, ok, err := src.ep.ClaudeStatus(context.Background(), r.id()); err != nil || ok {
+		t.Fatalf("source claude still registered after signal-exit (ok=%v err=%v)", ok, err)
+	}
+	// No placeholder may have been typed into the pane we could not
+	// foreground: it is left at its bare shell.
+	st, err := src.ep.PaneState(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("PaneState = %v", err)
+	}
+	if !tmuxx.IsShell(st.Command) {
+		t.Errorf("source pane command = %q, want the bare shell (placeholder must be skipped)", st.Command)
+	}
+}
+
+// TestVerifyThawExitDoneWhenSourceSignalExitedToShell covers fix-fr2's
+// `continue` path: after the signal-exit fallback the source claude is
+// gone but its pane was left at the bare shell (no placeholder typed).
+// verifyThawExit must report the step done — a source that is gone is the
+// end state that matters (ruling R-P3-PROOF-8 item 4); the pre-fix verify
+// demanded the placeholder and so re-ran forever.
+func TestVerifyThawExitDoneWhenSourceSignalExitedToShell(t *testing.T) {
+	r, src, _, reg := newThawExitRunner(t)
+	// Exit the source by signal (nil ref) — exactly the state the
+	// signal-exit path leaves behind: source gone, pane at its shell.
+	if err := src.ep.ExitClaude(context.Background(), nil, reg.PID, reg.ProcStart, r.p.Options.ExitTimeout); err != nil {
+		t.Fatalf("test setup: ExitClaude = %v", err)
+	}
+	done, err := r.verifyThawExit(context.Background())
+	if err != nil || !done {
+		t.Fatalf("verifyThawExit = %v %v, want done (source gone, pane left at shell)", done, err)
+	}
 }
 
 func TestRecordVerifyUsesJournal(t *testing.T) {
