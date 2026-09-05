@@ -112,6 +112,11 @@ func (l *Local) runStream(ctx context.Context, kind StreamKind, jobID, streamID 
 		if err != nil {
 			return err
 		}
+		// Rewritten-transcript temp files go in this job's own directory
+		// (under the tool's data dir), never the shared system /tmp: the
+		// reloaded manifest's TmpDir is empty (json:"-"), which sendFile
+		// would otherwise fall back to os.TempDir() for.
+		m.TmpDir = jobDir
 		v, err := l.planView(jobID)
 		if err != nil {
 			return err
