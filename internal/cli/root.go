@@ -24,6 +24,7 @@ type teleportFlags struct {
 	Force          bool
 	TmuxSocket     string
 	NoTmux         bool
+	NoBootstrap    bool
 	Excludes       []string
 	IncludeIgnored bool
 	DryRun         bool
@@ -126,6 +127,7 @@ func (a *app) rootCmd() *cobra.Command {
 	f.BoolVar(&tf.Force, "force", false, "allow non-fast-forward replacement of this session")
 	f.StringVar(&tf.TmuxSocket, "tmux-socket", "", "destination tmux socket name")
 	f.BoolVar(&tf.NoTmux, "no-tmux", false, "do not use tmux on the destination")
+	f.BoolVar(&tf.NoBootstrap, "no-bootstrap", false, "require claude-teleport pre-installed on the remote (do not auto-install it)")
 	f.StringArrayVar(&tf.Excludes, "exclude", nil, "exclude glob, repeatable")
 	f.BoolVar(&tf.IncludeIgnored, "include-ignored", false, "also transfer gitignored files")
 	f.BoolVar(&tf.DryRun, "dry-run", false, "preflight only")
