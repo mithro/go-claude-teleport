@@ -39,6 +39,10 @@ func (l *Local) BuildManifest(ctx context.Context, jobID string, id session.ID, 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	// Any rewrite temp files a Send off this in-memory manifest writes go in
+	// the job dir, not /tmp. TmpDir is json:"-", so a manifest reloaded from
+	// disk (the streaming Send path) sets it again from its own job dir.
+	m.TmpDir = dir
 	if err := m.Save(filepath.Join(dir, "manifest.json")); err != nil {
 		return nil, err
 	}

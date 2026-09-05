@@ -92,6 +92,69 @@ func TestTarStreamSourceToDestInProcess(t *testing.T) {
 	}
 }
 
+// TestSendWritesRewriteTempFilesInJobDirNotTmp pins the fix that keeps the
+// tool off the shared system /tmp. The streaming Send reloads the manifest
+// from disk, where TmpDir is not persisted (json:"-"), so runStream must
+// point it at this job's own directory before sending. We prove it by making
+// os.TempDir() unwritable: with the fix the rewrite temp file lands in the
+// (writable) job dir and the send succeeds; without it, sendFile falls back
+// to the read-only /tmp stand-in and the send fails.
+func TestSendWritesRewriteTempFilesInJobDirNotTmp(t *testing.T) {
+	// A read-only stand-in for /tmp: any rewrite temp file created here would
+	// fail, which is exactly the regression this guards against.
+	roTmp := filepath.Join(t.TempDir(), "ro-tmp")
+	if err := os.Mkdir(roTmp, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(roTmp, 0o700) })
+	t.Setenv("TMPDIR", roTmp)
+
+	src, dst := testPaths(t), testPaths(t)
+	jobID := sid
+	// The transcript's cwd must be prefixed by src.Home for RewriteJSON to
+	// touch it (same note as TestTarStreamSourceToDestInProcess), so the
+	// rewrite — and thus the temp file — actually runs.
+	cwd := filepath.Join(src.Home, "x")
+	proj := src.ProjectDir(cwd)
+	os.MkdirAll(proj, 0o700)
+	os.WriteFile(filepath.Join(proj, sid+".jsonl"), []byte(`{"cwd":"`+cwd+`"}`+"\n"), 0o600)
+	files := []session.FileEntry{{Root: src.ConfigDir, Rel: "projects/" + session.Munge(cwd) + "/" + sid + ".jsonl", Category: session.CatSession, Size: 24, Mode: 0o600, Rewrite: true}}
+	srcEP := NewLocal(src, "x", LocalOptions{ProcRoot: "/proc"})
+	dstEP := NewLocal(dst, "x", LocalOptions{ProcRoot: "/proc"})
+	pm := session.NewPathMap(session.Mapping{From: src.Home, To: dst.Home})
+	m, err := srcEP.BuildManifest(context.Background(), jobID, session.ID(sid), "laptop.example", "big-storage.example", files, pm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The entry is Absent on the destination, so Need() includes it and the
+	// rewrite (hence the temp file) actually runs during the send.
+	st, err := dstEP.ManifestDiff(context.Background(), m, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j, err := job.New(src.DataDir, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j.Plan, _ = json.Marshal(map[string]any{"statuses": st})
+	if err := srcEP.JournalPut(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	r, err := srcEP.OpenStream(context.Background(), StreamTar, jobID, "send:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		t.Fatalf("send stream copy: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("send failed — a rewrite temp file went to the read-only /tmp instead of the job dir: %v", err)
+	}
+	if entries, _ := os.ReadDir(roTmp); len(entries) != 0 {
+		t.Errorf("rewrite temp files leaked into the /tmp stand-in: %v", entries)
+	}
+}
+
 func TestPackStreamRecvWritesObjectsPack(t *testing.T) {
 	dst := testPaths(t)
 	dstEP := NewLocal(dst, "x", LocalOptions{ProcRoot: "/proc"})
