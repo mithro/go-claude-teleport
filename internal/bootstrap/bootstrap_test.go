@@ -2,7 +2,7 @@ package bootstrap
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"regexp"
@@ -35,7 +35,7 @@ func fakeFat(t *testing.T, natives map[string]string) []byte {
 	return img
 }
 
-func md5hex(b []byte) string { s := md5.Sum(b); return hex.EncodeToString(s[:]) }
+func sha256hex(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 
 var quoted = regexp.MustCompile(`'((?:[^']|'\\'')*)'`)
 
@@ -73,16 +73,16 @@ func (f *fakeRemote) run(_ context.Context, cmd string) (string, error) {
 	case strings.HasPrefix(cmd, "test -f"):
 		p := args(cmd)[0]
 		if d, ok := f.fs[p]; ok {
-			return md5hex(d) + "  " + p + "\n", nil
+			return sha256hex(d) + "  " + p + "\n", nil
 		}
 		return "", nil // `|| true` path: file absent
-	case strings.HasPrefix(cmd, "md5sum"):
+	case strings.HasPrefix(cmd, "sha256sum"):
 		p := args(cmd)[0]
 		d, ok := f.fs[p]
 		if !ok {
-			return "", fmt.Errorf("md5sum: %s: No such file or directory", p)
+			return "", fmt.Errorf("sha256sum: %s: No such file or directory", p)
 		}
-		return md5hex(d) + "  " + p + "\n", nil
+		return sha256hex(d) + "  " + p + "\n", nil
 	case strings.HasPrefix(cmd, "mv -f"):
 		a := args(cmd)
 		f.fs[a[1]] = f.fs[a[0]]
@@ -120,15 +120,17 @@ func TestDeployReconstructsAndInstallsForRemoteArch(t *testing.T) {
 	if got := fr.fs[want]; string(got) != string(wantData) {
 		t.Errorf("installed bytes are not canonical(arm64)")
 	}
-	if res.MD5 != md5hex(wantData) {
-		t.Errorf("md5 = %s, want %s", res.MD5, md5hex(wantData))
+	if res.SHA256 != sha256hex(wantData) {
+		t.Errorf("sha256 = %s, want %s", res.SHA256, sha256hex(wantData))
 	}
 	if res.Reused {
 		t.Errorf("first deploy should not be a reuse")
 	}
-	// No temp file left behind.
-	if _, ok := fr.fs[want+".incoming"]; ok {
-		t.Errorf("temp file left behind")
+	// No staging temp file left behind (it is pid-scoped: <path>.<pid>.tmp).
+	for k := range fr.fs {
+		if strings.HasSuffix(k, ".tmp") {
+			t.Errorf("staging temp file left behind: %s", k)
+		}
 	}
 }
 

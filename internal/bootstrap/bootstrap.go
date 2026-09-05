@@ -9,10 +9,11 @@ package bootstrap
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/mithro/go-multi-binary/archdetect"
@@ -36,7 +37,7 @@ type Putter func(ctx context.Context, data []byte, remotePath string) error
 type Result struct {
 	Arch       string // archdetect id, e.g. "arm64"
 	RemotePath string // absolute path of the installed helper on the remote
-	MD5        string // md5 of the installed bytes (verified on the remote)
+	SHA256     string // sha256 of the installed bytes (verified on the remote)
 	Size       int
 	Reused     bool // the path already held the identical bytes; no upload
 }
@@ -88,7 +89,7 @@ func Deploy(ctx context.Context, run Runner, put Putter, image []byte, version s
 	if err != nil {
 		return Result{}, fmt.Errorf("reconstruct claude-teleport for %s: %w", arch, err)
 	}
-	sum := md5.Sum(data)
+	sum := sha256.Sum256(data)
 	want := hex.EncodeToString(sum[:])
 
 	// Cache directory on the remote, honouring $XDG_CACHE_HOME and defaulting
@@ -105,33 +106,36 @@ func Deploy(ctx context.Context, run Runner, put Putter, image []byte, version s
 
 	// Idempotent reuse: `test -f` is quiet, and `|| true` swallows only the
 	// not-found exit — no stderr is suppressed.
-	if out, err := run(ctx, "test -f "+shellQuote(path)+" && md5sum "+shellQuote(path)+" || true"); err == nil && firstField(out) == want {
-		return Result{Arch: arch, RemotePath: path, MD5: want, Size: len(data), Reused: true}, nil
+	if out, err := run(ctx, "test -f "+shellQuote(path)+" && sha256sum "+shellQuote(path)+" || true"); err == nil && firstField(out) == want {
+		return Result{Arch: arch, RemotePath: path, SHA256: want, Size: len(data), Reused: true}, nil
 	}
 
 	if _, err := run(ctx, "mkdir -p "+shellQuote(dir)); err != nil {
 		return Result{}, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	tmp := path + ".incoming"
+	// A pid-scoped staging name so concurrent teleports to the same
+	// host+version+arch never `cat >` the same file or rm each other's
+	// in-flight upload; the final mv is atomic.
+	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
 	if err := put(ctx, data, tmp); err != nil {
 		return Result{}, fmt.Errorf("upload: %w", err)
 	}
 	if _, err := run(ctx, "chmod +x "+shellQuote(tmp)); err != nil {
 		return Result{}, fmt.Errorf("chmod: %w", err)
 	}
-	out, err := run(ctx, "md5sum "+shellQuote(tmp))
+	out, err := run(ctx, "sha256sum "+shellQuote(tmp))
 	if err != nil {
 		return Result{}, fmt.Errorf("verify upload: %w", err)
 	}
 	if got := firstField(out); got != want {
-		// Leave nothing half-installed behind.
+		// Leave nothing half-installed behind (only our own pid-scoped temp).
 		_, _ = run(ctx, "rm -f "+shellQuote(tmp))
-		return Result{}, fmt.Errorf("md5 mismatch after upload: sent %s, remote has %s", want, got)
+		return Result{}, fmt.Errorf("sha256 mismatch after upload: sent %s, remote has %s", want, got)
 	}
 	if _, err := run(ctx, "mv -f "+shellQuote(tmp)+" "+shellQuote(path)); err != nil {
 		return Result{}, fmt.Errorf("install: %w", err)
 	}
-	return Result{Arch: arch, RemotePath: path, MD5: want, Size: len(data)}, nil
+	return Result{Arch: arch, RemotePath: path, SHA256: want, Size: len(data)}, nil
 }
 
 func firstField(s string) string {

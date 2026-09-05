@@ -202,7 +202,7 @@ jobs:
             gh release create "$TAG" dist/* \
               --title "$TAG" \
               --generate-notes \
-              --notes "Fat static linux binaries (386, amd64, armhf, arm64, riscv64 — each carries every arch and can install itself onto a different-arch remote), Debian packages and SHA256SUMS. Apt repository: https://mith.ro/go-claude-teleport/ (see index for setup)."
+              --notes "Fat static linux binaries (386, amd64, armhf, arm64, riscv64 — each ~60 MB, carrying every arch so it can install itself onto a different-arch remote), Debian packages and SHA256SUMS. Apt repository: https://mith.ro/go-claude-teleport/ (see index for setup)."
           fi
 
   apt:
