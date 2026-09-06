@@ -216,7 +216,7 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 					}
 				}
 			}
-		case wantTmux != "" && reg.Tmux != wantTmux:
+		case wantTmux != "" && !samePane(reg, ref):
 			last = fmt.Sprintf("registry pane %q is not our pane %q", reg.Tmux, wantTmux)
 		case reg.Status == "idle":
 			return reg, nil
@@ -241,6 +241,21 @@ func (l *Local) ConfirmClaude(ctx context.Context, ref *session.TmuxRef, id sess
 		}
 		l.opts.Sleep(confirmPoll)
 	}
+}
+
+// samePane reports whether reg names the same tmux window and pane as ref,
+// disregarding the session name. A tmux window id (@N) and pane id (%N) are
+// unique per server, so a grouped-session alias (e.g. "default-3:@7.%9")
+// names the very same pane as "default:@7.%9". Comparing the full
+// "<session>:@win.%pane" string would spuriously reject a grouped alias and
+// fail confirmation for a destination Claude that in fact resumed correctly
+// (issue #19: grouped destination sessions never confirm).
+func samePane(reg *session.Registry, ref *session.TmuxRef) bool {
+	if ref == nil {
+		return false
+	}
+	_, win, pane, ok := reg.TmuxParts()
+	return ok && win == ref.WindowID && pane == ref.PaneID
 }
 
 // trustPrompt reports whether ref's VISIBLE screen is showing Claude
