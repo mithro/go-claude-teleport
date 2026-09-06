@@ -8,6 +8,7 @@ require (
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/google/go-cmp v0.7.0
 	github.com/kevinburke/ssh_config v1.6.0
+	github.com/mithro/go-multi-binary v0.0.0-20260905103116-459b4c2a28cb
 	github.com/skeema/knownhosts v1.3.1
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.9

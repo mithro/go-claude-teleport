@@ -397,9 +397,12 @@ func (c *Client) Close() error {
 	}
 	c.closed = true
 	c.mu.Unlock()
-	err := c.conn.Close()
+	var err error
+	if c.conn != nil {
+		err = c.conn.Close()
+	}
 	if c.wait != nil {
-		if werr := c.wait(); werr != nil && !errors.Is(werr, io.EOF) {
+		if werr := c.wait(); werr != nil && !errors.Is(werr, io.EOF) && c.logf != nil {
 			c.logf("remote helper exit: %v", werr)
 		}
 	}

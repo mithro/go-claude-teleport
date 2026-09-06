@@ -8,10 +8,12 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/mithro/go-claude-teleport/internal/bootstrap"
 	"github.com/mithro/go-claude-teleport/internal/orchestrate"
 	"github.com/mithro/go-claude-teleport/internal/remote"
 	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/version"
+	"github.com/mithro/go-multi-binary/fatblob"
 )
 
 type check struct {
@@ -25,6 +27,15 @@ type check struct {
 // must not surface credential contents).
 func (a *app) localChecks() []check {
 	var cs []check
+	// Whether this binary is fat decides if it can install the helper onto a
+	// remote that lacks it (zero-install cross-arch teleport).
+	if img, err := fatblob.ReadSelf(); err != nil {
+		cs = append(cs, check{"local claude-teleport", version.Version + " (could not read self: " + err.Error() + ")", true})
+	} else if arches, err := bootstrap.Arches(img); err != nil {
+		cs = append(cs, check{"local claude-teleport", version.Version + " (not a fat binary; remotes must have claude-teleport installed)", true})
+	} else {
+		cs = append(cs, check{"local claude-teleport", fmt.Sprintf("%s (fat: carries %s; can bootstrap a remote helper)", version.Version, strings.Join(arches, ", ")), true})
+	}
 	env := a.envSlice()
 	pathLookup := func(bin string) (string, error) { return lookInPath(a.env["PATH"], bin) }
 	if p, err := pathLookup("claude"); err != nil {

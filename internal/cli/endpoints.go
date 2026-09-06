@@ -45,7 +45,10 @@ func (a *app) dialRemote(ctx context.Context, o orchestrate.Options) (*remote.Cl
 	if err != nil {
 		return nil, nil, err
 	}
-	ep, err := remote.NewClient(ctx, c, "claude-teleport", a.logf)
+	// Bootstrap the remote helper by default; --no-bootstrap opts out. a.flags
+	// can be nil in tests that build an app directly, where the default holds.
+	bootstrapEnabled := a.flags == nil || !a.flags.NoBootstrap
+	ep, err := remote.NewClientOrBootstrap(ctx, c, remote.BootstrapOptions{Enabled: bootstrapEnabled}, a.logf)
 	if err != nil {
 		c.Close()
 		return nil, nil, fail(ExitUnreachable, "%s: %v", o.Target, err)
