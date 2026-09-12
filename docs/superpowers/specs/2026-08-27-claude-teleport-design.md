@@ -182,7 +182,13 @@ StrictHostKeyChecking=accept-new` adds them). Jump chains are built by
 dialling hop *n+1* through hop *n*'s connection (`client.Dial("tcp",
 "next:port")`), so **the final hostname is resolved by the last jump host**,
 never locally. `ProxyCommand` is not supported: a clear error names the
-host and suggests `--via`. One ssh connection is opened per remote endpoint
+host and suggests `--via`. Of OpenSSH's ten `Match` criteria the in-binary
+parser can evaluate two, `all` and a plain `host <patterns>`; a block guarded
+by any of the other eight (`exec`, `user`, `localuser`, `originalhost`,
+`final`, `canonical`, `tagged`, `localnetwork`) is skipped with a warning
+naming the file and line, exactly as if its guard were false. It does not
+fail the file — which, because the whole config is parsed up front, used to
+make one such block anywhere break every host (issue #21). One ssh connection is opened per remote endpoint
 and every channel (control, file streams) is multiplexed over it.
 
 Keepalives are ON by default (`ServerAliveInterval` 15s,

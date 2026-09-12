@@ -401,6 +401,9 @@ here with `--from <host>` to inspect it locally).
   keepalives off, while `ServerAliveCountMax=0` is a hard error (it reads
   like "tolerate no misses" but would silently mean the default 3).
   `ProxyJump` is honoured; `ProxyCommand` is not — use `--via`.
+  `Match all` and `Match host` are honoured; a block guarded by any
+  other `Match` criterion (`exec`, `user`, `localuser`, …) is skipped
+  with a warning, rather than failing every host as it once did.
 - The same `claude-teleport` version on both ends (`claude-teleport doctor
   <host>` checks this, plus `claude` on `PATH`, the config directory, and
   more) and a logged-in Claude Code on the destination.

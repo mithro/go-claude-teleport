@@ -460,6 +460,12 @@ func ParseTarget(s string) (Target, error)
 // Resolve applies ~/.ssh/config (Host/HostName/User/Port/IdentityFile/ProxyJump)
 // and -o overrides. ProxyJump from config is prepended to Via.
 func Resolve(t Target, cfg *ssh_config.Config, overrides map[string]string, localUser string) (Resolved, error)
+// DecodeConfig decodes the ssh_config read from path, resolving Include
+// against home. A Match block whose guard the parser cannot evaluate (any
+// criterion but "all" and a plain "host <patterns>") is dropped and named
+// through warnf rather than failing the whole file; every other parse error
+// is still an error. Added for issue #21.
+func DecodeConfig(b []byte, path, home string, warnf func(string, ...any)) (*ssh_config.Config, error)
 
 type Options struct {
     KnownHostsFile string
