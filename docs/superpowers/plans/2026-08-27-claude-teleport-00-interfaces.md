@@ -460,12 +460,20 @@ func ParseTarget(s string) (Target, error)
 // Resolve applies ~/.ssh/config (Host/HostName/User/Port/IdentityFile/ProxyJump)
 // and -o overrides. ProxyJump from config is prepended to Via.
 func Resolve(t Target, cfg *ssh_config.Config, overrides map[string]string, localUser string) (Resolved, error)
-// DecodeConfig decodes the ssh_config read from path, resolving Include
-// against home. A Match block whose guard the parser cannot evaluate (any
-// criterion but "all" and a plain "host <patterns>") is dropped and named
-// through warnf rather than failing the whole file; every other parse error
-// is still an error. Added for issue #21.
-func DecodeConfig(b []byte, path, home string, warnf func(string, ...any)) (*ssh_config.Config, error)
+type ConfigOptions struct {
+    Path        string               // file the bytes came from, named in warnings
+    Home        string               // resolves a relative Include
+    ExecAllow   []string             // commands a Match exec may run beyond the built-ins; "none" refuses every one
+    ExecTimeout time.Duration        // how long one Match exec guard may take (default 5s)
+    Warnf       func(string, ...any) // where repairs are reported; nil discards them
+}
+// DecodeConfig decodes an ssh_config. A Match exec guard is run, if the
+// command it names is on the allow list, and the block kept or skipped on its
+// exit status. A guard that cannot be decided — an unimplemented criterion,
+// or a command not allowed to run — is dropped and named through Warnf rather
+// than failing the whole file; every other parse error is still an error.
+// Added for issue #21.
+func DecodeConfig(b []byte, o ConfigOptions) (*ssh_config.Config, error)
 
 type Options struct {
     KnownHostsFile string

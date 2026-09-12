@@ -401,9 +401,15 @@ here with `--from <host>` to inspect it locally).
   keepalives off, while `ServerAliveCountMax=0` is a hard error (it reads
   like "tolerate no misses" but would silently mean the default 3).
   `ProxyJump` is honoured; `ProxyCommand` is not — use `--via`.
-  `Match all` and `Match host` are honoured; a block guarded by any
-  other `Match` criterion (`exec`, `user`, `localuser`, …) is skipped
-  with a warning, rather than failing every host as it once did.
+  `Match all`, `Match host` and `Match exec` are honoured. An `exec`
+  guard is run only if it names a command on an allow list — `true`,
+  `false`, `test`, `[`, `grep`, `hostname`, `id`, `uname` — which
+  `-o MatchExecAllow=cmd,...` extends and `-o MatchExecAllow=none`
+  empties; it is run directly rather than through a shell, so no pipes,
+  redirects, globs or `%h`-style tokens, and it is cut off after 5s.
+  A guard that cannot be decided, including a command that is not
+  allowed, is skipped with a warning rather than failing every host as
+  it once did.
 - The same `claude-teleport` version on both ends (`claude-teleport doctor
   <host>` checks this, plus `claude` on `PATH`, the config directory, and
   more) and a logged-in Claude Code on the destination.
