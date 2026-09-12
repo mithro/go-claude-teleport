@@ -64,6 +64,41 @@ func remoteHostExec(t *testing.T, exec func(cmd string, stdin io.Reader, stdout,
 	return target, opts, localHome
 }
 
+// Issue #21 end to end over a real ssh connection: with a Match exec block
+// above it, the Host alias must still be found and used. Nothing here passes
+// the peer's address or key on the command line — every one of them comes out
+// of the config that used to be rejected outright — so a completed handshake
+// proves the config was parsed and applied, not merely tolerated.
+func TestRemoteDialHonoursConfigAliasBelowUnsupportedMatch(t *testing.T) {
+	remoteEnv, _ := testEnv(t)
+	target, _, localHome := remoteHost(t, remoteEnv)
+	host, port, err := net.SplitHostPort(strings.TrimPrefix(target, "bob@"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := "Match exec \"true\"\n\tUser nobody\n\n" +
+		"Host peer\n\tHostName " + host + "\n\tPort " + port + "\n\tUser bob\n" +
+		"\tIdentityFile " + filepath.Join(localHome, ".ssh", "id_ed25519") + "\n"
+	if err := os.WriteFile(filepath.Join(localHome, ".ssh", "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PWD=" + localHome, "PATH=/usr/bin:/bin"}
+	var out, errOut bytes.Buffer
+	code := Main([]string{"compare-config", "peer", "-o", "StrictHostKeyChecking=accept-new"},
+		strings.NewReader(""), &out, &errOut, localEnv)
+	if code == ExitUsage {
+		t.Fatalf("the config must parse: exit %d err %q", code, errOut.String())
+	}
+	kh, _ := os.ReadFile(filepath.Join(localHome, ".ssh", "known_hosts"))
+	if !strings.Contains(string(kh), "ssh-ed25519") {
+		t.Fatalf("no handshake reached the peer: exit %d err %q", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "unsupported Match criterion") {
+		t.Errorf("the dropped block must be reported, stderr was %q", errOut.String())
+	}
+}
+
 func writeSettings(t *testing.T, cfgDir, hooks string) {
 	t.Helper()
 	os.MkdirAll(cfgDir, 0o700)

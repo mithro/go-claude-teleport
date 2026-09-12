@@ -105,6 +105,38 @@ func TestDialTargetSurfacesSSHConfigOpenError(t *testing.T) {
 	}
 }
 
+// A Match block the ssh_config parser cannot evaluate used to fail every
+// subcommand that touches a remote host with exit 2, before the host was even
+// resolved (issue #21). The block is unrelated to the target, so the dial must
+// get as far as the network.
+func TestDialTargetToleratesUnsupportedMatchBlock(t *testing.T) {
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "Match exec \"true\"\n\tStrictHostKeyChecking accept-new\n" +
+		"\nHost dest\n\tHostName dest.invalid\n\tUser someone\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	env := []string{"HOME=" + home, "USER=alice"}
+	_, _, err := dialTarget(ctx, "dest", nil, nil, env, t.Logf)
+	if err == nil {
+		t.Fatal("expected the dial to fail: dest.invalid does not resolve")
+	}
+	var exitErr *ExitError
+	if errors.As(err, &exitErr) && exitErr.Code == ExitUsage {
+		t.Errorf("err = %v, want the config to parse rather than fail as usage", err)
+	}
+	if strings.Contains(err.Error(), "Match") {
+		t.Errorf("err = %v, want no complaint about the Match block", err)
+	}
+}
+
 func TestEnvPaths(t *testing.T) {
 	p, err := envPaths([]string{"HOME=/home/alice", "CLAUDE_CONFIG_DIR=/home/alice/cfg"})
 	if err != nil || p.ConfigDir != "/home/alice/cfg" || p.DataDir != "/home/alice/.local/share/claude-teleport" || p.Home != "/home/alice" {

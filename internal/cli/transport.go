@@ -166,11 +166,13 @@ func dialTarget(ctx context.Context, target string, via []string, opts []string,
 	home := envValue(env, "HOME")
 	var cfg *ssh_config.Config
 	sshConfigPath := filepath.Join(home, ".ssh", "config")
-	f, err := os.Open(sshConfigPath)
+	b, err := os.ReadFile(sshConfigPath)
 	switch {
 	case err == nil:
-		cfg, err = ssh_config.Decode(f)
-		f.Close()
+		// DecodeConfig drops (and reports through logf) any Match block whose
+		// guard the parser cannot evaluate, so one such block does not fail
+		// every host — see issue #21.
+		cfg, err = sshx.DecodeConfig(b, sshConfigPath, home, logf)
 		if err != nil {
 			return nil, sshx.Resolved{}, fail(ExitUsage, "~/.ssh/config: %v", err)
 		}
