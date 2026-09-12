@@ -64,20 +64,20 @@ func remoteHostExec(t *testing.T, exec func(cmd string, stdin io.Reader, stdout,
 	return target, opts, localHome
 }
 
-// Issue #21 end to end over a real ssh connection: with a Match exec block
-// above it, the Host alias must still be found and used. Nothing here passes
-// the peer's address or key on the command line — every one of them comes out
-// of the config that used to be rejected outright — so a completed handshake
-// proves the config was parsed and applied, not merely tolerated.
-func TestRemoteDialHonoursConfigAliasBelowUnsupportedMatch(t *testing.T) {
+// Issue #21 end to end over a real ssh connection. The peer's port is
+// supplied only by the Match exec block: the Host block below it names a port
+// nothing listens on. So the handshake can only complete if the guard was
+// actually run, exited 0, and the block was applied — dropping the block, as
+// the first cut of this fix did, reaches port 1 and fails.
+func TestRemoteDialRunsAllowedMatchExecGuard(t *testing.T) {
 	remoteEnv, _ := testEnv(t)
 	target, _, localHome := remoteHost(t, remoteEnv)
 	host, port, err := net.SplitHostPort(strings.TrimPrefix(target, "bob@"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := "Match exec \"true\"\n\tUser nobody\n\n" +
-		"Host peer\n\tHostName " + host + "\n\tPort " + port + "\n\tUser bob\n" +
+	cfg := "Match exec \"true\"\n\tPort " + port + "\n\n" +
+		"Host peer\n\tHostName " + host + "\n\tPort 1\n\tUser bob\n" +
 		"\tIdentityFile " + filepath.Join(localHome, ".ssh", "id_ed25519") + "\n"
 	if err := os.WriteFile(filepath.Join(localHome, ".ssh", "config"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -94,8 +94,34 @@ func TestRemoteDialHonoursConfigAliasBelowUnsupportedMatch(t *testing.T) {
 	if !strings.Contains(string(kh), "ssh-ed25519") {
 		t.Fatalf("no handshake reached the peer: exit %d err %q", code, errOut.String())
 	}
-	if !strings.Contains(errOut.String(), "unsupported Match criterion") {
-		t.Errorf("the dropped block must be reported, stderr was %q", errOut.String())
+	if strings.Contains(errOut.String(), "ignoring the block") {
+		t.Errorf("the guard was decided, so nothing should be reported: %q", errOut.String())
+	}
+}
+
+// The same shape with a guard that exits non-zero: the block must not apply,
+// so the port comes from the Host block instead.
+func TestRemoteDialSkipsFailedMatchExecGuard(t *testing.T) {
+	remoteEnv, _ := testEnv(t)
+	target, _, localHome := remoteHost(t, remoteEnv)
+	host, port, err := net.SplitHostPort(strings.TrimPrefix(target, "bob@"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := "Match exec \"false\"\n\tPort 1\n\n" +
+		"Host peer\n\tHostName " + host + "\n\tPort " + port + "\n\tUser bob\n" +
+		"\tIdentityFile " + filepath.Join(localHome, ".ssh", "id_ed25519") + "\n"
+	if err := os.WriteFile(filepath.Join(localHome, ".ssh", "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	localEnv := []string{"HOME=" + localHome, "USER=alice", "PWD=" + localHome, "PATH=/usr/bin:/bin"}
+	var out, errOut bytes.Buffer
+	Main([]string{"compare-config", "peer", "-o", "StrictHostKeyChecking=accept-new"},
+		strings.NewReader(""), &out, &errOut, localEnv)
+	kh, _ := os.ReadFile(filepath.Join(localHome, ".ssh", "known_hosts"))
+	if !strings.Contains(string(kh), "ssh-ed25519") {
+		t.Fatalf("the failed guard must not supply Port 1: err %q", errOut.String())
 	}
 }
 

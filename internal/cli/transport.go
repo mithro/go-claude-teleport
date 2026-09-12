@@ -163,16 +163,29 @@ func dialTarget(ctx context.Context, target string, via []string, opts []string,
 		}
 		overrides[k] = v
 	}
+	// MatchExecAllow is ours, not an ssh_config keyword: it adds to the
+	// commands a Match exec guard may run. It is reachable only from the
+	// command line — taking it from the config file would let the file that
+	// names a command also authorise it, which is the whole point of the list.
+	var execAllow []string
+	for k, v := range overrides {
+		if strings.EqualFold(k, "MatchExecAllow") {
+			execAllow = strings.Split(v, ",")
+			delete(overrides, k)
+		}
+	}
 	home := envValue(env, "HOME")
 	var cfg *ssh_config.Config
 	sshConfigPath := filepath.Join(home, ".ssh", "config")
 	b, err := os.ReadFile(sshConfigPath)
 	switch {
 	case err == nil:
-		// DecodeConfig drops (and reports through logf) any Match block whose
-		// guard the parser cannot evaluate, so one such block does not fail
-		// every host — see issue #21.
-		cfg, err = sshx.DecodeConfig(b, sshConfigPath, home, logf)
+		// DecodeConfig runs an allow-listed Match exec guard and drops (and
+		// reports through logf) any Match block it cannot decide, so one such
+		// block does not fail every host — see issue #21.
+		cfg, err = sshx.DecodeConfig(b, sshx.ConfigOptions{
+			Path: sshConfigPath, Home: home, ExecAllow: execAllow, Warnf: logf,
+		})
 		if err != nil {
 			return nil, sshx.Resolved{}, fail(ExitUsage, "~/.ssh/config: %v", err)
 		}
