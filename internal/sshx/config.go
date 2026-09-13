@@ -12,11 +12,12 @@ import (
 // ConfigOptions tunes how DecodeConfig treats the constructs the ssh_config
 // parser cannot represent.
 type ConfigOptions struct {
-	Path        string               // file the bytes came from, named in warnings
-	Home        string               // resolves a relative Include
-	ExecAllow   []string             // commands a Match exec may run beyond the built-ins; "none" refuses every one
-	ExecTimeout time.Duration        // how long one Match exec guard may take (default defaultExecTimeout)
-	Warnf       func(string, ...any) // where repairs are reported; nil discards them
+	Path          string               // file the bytes came from, named in warnings
+	Home          string               // resolves a relative Include
+	ExecAllow     []string             // commands a Match exec may run beyond the built-ins; "none" refuses every one
+	ExecTimeout   time.Duration        // how long one Match exec guard may take (default defaultExecTimeout)
+	IgnoreUnknown []string             // pattern list of unknown keywords to tolerate, as ssh_config's own IgnoreUnknown
+	Warnf         func(string, ...any) // where repairs are reported; nil discards them
 }
 
 // maxIncludeDepth mirrors the ssh_config parser's own recursion cap, so the
@@ -162,13 +163,26 @@ func sanitizeConfig(src, path string, depth int, o ConfigOptions) (string, bool)
 // naming it: an unevaluated guard means the block does not apply, which is
 // what OpenSSH does when a guard is false. Every other parse error stays an
 // error, because a config that is genuinely malformed is the user's to fix.
+//
+// Before any of that, every keyword in the file — and in the files it
+// Includes — is checked against the set ssh_config(5) defines. One that is
+// not defined is an error, as it is under ssh itself, unless an IgnoreUnknown
+// pattern covers it.
 func DecodeConfig(b []byte, o ConfigOptions) (*ssh_config.Config, error) {
+	if o.Warnf == nil {
+		o.Warnf = func(string, ...any) {}
+	}
+	// Refuse a keyword we cannot place before reading anything into the
+	// config: a typo means the setting the user believes is in force is not.
+	var unknown []UnknownKeyword
+	checkKeywords(string(b), o.Path, 0, o, o.IgnoreUnknown, &unknown)
+	if len(unknown) > 0 {
+		return nil, &UnknownKeywordError{Unknown: unknown}
+	}
+
 	cfg, err := ssh_config.DecodeBytes(b)
 	if err == nil {
 		return cfg, nil
-	}
-	if o.Warnf == nil {
-		o.Warnf = func(string, ...any) {}
 	}
 	repaired, changed := sanitizeConfig(string(b), o.Path, 0, o)
 	if !changed {
