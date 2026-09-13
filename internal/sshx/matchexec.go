@@ -37,9 +37,9 @@ const execMeta = "|&;<>()$`*?~#{}\\\n\r\t%'"
 // to ssh) implements "all" and "host"; this package adds "exec". A guard
 // built from anything else cannot be decided here.
 var matchCriteria = map[string]bool{
-	"all": true, "canonical": true, "exec": true, "final": true,
-	"host": true, "localnetwork": true, "localuser": true,
-	"originalhost": true, "tagged": true, "user": true,
+	"all": true, "canonical": true, "command": true, "exec": true,
+	"final": true, "host": true, "localnetwork": true, "localuser": true,
+	"originalhost": true, "tagged": true, "user": true, "version": true,
 }
 
 // matchVerdict says what sanitizeConfig should do with a Match line.
