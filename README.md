@@ -410,6 +410,15 @@ here with `--from <host>` to inspect it locally).
   A guard that cannot be decided, including a command that is not
   allowed, is skipped with a warning rather than failing every host as
   it once did.
+- Every keyword in the config, and in the files it `Include`s, is
+  checked against the set `ssh_config(5)` defines. One that is not
+  defined is an error naming its file and line — a typo means the
+  setting you think is in force is not, which is what `ssh` itself says
+  about a config it cannot read. `IgnoreUnknown <pattern-list>` in the
+  config, or `-o IgnoreUnknown=...`, is the way past it, including when
+  a newer OpenSSH has keywords this build predates. Of the keywords
+  that *are* defined, a teleport acts on twelve; `claude-teleport
+  doctor <host>` lists the others your config sets for that host.
 - The same `claude-teleport` version on both ends (`claude-teleport doctor
   <host>` checks this, plus `claude` on `PATH`, the config directory, and
   more) and a logged-in Claude Code on the destination.

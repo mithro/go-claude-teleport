@@ -208,6 +208,26 @@ skipped with a warning naming the file and line, exactly as if its guard were
 false. It does not fail the file, which, because the whole config is parsed
 up front, used to make one such block anywhere break every host (issue #21).
 
+Every keyword in the config, and in the files it `Include`s, is checked
+against the set `ssh_config(5)` defines — a table generated from the manual
+and from `ssh -G`, and verified against `ssh` itself, by
+`internal/sshx/keywords_gen.py`. A keyword that is **not** defined is an error
+naming every offender with its file and line, which is what `ssh` itself does
+with a config it cannot read ("Bad configuration option"): a keyword we cannot
+place is either a typo, and the setting the user believes is in force is not,
+or a keyword newer than this build's table. `IgnoreUnknown <pattern-list>` —
+in the config, as OpenSSH defines it, or as `-o IgnoreUnknown=...` — is the
+way past, and is the reason the table going stale can never become another
+issue #21.
+
+Of the keywords that *are* defined, this tool acts on twelve: `Host`, `Match`,
+`Include`, `HostName`, `User`, `Port`, `IdentityFile`, `ProxyJump`,
+`ProxyCommand` (to refuse it), `ServerAliveInterval`, `ServerAliveCountMax`
+and `IgnoreUnknown`. The rest are real keywords that a teleport does not
+implement; `claude-teleport doctor <host>` lists the ones the config sets for
+that host, so the gap between what the config asks for and what a teleport
+does is stated rather than discovered.
+
 One ssh connection is opened per remote endpoint
 and every channel (control, file streams) is multiplexed over it.
 
