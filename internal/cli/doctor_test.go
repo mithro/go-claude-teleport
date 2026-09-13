@@ -13,6 +13,38 @@ import (
 	"github.com/mithro/go-claude-teleport/test/fakeclaude/harness"
 )
 
+// doctor is where the keywords the config sets and the teleport does not act
+// on get said out loud. They are real ssh_config keywords, so they are not an
+// error, but a config asking for ControlMaster and getting none should not be
+// something the user has to read the source to discover.
+func TestDoctorReportsUnhonouredConfigKeywords(t *testing.T) {
+	root := t.TempDir()
+	cfgDir := filepath.Join(root, ".claude")
+	os.MkdirAll(filepath.Join(cfgDir, "projects"), 0o700)
+	sshDir := filepath.Join(root, ".ssh")
+	os.MkdirAll(sshDir, 0o700)
+	cfg := "Host probe\n\tHostName 127.0.0.1\n\tPort 1\n" +
+		"\tControlMaster auto\n\tForwardAgent yes\n\tUser bob\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	env := harness.Env(t, root, cfgDir, "XDG_DATA_HOME="+filepath.Join(root, "data"))
+	_, out, stderr := run(t, env, "doctor", "probe")
+	for _, w := range []string{"ssh_config", "ControlMaster", "ForwardAgent"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("missing %q:\n%s%s", w, out, stderr)
+		}
+	}
+	// User and Port are acted on, so they are not in the not-acted-on list.
+	for _, w := range []string{"User", "Port"} {
+		if strings.Contains(out, "not acted on") &&
+			strings.Contains(strings.SplitN(out[strings.Index(out, "not acted on"):], "\n", 2)[0], w) {
+			t.Errorf("%q is honoured and should not be listed:\n%s", w, out)
+		}
+	}
+}
+
 func TestDoctorPassesWithFakeClaude(t *testing.T) {
 	root := t.TempDir()
 	cfg := filepath.Join(root, ".claude")

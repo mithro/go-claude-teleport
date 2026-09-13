@@ -139,6 +139,49 @@ func tmuxSocketDir(env []string) string {
 	return fmt.Sprintf("/tmp/tmux-%d", os.Getuid())
 }
 
+// loadSSHConfig reads and decodes ~/.ssh/config for a run with these -o
+// overrides. It consumes the two options that steer the decode rather than
+// the connection: MatchExecAllow, which is ours and is removed so it never
+// reaches Resolve, and IgnoreUnknown, which is a real ssh_config keyword and
+// so is read without being removed. A missing file is not an error; any other
+// open failure is, rather than being taken for "no config".
+func loadSSHConfig(home string, overrides map[string]string, logf func(string, ...any)) (*ssh_config.Config, error) {
+	var execAllow, ignoreUnknown []string
+	for k, v := range overrides {
+		if strings.EqualFold(k, "MatchExecAllow") {
+			execAllow = strings.Split(v, ",")
+			delete(overrides, k)
+		}
+		if strings.EqualFold(k, "IgnoreUnknown") {
+			ignoreUnknown = append(ignoreUnknown, v)
+		}
+	}
+	sshConfigPath := filepath.Join(home, ".ssh", "config")
+	b, err := os.ReadFile(sshConfigPath)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// No ~/.ssh/config: a nil config, which Resolve reads as "nothing
+		// to consult".
+		return nil, nil
+	case err != nil:
+		return nil, fail(ExitUsage, "%s: %v", sshConfigPath, err)
+	}
+	cfg, err := sshx.DecodeConfig(b, sshx.ConfigOptions{
+		Path: sshConfigPath, Home: home, ExecAllow: execAllow,
+		IgnoreUnknown: ignoreUnknown, Warnf: logf,
+	})
+	var unknownErr *sshx.UnknownKeywordError
+	switch {
+	case errors.As(err, &unknownErr):
+		// Already names every file and line it found, including any
+		// Include'd ones, so do not prefix it with just this file.
+		return nil, fail(ExitUsage, "%v", err)
+	case err != nil:
+		return nil, fail(ExitUsage, "~/.ssh/config: %v", err)
+	}
+	return cfg, nil
+}
+
 // dialTarget resolves target (with --via hops and -o overrides) through
 // ~/.ssh/config and dials it with 3 attempts. Honours -o UserKnownHostsFile
 // and -o StrictHostKeyChecking (via Resolved.Options). Exit code 2 for bad
@@ -163,39 +206,10 @@ func dialTarget(ctx context.Context, target string, via []string, opts []string,
 		}
 		overrides[k] = v
 	}
-	// MatchExecAllow is ours, not an ssh_config keyword: it adds to the
-	// commands a Match exec guard may run. It is reachable only from the
-	// command line — taking it from the config file would let the file that
-	// names a command also authorise it, which is the whole point of the list.
-	var execAllow []string
-	for k, v := range overrides {
-		if strings.EqualFold(k, "MatchExecAllow") {
-			execAllow = strings.Split(v, ",")
-			delete(overrides, k)
-		}
-	}
 	home := envValue(env, "HOME")
-	var cfg *ssh_config.Config
-	sshConfigPath := filepath.Join(home, ".ssh", "config")
-	b, err := os.ReadFile(sshConfigPath)
-	switch {
-	case err == nil:
-		// DecodeConfig runs an allow-listed Match exec guard and drops (and
-		// reports through logf) any Match block it cannot decide, so one such
-		// block does not fail every host — see issue #21.
-		cfg, err = sshx.DecodeConfig(b, sshx.ConfigOptions{
-			Path: sshConfigPath, Home: home, ExecAllow: execAllow, Warnf: logf,
-		})
-		if err != nil {
-			return nil, sshx.Resolved{}, fail(ExitUsage, "~/.ssh/config: %v", err)
-		}
-	case errors.Is(err, fs.ErrNotExist):
-		// No ~/.ssh/config: proceed with a nil config (Resolve treats that
-		// as "no config to consult").
-	default:
-		// Any other open error (permission denied, a symlink loop, ...)
-		// must not be silently treated as "no config" — surface it.
-		return nil, sshx.Resolved{}, fail(ExitUsage, "%s: %v", sshConfigPath, err)
+	cfg, err := loadSSHConfig(home, overrides, logf)
+	if err != nil {
+		return nil, sshx.Resolved{}, err
 	}
 	localUser := envValue(env, "USER")
 	if localUser == "" {
