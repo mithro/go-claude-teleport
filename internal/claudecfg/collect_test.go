@@ -134,7 +134,11 @@ func TestCollectPluginHashesAndSkills(t *testing.T) {
 	os.MkdirAll(filepath.Join(plug, "hooks"), 0o700)
 	os.MkdirAll(filepath.Join(plug, "skills", "tdd"), 0o700)
 	os.MkdirAll(filepath.Join(plug, "agents"), 0o700)
-	os.WriteFile(filepath.Join(plug, "hooks", "hooks.json"), []byte(`{"hooks":{}}`), 0o600)
+	// A hooks.json that actually declares a hook: the empty `{"hooks":{}}`
+	// this used to write now hashes as absent (see hooksFileHash), which
+	// would make the wantHooks != "" assertion below test nothing.
+	os.WriteFile(filepath.Join(plug, "hooks", "hooks.json"),
+		[]byte(`{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/bin/guard"}]}]}}`), 0o600)
 	os.WriteFile(filepath.Join(plug, ".mcp.json"), []byte(`{"mcpServers":{}}`), 0o600)
 	os.WriteFile(filepath.Join(plug, "skills", "tdd", "SKILL.md"), []byte("# tdd"), 0o600)
 	os.WriteFile(filepath.Join(plug, "agents", "explorer.md"), []byte("# explorer"), 0o600)
