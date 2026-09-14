@@ -181,6 +181,12 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 			if err != nil {
 				return nil, err
 			}
+			// --tmux-session wins over the name derived from the source:
+			// it is the only way to land in a destination session that is
+			// not named after the one the session happened to sit in.
+			if o.TmuxSession != "" {
+				tp.Group = tmuxx.StoredSessionName(sessions, o.TmuxSession)
+			}
 			_, exists := tmuxx.BaseSession(sessions, tp.Group)
 			tp.CreateSession = !exists
 			p.Tmux = tp

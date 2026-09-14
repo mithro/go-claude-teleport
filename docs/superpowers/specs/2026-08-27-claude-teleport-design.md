@@ -182,7 +182,53 @@ StrictHostKeyChecking=accept-new` adds them). Jump chains are built by
 dialling hop *n+1* through hop *n*'s connection (`client.Dial("tcp",
 "next:port")`), so **the final hostname is resolved by the last jump host**,
 never locally. `ProxyCommand` is not supported: a clear error names the
-host and suggests `--via`. One ssh connection is opened per remote endpoint
+host and suggests `--via`.
+
+Of OpenSSH's ten `Match` criteria, three are evaluated: `all` and a plain
+`host <patterns>`, which the parser decides per lookup, and `exec`, which is
+run here. An `exec` guard is run **only** if the command it names is on an
+allow list — by default `true`, `false`, `test`, `[`, `grep`, `hostname`,
+`id` and `uname`, all of which report state and change none — extended by
+`-o MatchExecAllow=cmd,...` and disabled entirely by `-o
+MatchExecAllow=none`. The list is reachable only from the command line, never
+from the config file, so the file that names a command cannot also authorise
+it. The command is run directly and never through a shell, so it must be a
+bare command name found on `PATH` (not a path) with no character that only a
+shell would understand — `| & ; < > ( ) $` backtick `* ? ~ # { } \ ' %` —
+and it is given no stdin, has its output discarded, and is cut off after 5
+seconds. `%h` and the other tokens OpenSSH expands are among the refused
+characters on purpose: the config is decoded once per run, while those differ
+per host. The block is then kept or skipped on the command's exit status,
+and `!exec` inverts that.
+
+A guard that cannot be decided — one of the remaining seven criteria
+(`user`, `localuser`, `originalhost`, `final`, `canonical`, `tagged`,
+`localnetwork`), or an `exec` whose command is not allowed to run — is
+skipped with a warning naming the file and line, exactly as if its guard were
+false. It does not fail the file, which, because the whole config is parsed
+up front, used to make one such block anywhere break every host (issue #21).
+
+Every keyword in the config, and in the files it `Include`s, is checked
+against the set `ssh_config(5)` defines — a table generated from the manual
+and from `ssh -G`, and verified against `ssh` itself, by
+`internal/sshx/keywords_gen.py`. A keyword that is **not** defined is an error
+naming every offender with its file and line, which is what `ssh` itself does
+with a config it cannot read ("Bad configuration option"): a keyword we cannot
+place is either a typo, and the setting the user believes is in force is not,
+or a keyword newer than this build's table. `IgnoreUnknown <pattern-list>` —
+in the config, as OpenSSH defines it, or as `-o IgnoreUnknown=...` — is the
+way past, and is the reason the table going stale can never become another
+issue #21.
+
+Of the keywords that *are* defined, this tool acts on twelve: `Host`, `Match`,
+`Include`, `HostName`, `User`, `Port`, `IdentityFile`, `ProxyJump`,
+`ProxyCommand` (to refuse it), `ServerAliveInterval`, `ServerAliveCountMax`
+and `IgnoreUnknown`. The rest are real keywords that a teleport does not
+implement; `claude-teleport doctor <host>` lists the ones the config sets for
+that host, so the gap between what the config asks for and what a teleport
+does is stated rather than discovered.
+
+One ssh connection is opened per remote endpoint
 and every channel (control, file streams) is multiplexed over it.
 
 Keepalives are ON by default (`ServerAliveInterval` 15s,
@@ -517,17 +563,30 @@ Every decision above is shown by `inspect`/`--dry-run` before anything moves.
 
 ## 9. tmux
 
-Source facts come from the registry `tmux` field (`session:@win.%pane`)
+A host may run several tmux servers at once (`tmux -L main` beside the
+default socket is ordinary), and the registry records a pane as
+`session:@win.%pane` with **no socket in it**. So the pane's server is
+found, never assumed: the probe dials every *live* server under
+`/tmp/tmux-<uid>/` (or `$TMUX_TMPDIR`), plus the one `$TMUX` names when
+that sits elsewhere, and asks each which panes it has. Liveness is the
+test, not the presence of a socket file — a socket outlives the server
+that made it. A session name present on two servers is ambiguous and is
+reported as such rather than resolved to whichever answered first.
+
+Source facts come from the registry `tmux` field, the server found above,
 and one control-mode query: session name, `session_group`, window index and
 name, `automatic-rename`, pane title, `pane_current_path`, socket path.
 
-Destination server discovery, in order: a server on a socket with the
-source's socket *name* (`-L main`); the default socket; if exactly one
-server socket exists under `/tmp/tmux-<uid>/` (or `$TMUX_TMPDIR`), that one;
-otherwise fail at preflight with the list found. **Never start a server.**
+Destination server discovery, in order: `--tmux-socket`; a server on a
+socket with the source's socket *name* (`-L main`, now derived from the
+pane's real server); the default socket; if exactly one live server exists
+under the socket dir, that one; otherwise fail at preflight with the list
+found. **Never start a server.**
 
-Window placement: group name `G` = source `session_group` if non-empty else
-`session_name`. If a destination session belongs to group `G` (or is named
+Window placement: group name `G` = `--tmux-session` if given, else source
+`session_group` if non-empty, else `session_name`. A `--tmux-session` name
+is matched against the destination's session list in either spelling
+(stored or plain) and otherwise names a session to create. If a destination session belongs to group `G` (or is named
 `G`), use the group's base session; otherwise `new-session -d -s G -c
 <cwd>` (a session on an existing server, allowed). Then `new-window -t G:
 -n <name> -c <cwd>`; if the source window had `automatic-rename off`, set it

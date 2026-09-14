@@ -101,7 +101,20 @@ func (p *prober) resolveSessionName(typed string) (string, error) {
 	return "", fmt.Errorf("%q is ambiguous between sessions: %s", typed, strings.Join(names, ", "))
 }
 
-func (p *prober) SocketPath() string { return p.socket }
+// PaneSocket answers for the one server this prober holds: the socket when
+// the pane is on it, "" otherwise. multiProber does the cross-server work.
+func (p *prober) PaneSocket(paneID string) string {
+	panes, err := p.ListPanes()
+	if err != nil {
+		return ""
+	}
+	for _, pi := range panes {
+		if pi.PaneID == paneID {
+			return p.socket
+		}
+	}
+	return ""
+}
 
 // listPanesFormat: tab-separated for the same reason describeFormat is —
 // tmux does NOT vis-encode a space in a session name (probe-verified on
@@ -126,7 +139,7 @@ func (p *prober) ListPanes() ([]session.PaneInfo, error) {
 			// exactly the failure this format change fixes.
 			return nil, fmt.Errorf("list-panes -a: malformed line %q", l)
 		}
-		out = append(out, session.PaneInfo{Session: f[0], WindowID: f[1], PaneID: f[2]})
+		out = append(out, session.PaneInfo{Session: f[0], WindowID: f[1], PaneID: f[2], SocketPath: p.socket})
 	}
 	return out, nil
 }

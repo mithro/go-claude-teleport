@@ -57,6 +57,32 @@ func readTranscript(t *testing.T, h *host, cwd string) string {
 	return string(b)
 }
 
+// --tmux-session puts the window in a named destination session instead of
+// the one the source happened to use. Without it the source's name carries
+// over, which is what TestE2ERunningWorktreeFreshMain pins.
+func TestE2ETmuxSessionOverridesDestinationGroup(t *testing.T) {
+	src := newHost(t, "laptop.example", "alice", newFakeTmux())
+	dst := newHost(t, "big-storage.example", "bob", newFakeTmux())
+	cwd := filepath.Join(src.paths.Home, "github", "x")
+	makeRepo(t, cwd)
+	seedSession(t, src, cwd)
+	startClaudeInPane(t, src, "work", cwd)
+
+	o := baseOptions()
+	o.TmuxSession = "pcbs"
+	p, j := teleport(t, o, src, dst)
+	if j.Outcome != "success" {
+		t.Fatalf("outcome %q", j.Outcome)
+	}
+	if p.Tmux == nil || p.Tmux.Group != "pcbs" {
+		t.Fatalf("plan tmux = %+v, want Group pcbs", p.Tmux)
+	}
+	reg := waitRegistry(t, dst, "idle")
+	if !strings.HasPrefix(reg.Tmux, "pcbs:") {
+		t.Errorf("destination registry tmux = %q, want a pcbs: session", reg.Tmux)
+	}
+}
+
 func TestE2ERunningWorktreeFreshMain(t *testing.T) {
 	src := newHost(t, "laptop.example", "alice", newFakeTmux())
 	dst := newHost(t, "big-storage.example", "bob", newFakeTmux())

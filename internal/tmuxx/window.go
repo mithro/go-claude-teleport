@@ -42,6 +42,25 @@ func BaseSession(sessions []SessionInfo, group string) (string, bool) {
 	return best, best != ""
 }
 
+// StoredSessionName maps a session name a HUMAN typed (--tmux-session) onto
+// tmux's stored, vis(3)-encoded spelling, the only one a `-t` target
+// resolves (R-PRB-2). A name matching no existing session is returned
+// unchanged: it names a session that does not exist yet and will be
+// created. Matching accepts either spelling, as the CLI selector does.
+func StoredSessionName(sessions []SessionInfo, typed string) string {
+	for _, s := range sessions {
+		if s.Name == typed {
+			return s.Name
+		}
+	}
+	for _, s := range sessions {
+		if UnvisName(s.Name) == typed {
+			return s.Name
+		}
+	}
+	return typed
+}
+
 // RefString is the single canonical "<session>:<window>.<pane>" spelling
 // (matching session.Registry.Tmux, e.g. "main:@3.%7") built from ref's
 // fields, which already carry tmux's STORED (vis-encoded) spelling

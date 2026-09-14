@@ -74,6 +74,11 @@ Or build it yourself:
 go install github.com/mithro/go-claude-teleport/cmd/claude-teleport@latest
 ```
 
+tmux placement: the window opens in the session the source used, or in the
+one `--tmux-session NAME` names. Several tmux servers on a host are fine —
+every live one is searched for the session being moved, and `--tmux-socket`
+picks between them when a name is on more than one.
+
 `claude-teleport` (matching `--version`/protocol) must be installed on
 **both** machines; `claude-teleport doctor <host>` checks this. Claude Code
 itself must already be installed **and logged in** on the destination — the
@@ -401,6 +406,24 @@ here with `--from <host>` to inspect it locally).
   keepalives off, while `ServerAliveCountMax=0` is a hard error (it reads
   like "tolerate no misses" but would silently mean the default 3).
   `ProxyJump` is honoured; `ProxyCommand` is not — use `--via`.
+  `Match all`, `Match host` and `Match exec` are honoured. An `exec`
+  guard is run only if it names a command on an allow list — `true`,
+  `false`, `test`, `[`, `grep`, `hostname`, `id`, `uname` — which
+  `-o MatchExecAllow=cmd,...` extends and `-o MatchExecAllow=none`
+  empties; it is run directly rather than through a shell, so no pipes,
+  redirects, globs or `%h`-style tokens, and it is cut off after 5s.
+  A guard that cannot be decided, including a command that is not
+  allowed, is skipped with a warning rather than failing every host as
+  it once did.
+- Every keyword in the config, and in the files it `Include`s, is
+  checked against the set `ssh_config(5)` defines. One that is not
+  defined is an error naming its file and line — a typo means the
+  setting you think is in force is not, which is what `ssh` itself says
+  about a config it cannot read. `IgnoreUnknown <pattern-list>` in the
+  config, or `-o IgnoreUnknown=...`, is the way past it, including when
+  a newer OpenSSH has keywords this build predates. Of the keywords
+  that *are* defined, a teleport acts on twelve; `claude-teleport
+  doctor <host>` lists the others your config sets for that host.
 - The same `claude-teleport` version on both ends (`claude-teleport doctor
   <host>` checks this, plus `claude` on `PATH`, the config directory, and
   more) and a logged-in Claude Code on the destination.

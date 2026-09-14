@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,6 +103,111 @@ func TestDialTargetSurfacesSSHConfigOpenError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), cfgPath) {
 		t.Errorf("err = %v, want it to name %s", err, cfgPath)
+	}
+}
+
+// A Match block the ssh_config parser cannot decide used to fail every
+// subcommand that touches a remote host with exit 2, before the host was even
+// resolved (issue #21). The block is unrelated to the target, so the dial must
+// get as far as the network.
+func TestDialTargetToleratesUndecidableMatchBlock(t *testing.T) {
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "Match exec \"curl https://evil.example\"\n\tStrictHostKeyChecking accept-new\n" +
+		"\nHost dest\n\tHostName dest.invalid\n\tUser someone\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	env := []string{"HOME=" + home, "USER=alice"}
+	_, _, err := dialTarget(ctx, "dest", nil, nil, env, t.Logf)
+	if err == nil {
+		t.Fatal("expected the dial to fail: dest.invalid does not resolve")
+	}
+	var exitErr *ExitError
+	if errors.As(err, &exitErr) && exitErr.Code == ExitUsage {
+		t.Errorf("err = %v, want the config to parse rather than fail as usage", err)
+	}
+	if strings.Contains(err.Error(), "Match") {
+		t.Errorf("err = %v, want no complaint about the Match block", err)
+	}
+}
+
+// -o MatchExecAllow adds to the commands a guard may run. It is the only way
+// in: the config file that names a command cannot also authorise it.
+func TestDialTargetMatchExecAllowOptIn(t *testing.T) {
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "Match exec \"sleep 0\"\n\tUser fromtheblock\n" +
+		"\nHost dest\n\tHostName dest.invalid\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + home, "USER=alice"}
+
+	// The dial itself is beside the point here: cancel it so only the config
+	// handling, which runs first, is exercised.
+	dialLogs := func(opts []string) string {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var sb strings.Builder
+		dialTarget(ctx, "dest", nil, opts, env, func(f string, a ...any) {
+			fmt.Fprintf(&sb, f+"\n", a...)
+		})
+		return sb.String()
+	}
+
+	if got := dialLogs(nil); !strings.Contains(got, "allow list") {
+		t.Errorf("without the opt-in sleep must be refused, log was %q", got)
+	}
+	if got := dialLogs([]string{"MatchExecAllow=sleep"}); strings.Contains(got, "allow list") {
+		t.Errorf("with the opt-in sleep must be run, log was %q", got)
+	}
+}
+
+// A keyword ssh_config(5) does not define is an error, as it is under ssh
+// itself: the setting the user believes is in force is not. -o IgnoreUnknown
+// is the way past it, which matters most when this build's keyword table has
+// gone stale against a newer OpenSSH.
+func TestDialTargetFailsOnUnknownConfigKeyword(t *testing.T) {
+	home := t.TempDir()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "Host dest\n\tHostName dest.invalid\n\tBananaPhone yes\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"HOME=" + home, "USER=alice"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the dial is beside the point; the config is read before it
+
+	_, _, err := dialTarget(ctx, "dest", nil, nil, env, t.Logf)
+	var exitErr *ExitError
+	if !errors.As(err, &exitErr) || exitErr.Code != ExitUsage {
+		t.Fatalf("err = %v, want *ExitError{Code: ExitUsage}", err)
+	}
+	for _, want := range []string{"BananaPhone", "line 3", "IgnoreUnknown"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v, want it to mention %q", err, want)
+		}
+	}
+
+	// With the override the config is accepted and the run reaches the dial.
+	_, _, err = dialTarget(ctx, "dest", nil, []string{"IgnoreUnknown=Banana*"}, env, t.Logf)
+	if errors.As(err, &exitErr) && exitErr.Code == ExitUsage {
+		t.Errorf("err = %v, want the override to get past the config", err)
 	}
 }
 
@@ -207,9 +313,14 @@ func TestRemoteServeResolvesSuspendedSessions(t *testing.T) {
 	remoteEnv, remoteHome := testEnv(t)
 	sockDir := t.TempDir()
 	sock := filepath.Join(sockDir, "default")
-	if err := os.WriteFile(sock, nil, 0o600); err != nil {
+	// A real socket, not a plain file: the probe enumerates live servers by
+	// the socket mode bit, which is what distinguishes a tmux socket from
+	// anything else that happens to sit in the directory.
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { ln.Close() })
 	stub := &stubTmux{sessionName: "main", windowID: "@4", paneID: "%9", panePID: placeholderProcess(t, tsid)}
 	restore := tmuxx.Dial
 	tmuxx.Dial = func(ctx context.Context, path string) (tmuxx.Transport, error) {

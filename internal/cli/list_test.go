@@ -102,7 +102,7 @@ func (f *fakeProbe) ListPanes() ([]session.PaneInfo, error) {
 	}
 	return out, nil
 }
-func (f *fakeProbe) SocketPath() string { return f.socket }
+func (f *fakeProbe) PaneSocket(string) string { return f.socket }
 
 // TestListSuspendedViaProbe covers the fix for Task 20 review round 1: a
 // placeholder pane must mark its session suspended, but a live registry

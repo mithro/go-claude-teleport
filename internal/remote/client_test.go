@@ -609,7 +609,7 @@ func (p *paneProbe) PaneCommand(paneID string) ([]string, int, bool) {
 }
 func (p *paneProbe) FindWindow(string, string) ([]string, error) { return nil, nil }
 func (p *paneProbe) ListPanes() ([]session.PaneInfo, error)      { return p.infos, nil }
-func (p *paneProbe) SocketPath() string                          { return p.socket }
+func (p *paneProbe) PaneSocket(string) string                    { return p.socket }
 
 // TestListSessionsOverSSHReportsSuspended is the wire half of the
 // suspended-state fix: `list --host` dispatches to Local.ListSessions on

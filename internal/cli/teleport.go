@@ -59,7 +59,7 @@ func (a *app) teleportOptions(f teleportFlags, args []string) (orchestrate.Optio
 	}
 	o := orchestrate.Options{
 		Direction: "to", Target: f.To, Selector: sel, DestPath: f.DestPath, Maps: maps, State: f.State,
-		AllowDrift: f.AllowDrift, Force: f.Force, TmuxSocket: f.TmuxSocket, NoTmux: f.NoTmux, Excludes: f.Excludes,
+		AllowDrift: f.AllowDrift, Force: f.Force, TmuxSocket: f.TmuxSocket, TmuxSession: f.TmuxSession, NoTmux: f.NoTmux, Excludes: f.Excludes,
 		IncludeIgnored: f.IncludeIgnored, ExitTimeout: f.ExitTimeout, StartTimeout: f.StartTimeout, Via: f.Via, SSHOptions: sshOpts,
 	}
 	if f.From != "" {
@@ -216,6 +216,13 @@ func continueFlags(stored, given orchestrate.Options, liveRunner bool) (notes []
 	if given.AllowDrift && !stored.AllowDrift {
 		updated.AllowDrift, changed = true, true
 		notes = append(notes, "  --allow-config-drift: this job was planned without it; "+when)
+	}
+	if given.TmuxSession != "" && given.TmuxSession != stored.TmuxSession {
+		was := stored.TmuxSession
+		if was == "" {
+			was = "the source session's name"
+		}
+		notes = append(notes, fmt.Sprintf("  --tmux-session %s: this job was planned against %s and keeps it (abandon it to start over elsewhere)", given.TmuxSession, was))
 	}
 	if given.TmuxSocket != "" && given.TmuxSocket != stored.TmuxSocket {
 		was := stored.TmuxSocket

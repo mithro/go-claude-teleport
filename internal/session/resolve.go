@@ -31,6 +31,9 @@ type PaneInfo struct {
 	Session  string
 	WindowID string
 	PaneID   string
+	// SocketPath is the tmux server this pane is on. A host may run
+	// several, so a pane is only located once this is known.
+	SocketPath string
 }
 
 // PaneProbe lets Resolve consult tmux without importing tmuxx (Plan 03 wires
@@ -41,9 +44,13 @@ type PaneProbe interface {
 	PaneCommand(paneID string) (argv []string, pid int, ok bool)
 	// FindWindow resolves "<session> <window index|name>" to its pane ids.
 	FindWindow(session, window string) (paneIDs []string, err error)
-	// ListPanes enumerates every pane on the server (for suspended-pane discovery).
+	// ListPanes enumerates every pane on every server (for suspended-pane
+	// discovery); each carries the socket it was found on.
 	ListPanes() ([]PaneInfo, error)
-	SocketPath() string
+	// PaneSocket reports which tmux server holds paneID, "" if none does.
+	// The registry records a pane with no socket in it, so this is the
+	// lookup that turns that into a located pane.
+	PaneSocket(paneID string) string
 }
 
 // Session is a located session.
@@ -104,7 +111,7 @@ func Load(p Paths, id ID, probe PaneProbe) (*Session, error) {
 		if sess, win, pane, ok := r.TmuxParts(); ok {
 			s.Tmux = &TmuxRef{Session: sess, WindowID: win, PaneID: pane}
 			if probe != nil {
-				s.Tmux.SocketPath = probe.SocketPath()
+				s.Tmux.SocketPath = probe.PaneSocket(pane)
 			}
 		}
 		return s, nil
@@ -121,7 +128,7 @@ func Load(p Paths, id ID, probe PaneProbe) (*Session, error) {
 			}
 			if sid, ph, ok := ArgvSessionID(argv); ok && ph && sid == string(id) {
 				s.State = StateSuspended
-				s.Tmux = &TmuxRef{SocketPath: probe.SocketPath(), Session: pi.Session, WindowID: pi.WindowID, PaneID: pi.PaneID}
+				s.Tmux = &TmuxRef{SocketPath: pi.SocketPath, Session: pi.Session, WindowID: pi.WindowID, PaneID: pi.PaneID}
 				break
 			}
 		}

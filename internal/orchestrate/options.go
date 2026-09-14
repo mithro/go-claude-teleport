@@ -16,20 +16,24 @@ import (
 )
 
 type Options struct {
-	Direction      string            `json:"direction"` // "to" | "from"
-	Selector       session.Selector  `json:"selector"`
-	DestPath       string            `json:"dest_path"`
-	Maps           []session.Mapping `json:"maps"`
-	State          string            `json:"state"` // auto|running|suspended|idle
-	AllowDrift     bool              `json:"allow_drift"`
-	Force          bool              `json:"force"`
-	TmuxSocket     string            `json:"tmux_socket"`
-	NoTmux         bool              `json:"no_tmux"`
-	Excludes       []string          `json:"excludes"`
-	IncludeIgnored bool              `json:"include_ignored"`
-	ExitTimeout    time.Duration     `json:"exit_timeout"`
-	StartTimeout   time.Duration     `json:"start_timeout"`
-	BangMode       bool              `json:"bang_mode"` // running inside the session ($CLAUDE_PID == source pid)
+	Direction  string            `json:"direction"` // "to" | "from"
+	Selector   session.Selector  `json:"selector"`
+	DestPath   string            `json:"dest_path"`
+	Maps       []session.Mapping `json:"maps"`
+	State      string            `json:"state"` // auto|running|suspended|idle
+	AllowDrift bool              `json:"allow_drift"`
+	Force      bool              `json:"force"`
+	TmuxSocket string            `json:"tmux_socket"`
+	// TmuxSession names the destination tmux session (group) to put the
+	// window in. Empty keeps spec §9's derivation: the source session's
+	// group, else its name.
+	TmuxSession    string        `json:"tmux_session"`
+	NoTmux         bool          `json:"no_tmux"`
+	Excludes       []string      `json:"excludes"`
+	IncludeIgnored bool          `json:"include_ignored"`
+	ExitTimeout    time.Duration `json:"exit_timeout"`
+	StartTimeout   time.Duration `json:"start_timeout"`
+	BangMode       bool          `json:"bang_mode"` // running inside the session ($CLAUDE_PID == source pid)
 
 	// Additions (Plan 03): what the runner needs to re-dial the remote.
 	Target     string            `json:"target"` // [user@]host[:port] of the remote endpoint

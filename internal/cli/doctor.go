@@ -11,6 +11,7 @@ import (
 	"github.com/mithro/go-claude-teleport/internal/bootstrap"
 	"github.com/mithro/go-claude-teleport/internal/orchestrate"
 	"github.com/mithro/go-claude-teleport/internal/remote"
+	"github.com/mithro/go-claude-teleport/internal/sshx"
 	"github.com/mithro/go-claude-teleport/internal/tmuxx"
 	"github.com/mithro/go-claude-teleport/internal/version"
 	"github.com/mithro/go-multi-binary/fatblob"
@@ -102,6 +103,32 @@ func sockDetail(sock string) string {
 // takes an already-connected remote.Endpoint so the logic is testable
 // against an in-process Local standing in for "the remote host" (as the
 // rest of Plan 03 does), with the real ssh dial living entirely in
+// sshConfigCheck reports which keywords ~/.ssh/config sets for host that the
+// teleport does not act on. They are valid ssh_config, so this is never a
+// failure — it is the one place the gap between what the config asks for and
+// what a teleport does is said out loud.
+func (a *app) sshConfigCheck(host string, opts []string) check {
+	overrides := map[string]string{}
+	for _, o := range opts {
+		if k, v, ok := strings.Cut(o, "="); ok && k != "" {
+			overrides[k] = v
+		}
+	}
+	cfg, err := loadSSHConfig(a.env["HOME"], overrides, func(string, ...any) {})
+	if err != nil {
+		return check{"ssh_config", err.Error(), false}
+	}
+	if cfg == nil {
+		return check{"ssh_config", "no ~/.ssh/config to read", true}
+	}
+	ignored := sshx.IgnoredKeywords(cfg, host)
+	if len(ignored) == 0 {
+		return check{"ssh_config", "every keyword it sets for " + host + " is acted on", true}
+	}
+	return check{"ssh_config", fmt.Sprintf("set for %s but not acted on: %s",
+		host, strings.Join(ignored, ", ")), true}
+}
+
 // newDoctorCmd's RunE.
 func remoteChecks(ctx context.Context, ep remote.Endpoint, host string) ([]check, remote.HostInfo, error) {
 	hi, err := ep.Hello(ctx)
@@ -169,6 +196,9 @@ func newDoctorCmd(a *app) *cobra.Command {
 				if err != nil {
 					return usageErr(err)
 				}
+				// Before the dial, so it is still reported when the host
+				// turns out to be unreachable.
+				print([]check{a.sshConfigCheck(host, opts)})
 				ep, closeFn, err := a.dialRemote(ctx, orchestrate.Options{Target: host, Via: via, SSHOptions: sshOpts})
 				if err != nil {
 					return exitErr(a.fail(err))

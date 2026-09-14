@@ -93,10 +93,10 @@ func selfExe() string {
 // host reads as idle over the wire — selector rule 4 (<tmux-session>
 // <window>) cannot resolve there, a placeholder pane is invisible to a
 // remote ResolveSession/InspectSession, and `--from host` silently
-// downgrades the end state. The socket is $TMUX first, then spec §9
-// discovery, exactly as an interactive invocation resolves it; the
-// returned closeFn releases the control connection the probe holds (a
-// no-op when there is no reachable server).
+// downgrades the end state. The probe spans every live tmux server on the
+// host, plus the one named by $TMUX if it sits elsewhere, so a session is
+// found whichever server it is on; the returned closeFn releases the
+// control connections it holds (a no-op when no server is reachable).
 func serverLocalOptions(ctx context.Context, env []string, logf func(string, ...any)) (remote.LocalOptions, func()) {
 	opts := remote.LocalOptions{
 		ProcRoot: "/proc",
@@ -108,26 +108,53 @@ func serverLocalOptions(ctx context.Context, env []string, logf func(string, ...
 		Logf:          logf,
 	}
 	noop := func() {}
-	sock := ""
-	if t := envValue(env, "TMUX"); t != "" {
-		sock = strings.SplitN(t, ",", 2)[0]
-	} else if s, err := tmuxx.FindServer(opts.TmuxSocketDir, "", ""); err == nil {
-		sock = s
-	}
-	if sock == "" {
-		return opts, noop
-	}
-	tr, err := tmuxx.Dial(ctx, sock)
+	// Every live server, not one: a host may run several at once and the
+	// registry locates a pane without naming a socket, so binding one
+	// server and attributing every session to it is a guess.
+	sockets, err := tmuxx.ListLiveServers(opts.TmuxSocketDir)
 	if err != nil {
+		sockets = nil
+	}
+	// $TMUX names the server this process is running inside, which can sit
+	// outside the socket dir entirely (a -S path, or another TMUX_TMPDIR).
+	if t := envValue(env, "TMUX"); t != "" {
+		own := strings.SplitN(t, ",", 2)[0]
+		found := false
+		for _, s := range sockets {
+			if s == own {
+				found = true
+				break
+			}
+		}
+		if !found {
+			sockets = append(sockets, own)
+		}
+	}
+	if len(sockets) == 0 {
 		return opts, noop
 	}
 	procs, err := procx.Scan(opts.ProcRoot)
 	if err != nil {
-		tr.Close()
 		return opts, noop
 	}
-	opts.Probe = tmuxx.Prober(ctx, tr, procs, sock)
-	return opts, func() { tr.Close() }
+	transports := map[string]tmuxx.Transport{}
+	for _, s := range sockets {
+		tr, err := tmuxx.Dial(ctx, s)
+		if err != nil {
+			// One unreachable server must not hide the others.
+			continue
+		}
+		transports[s] = tr
+	}
+	if len(transports) == 0 {
+		return opts, noop
+	}
+	opts.Probe = tmuxx.MultiProber(ctx, transports, procs)
+	return opts, func() {
+		for _, tr := range transports {
+			tr.Close()
+		}
+	}
 }
 
 // tmuxSocketDir resolves $TMUX_TMPDIR, defaulting to /tmp/tmux-<uid> when
@@ -137,6 +164,49 @@ func tmuxSocketDir(env []string) string {
 		return d
 	}
 	return fmt.Sprintf("/tmp/tmux-%d", os.Getuid())
+}
+
+// loadSSHConfig reads and decodes ~/.ssh/config for a run with these -o
+// overrides. It consumes the two options that steer the decode rather than
+// the connection: MatchExecAllow, which is ours and is removed so it never
+// reaches Resolve, and IgnoreUnknown, which is a real ssh_config keyword and
+// so is read without being removed. A missing file is not an error; any other
+// open failure is, rather than being taken for "no config".
+func loadSSHConfig(home string, overrides map[string]string, logf func(string, ...any)) (*ssh_config.Config, error) {
+	var execAllow, ignoreUnknown []string
+	for k, v := range overrides {
+		if strings.EqualFold(k, "MatchExecAllow") {
+			execAllow = strings.Split(v, ",")
+			delete(overrides, k)
+		}
+		if strings.EqualFold(k, "IgnoreUnknown") {
+			ignoreUnknown = append(ignoreUnknown, v)
+		}
+	}
+	sshConfigPath := filepath.Join(home, ".ssh", "config")
+	b, err := os.ReadFile(sshConfigPath)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// No ~/.ssh/config: a nil config, which Resolve reads as "nothing
+		// to consult".
+		return nil, nil
+	case err != nil:
+		return nil, fail(ExitUsage, "%s: %v", sshConfigPath, err)
+	}
+	cfg, err := sshx.DecodeConfig(b, sshx.ConfigOptions{
+		Path: sshConfigPath, Home: home, ExecAllow: execAllow,
+		IgnoreUnknown: ignoreUnknown, Warnf: logf,
+	})
+	var unknownErr *sshx.UnknownKeywordError
+	switch {
+	case errors.As(err, &unknownErr):
+		// Already names every file and line it found, including any
+		// Include'd ones, so do not prefix it with just this file.
+		return nil, fail(ExitUsage, "%v", err)
+	case err != nil:
+		return nil, fail(ExitUsage, "~/.ssh/config: %v", err)
+	}
+	return cfg, nil
 }
 
 // dialTarget resolves target (with --via hops and -o overrides) through
@@ -164,23 +234,9 @@ func dialTarget(ctx context.Context, target string, via []string, opts []string,
 		overrides[k] = v
 	}
 	home := envValue(env, "HOME")
-	var cfg *ssh_config.Config
-	sshConfigPath := filepath.Join(home, ".ssh", "config")
-	f, err := os.Open(sshConfigPath)
-	switch {
-	case err == nil:
-		cfg, err = ssh_config.Decode(f)
-		f.Close()
-		if err != nil {
-			return nil, sshx.Resolved{}, fail(ExitUsage, "~/.ssh/config: %v", err)
-		}
-	case errors.Is(err, fs.ErrNotExist):
-		// No ~/.ssh/config: proceed with a nil config (Resolve treats that
-		// as "no config to consult").
-	default:
-		// Any other open error (permission denied, a symlink loop, ...)
-		// must not be silently treated as "no config" — surface it.
-		return nil, sshx.Resolved{}, fail(ExitUsage, "%s: %v", sshConfigPath, err)
+	cfg, err := loadSSHConfig(home, overrides, logf)
+	if err != nil {
+		return nil, sshx.Resolved{}, err
 	}
 	localUser := envValue(env, "USER")
 	if localUser == "" {

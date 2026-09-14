@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -23,6 +24,7 @@ type teleportFlags struct {
 	AllowDrift     bool
 	Force          bool
 	TmuxSocket     string
+	TmuxSession    string
 	NoTmux         bool
 	NoBootstrap    bool
 	Excludes       []string
@@ -126,6 +128,7 @@ func (a *app) rootCmd() *cobra.Command {
 	f.BoolVar(&tf.AllowDrift, "allow-config-drift", false, "downgrade blocking drift to warnings")
 	f.BoolVar(&tf.Force, "force", false, "allow non-fast-forward replacement of this session")
 	f.StringVar(&tf.TmuxSocket, "tmux-socket", "", "destination tmux socket name")
+	f.StringVar(&tf.TmuxSession, "tmux-session", "", "destination tmux session name (default: the source session's)")
 	f.BoolVar(&tf.NoTmux, "no-tmux", false, "do not use tmux on the destination")
 	f.BoolVar(&tf.NoBootstrap, "no-bootstrap", false, "require claude-teleport pre-installed on the remote (do not auto-install it)")
 	f.StringArrayVar(&tf.Excludes, "exclude", nil, "exclude glob, repeatable")
@@ -155,7 +158,23 @@ func (a *app) selectorEnv() session.Env {
 // probe returns the tmux pane probe. Plan 03 returns tmuxx.Prober when a
 // tmux server is reachable; in this plan there is no tmux client, so
 // suspended panes and the two-word selector are not resolvable yet.
-func (a *app) probe() session.PaneProbe { return nil }
+// probe builds the tmux probe the selector and `list` consult, once per
+// run, spanning every live server on the host (serverLocalOptions does the
+// dialling). It returned nil until now, which left spec §5 rule 4
+// (`<tmux-session> <window>`) answering "tmux is not available" on a machine
+// plainly running tmux, and hid every suspended session from `list` — both
+// of them documented behaviour that had no implementation locally.
+//
+// nil stays a valid answer: a host with no tmux server has nothing to probe,
+// and session.Resolve reads nil as "do not consult tmux".
+func (a *app) probe() session.PaneProbe {
+	a.probeOnce.Do(func() {
+		opts, closeProbe := serverLocalOptions(context.Background(), a.envSlice(), a.logf)
+		a.cachedProbe = opts.Probe
+		a.closers = append(a.closers, func() error { closeProbe(); return nil })
+	})
+	return a.cachedProbe
+}
 
 // resolveSession applies the spec §5 selector rules locally.
 func (a *app) resolveSession(args []string) (*session.Session, error) {
