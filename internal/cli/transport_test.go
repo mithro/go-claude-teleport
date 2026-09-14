@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -312,9 +313,14 @@ func TestRemoteServeResolvesSuspendedSessions(t *testing.T) {
 	remoteEnv, remoteHome := testEnv(t)
 	sockDir := t.TempDir()
 	sock := filepath.Join(sockDir, "default")
-	if err := os.WriteFile(sock, nil, 0o600); err != nil {
+	// A real socket, not a plain file: the probe enumerates live servers by
+	// the socket mode bit, which is what distinguishes a tmux socket from
+	// anything else that happens to sit in the directory.
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { ln.Close() })
 	stub := &stubTmux{sessionName: "main", windowID: "@4", paneID: "%9", panePID: placeholderProcess(t, tsid)}
 	restore := tmuxx.Dial
 	tmuxx.Dial = func(ctx context.Context, path string) (tmuxx.Transport, error) {

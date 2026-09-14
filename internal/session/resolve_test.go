@@ -38,7 +38,7 @@ func (f *fakeProbe) ListPanes() ([]PaneInfo, error) {
 	}
 	return out, nil
 }
-func (f *fakeProbe) SocketPath() string { return f.socket }
+func (f *fakeProbe) PaneSocket(string) string { return f.socket }
 
 func fixturePaths() Paths {
 	p := NewPaths("/home/alice", "testdata/config", "/tmp/xdg", true)

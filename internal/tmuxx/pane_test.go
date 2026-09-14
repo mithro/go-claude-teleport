@@ -184,8 +184,11 @@ func TestProber(t *testing.T) {
 	if err != nil || len(panes) != 2 {
 		t.Errorf("FindWindow = %v %v", panes, err)
 	}
-	if p.SocketPath() != "/tmp/tmux-1000/default" {
-		t.Error("SocketPath")
+	if p.PaneSocket("%8") != "/tmp/tmux-1000/default" {
+		t.Error("PaneSocket of a pane on this server")
+	}
+	if p.PaneSocket("%404") != "" {
+		t.Error("PaneSocket of a pane this server does not have")
 	}
 	all, err := p.ListPanes()
 	if err != nil || len(all) != 2 || all[1].Session != "main" || all[1].WindowID != "@1" || all[1].PaneID != "%8" {
@@ -289,10 +292,11 @@ func TestProberListPanesKeepsStoredSessionNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	const sock = "/tmp/tmux-1000/default"
 	want := []session.PaneInfo{
-		{Session: `a b`, WindowID: "@0", PaneID: "%0"},
-		{Session: `a"b`, WindowID: "@2", PaneID: "%2"},
-		{Session: `a\\b`, WindowID: "@1", PaneID: "%1"},
+		{Session: `a b`, WindowID: "@0", PaneID: "%0", SocketPath: sock},
+		{Session: `a"b`, WindowID: "@2", PaneID: "%2", SocketPath: sock},
+		{Session: `a\\b`, WindowID: "@1", PaneID: "%1", SocketPath: sock},
 	}
 	if diff := cmp.Diff(want, all); diff != "" {
 		t.Errorf("ListPanes (-want +got):\n%s", diff)
