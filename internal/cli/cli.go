@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/mithro/go-claude-teleport/internal/orchestrate"
 	"github.com/mithro/go-claude-teleport/internal/session"
@@ -61,7 +62,12 @@ type app struct {
 	paths   session.Paths
 	selfExe string
 	logf    func(string, ...any)
-	closers []func() error
+
+	// The tmux probe is built at most once per run and released by the
+	// closers above; see (*app).probe.
+	probeOnce   sync.Once
+	cachedProbe session.PaneProbe
+	closers     []func() error
 }
 
 // ensurePaths resolves a.paths (honouring --config-dir) the first time a
