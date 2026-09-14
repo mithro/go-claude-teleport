@@ -48,6 +48,8 @@ Options:
   --allow-config-drift    turn blocking configuration drift into warnings
   --force                 allow non-fast-forward replacement of an existing copy of this session
   --tmux-socket NAME      destination tmux socket name (default: same as source)
+  --tmux-session NAME     destination tmux session to open the window in
+                          (default: the session name the source used)
   --no-tmux               do not use tmux on the destination (end state must be idle)
   --exclude GLOB          omit matching files from the repository transfer, repeatable
   --include-ignored       also transfer gitignored files

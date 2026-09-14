@@ -23,6 +23,7 @@ type teleportFlags struct {
 	AllowDrift     bool
 	Force          bool
 	TmuxSocket     string
+	TmuxSession    string
 	NoTmux         bool
 	NoBootstrap    bool
 	Excludes       []string
@@ -126,6 +127,7 @@ func (a *app) rootCmd() *cobra.Command {
 	f.BoolVar(&tf.AllowDrift, "allow-config-drift", false, "downgrade blocking drift to warnings")
 	f.BoolVar(&tf.Force, "force", false, "allow non-fast-forward replacement of this session")
 	f.StringVar(&tf.TmuxSocket, "tmux-socket", "", "destination tmux socket name")
+	f.StringVar(&tf.TmuxSession, "tmux-session", "", "destination tmux session name (default: the source session's)")
 	f.BoolVar(&tf.NoTmux, "no-tmux", false, "do not use tmux on the destination")
 	f.BoolVar(&tf.NoBootstrap, "no-bootstrap", false, "require claude-teleport pre-installed on the remote (do not auto-install it)")
 	f.StringArrayVar(&tf.Excludes, "exclude", nil, "exclude glob, repeatable")
