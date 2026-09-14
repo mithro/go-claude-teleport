@@ -563,17 +563,30 @@ Every decision above is shown by `inspect`/`--dry-run` before anything moves.
 
 ## 9. tmux
 
-Source facts come from the registry `tmux` field (`session:@win.%pane`)
+A host may run several tmux servers at once (`tmux -L main` beside the
+default socket is ordinary), and the registry records a pane as
+`session:@win.%pane` with **no socket in it**. So the pane's server is
+found, never assumed: the probe dials every *live* server under
+`/tmp/tmux-<uid>/` (or `$TMUX_TMPDIR`), plus the one `$TMUX` names when
+that sits elsewhere, and asks each which panes it has. Liveness is the
+test, not the presence of a socket file — a socket outlives the server
+that made it. A session name present on two servers is ambiguous and is
+reported as such rather than resolved to whichever answered first.
+
+Source facts come from the registry `tmux` field, the server found above,
 and one control-mode query: session name, `session_group`, window index and
 name, `automatic-rename`, pane title, `pane_current_path`, socket path.
 
-Destination server discovery, in order: a server on a socket with the
-source's socket *name* (`-L main`); the default socket; if exactly one
-server socket exists under `/tmp/tmux-<uid>/` (or `$TMUX_TMPDIR`), that one;
-otherwise fail at preflight with the list found. **Never start a server.**
+Destination server discovery, in order: `--tmux-socket`; a server on a
+socket with the source's socket *name* (`-L main`, now derived from the
+pane's real server); the default socket; if exactly one live server exists
+under the socket dir, that one; otherwise fail at preflight with the list
+found. **Never start a server.**
 
-Window placement: group name `G` = source `session_group` if non-empty else
-`session_name`. If a destination session belongs to group `G` (or is named
+Window placement: group name `G` = `--tmux-session` if given, else source
+`session_group` if non-empty, else `session_name`. A `--tmux-session` name
+is matched against the destination's session list in either spelling
+(stored or plain) and otherwise names a session to create. If a destination session belongs to group `G` (or is named
 `G`), use the group's base session; otherwise `new-session -d -s G -c
 <cwd>` (a session on an existing server, allowed). Then `new-window -t G:
 -n <name> -c <cwd>`; if the source window had `automatic-rename off`, set it

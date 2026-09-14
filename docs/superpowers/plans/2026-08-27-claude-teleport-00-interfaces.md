@@ -438,6 +438,26 @@ var Version = "dev"          // set by -ldflags "-X .../internal/version.Version
 const Protocol = 1           // remote protocol version
 ```
 
+## internal/tmuxx — multiple servers
+
+```go
+// ListLiveServers returns the sockets under socketDir a server is actually
+// answering on: a socket file outlives the server that made it.
+func ListLiveServers(socketDir string) ([]string, error)
+// MultiProber adapts one Transport per socket to session.PaneProbe, so a
+// pane is located by asking each server which panes it has rather than by
+// assuming one server owns everything.
+func MultiProber(ctx context.Context, transports map[string]Transport, procs *procx.Table) session.PaneProbe
+// StoredSessionName maps a --tmux-session name a person typed onto tmux's
+// stored spelling, or returns it unchanged to name a session to create.
+func StoredSessionName(sessions []SessionInfo, typed string) string
+```
+
+session.PaneProbe changed with it: `SocketPath() string` became
+`PaneSocket(paneID string) string`, and `PaneInfo` gained `SocketPath`,
+because which socket a pane is on is a property of the pane, not of the
+probe. orchestrate.Options gained `TmuxSession`.
+
 ## internal/sshx (Plan 02)
 
 ```go

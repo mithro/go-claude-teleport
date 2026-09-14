@@ -74,6 +74,11 @@ Or build it yourself:
 go install github.com/mithro/go-claude-teleport/cmd/claude-teleport@latest
 ```
 
+tmux placement: the window opens in the session the source used, or in the
+one `--tmux-session NAME` names. Several tmux servers on a host are fine —
+every live one is searched for the session being moved, and `--tmux-socket`
+picks between them when a name is on more than one.
+
 `claude-teleport` (matching `--version`/protocol) must be installed on
 **both** machines; `claude-teleport doctor <host>` checks this. Claude Code
 itself must already be installed **and logged in** on the destination — the
