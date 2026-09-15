@@ -450,9 +450,9 @@ func (c *Client) GitDestState(ctx context.Context, mainDir, worktreeDir, branch 
 	return r.State, err
 }
 
-func (c *Client) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket string) (*tmuxx.Facts, error) {
+func (c *Client) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket, targetSession string) (*tmuxx.Facts, error) {
 	var r InventoryTmuxResult
-	err := c.call(ctx, OpInventoryTmux, InventoryTmuxArgs{Ref: ref, PreferredSocket: preferredSocket}, &r)
+	err := c.call(ctx, OpInventoryTmux, InventoryTmuxArgs{Ref: ref, PreferredSocket: preferredSocket, TargetSession: targetSession}, &r)
 	return r.Facts, err
 }
 

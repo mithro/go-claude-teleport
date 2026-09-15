@@ -29,12 +29,12 @@ func (l *Local) dial(ctx context.Context, socketPath string) (tmuxx.Transport, e
 
 // InventoryTmux describes the pane in ref, or — with ref == nil — only
 // discovers the server (spec §9) and returns Facts with SocketPath set.
-func (l *Local) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket string) (*tmuxx.Facts, error) {
+func (l *Local) InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket, targetSession string) (*tmuxx.Facts, error) {
 	if l.opts.Tmux == nil {
 		return nil, &Error{Code: "unavailable", Message: "tmux is not available on this host"}
 	}
 	if ref == nil {
-		sock, err := tmuxx.FindServer(l.opts.TmuxSocketDir, preferredSocket, "")
+		sock, err := tmuxx.FindServerForSession(l.opts.TmuxSocketDir, preferredSocket, "", targetSession)
 		if err != nil {
 			return nil, &Error{Code: "unavailable", Message: err.Error()}
 		}

@@ -155,7 +155,7 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 	// tmux (spec §9).
 	if !o.NoTmux && p.DestInfo.HasTmux {
 		if sess.Tmux != nil {
-			if p.SourceFacts, err = src.InventoryTmux(ctx, sess.Tmux, ""); err != nil {
+			if p.SourceFacts, err = src.InventoryTmux(ctx, sess.Tmux, "", ""); err != nil {
 				return nil, err
 			}
 		}
@@ -163,7 +163,17 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 		if preferred == "" && sess.Tmux != nil {
 			preferred = filepath.Base(sess.Tmux.SocketPath)
 		}
-		dfacts, err := dst.InventoryTmux(ctx, nil, preferred)
+		// The session the window will open in is known before discovery —
+		// --tmux-session, else the name derived from the source — and
+		// telling the destination lets it prefer a server that already
+		// holds it over one that merely shares the source's socket name.
+		target := o.TmuxSession
+		if target == "" && p.SourceFacts != nil {
+			if target = p.SourceFacts.Group; target == "" {
+				target = p.SourceFacts.SessionName
+			}
+		}
+		dfacts, err := dst.InventoryTmux(ctx, nil, preferred, target)
 		switch {
 		case isCode(err, "unavailable"):
 			p.Tmux = nil

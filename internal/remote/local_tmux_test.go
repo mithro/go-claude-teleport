@@ -24,7 +24,7 @@ func TestLocalInventoryTmuxDescribesPane(t *testing.T) {
 		`show-options -wv -t "@3" automatic-rename`: {"off"},
 	}}
 	l := NewLocal(p, "/usr/local/bin/claude-teleport", LocalOptions{ProcRoot: "/proc", Tmux: fakeDialer(f), TmuxSocketDir: t.TempDir()})
-	facts, err := l.InventoryTmux(context.Background(), &session.TmuxRef{SocketPath: "/tmp/tmux-1000/default", Session: "main", WindowID: "@3", PaneID: "%7"}, "")
+	facts, err := l.InventoryTmux(context.Background(), &session.TmuxRef{SocketPath: "/tmp/tmux-1000/default", Session: "main", WindowID: "@3", PaneID: "%7"}, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestLocalInventoryTmuxDescribesPane(t *testing.T) {
 
 func TestLocalInventoryTmuxUnavailable(t *testing.T) {
 	l := NewLocal(testPaths(t), "x", LocalOptions{ProcRoot: "/proc"})
-	_, err := l.InventoryTmux(context.Background(), nil, "")
+	_, err := l.InventoryTmux(context.Background(), nil, "", "")
 	if e, ok := err.(*Error); !ok || e.Code != "unavailable" {
 		t.Fatalf("err = %v, want unavailable", err)
 	}
