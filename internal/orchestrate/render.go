@@ -74,8 +74,42 @@ func (p *Plan) renderTmux(w io.Writer) {
 // thing a plan can say, and it was the one status the summary dropped
 // entirely — the entry vanished from every count.
 func (p *Plan) renderFileSummary(w io.Writer) {
-	var toSend, same, ff, staged, replaced int
-	for _, st := range p.Statuses {
+	// Memory files are never replaced whatever their status: Install routes
+	// a diverging one to MemoryDiffers and drops the staged copy, because a
+	// project's memory is shared by every session of that project and the
+	// destination's copy is as real as the source's. Counting them with
+	// ordinary files announced a replacement that cannot happen -- the one
+	// line in the whole summary that reads as imminent data loss.
+	memory, memIndex := map[int]bool{}, map[int]bool{}
+	if p.Extras != nil {
+		for _, e := range p.Extras.Memory {
+			memory[e.ID] = true
+			if session.IsMemoryIndex(e.Dst) {
+				memIndex[e.ID] = true
+			}
+		}
+	}
+	var toSend, same, ff, staged, replaced, memKept, memMerged int
+	for id, st := range p.Statuses {
+		if memory[id] {
+			switch st {
+			case transfer.Absent, transfer.StagedMismatch, transfer.FFCandidate:
+				toSend++
+			case transfer.PresentDifferent:
+				// The index is merged so the memory files copied beside it
+				// are findable; every other memory file is left alone.
+				if memIndex[id] {
+					memMerged++
+				} else {
+					memKept++
+				}
+			case transfer.PresentSame:
+				same++
+			case transfer.StagedSame:
+				staged++
+			}
+			continue
+		}
 		switch st {
 		case transfer.Absent, transfer.StagedMismatch:
 			toSend++
@@ -94,6 +128,12 @@ func (p *Plan) renderFileSummary(w io.Writer) {
 	fmt.Fprintf(w, "Files      %d to send, %d already present, %d fast-forward, %d already staged\n", toSend, same, ff, staged)
 	if replaced > 0 {
 		fmt.Fprintf(w, "  %d destination file(s) diverged and are REPLACED (--force)\n", replaced)
+	}
+	if memKept > 0 {
+		fmt.Fprintf(w, "  %d memory file(s) differ here and are KEPT; the source's copy is not installed\n", memKept)
+	}
+	if memMerged > 0 {
+		fmt.Fprintf(w, "  %d memory index (MEMORY.md) differs here and is merged; existing entries are kept, the source's are added\n", memMerged)
 	}
 }
 
