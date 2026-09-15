@@ -157,7 +157,12 @@ func TestInstallMemoryCopyIfAbsent(t *testing.T) {
 	m, staging, p := staged(t)
 	memSrc := filepath.Join(t.TempDir(), "memory.md")
 	os.WriteFile(memSrc, []byte("# notes\n"), 0o600)
-	memDst := filepath.Join(p.ConfigDir, "projects", "-home-bob-work", "memory", "MEMORY.md")
+	// Deliberately NOT MEMORY.md: this test is the general memory rule
+	// (copy if absent, otherwise report and leave alone). The index is the
+	// one documented exception -- it is merged, so that memory files copied
+	// alongside it are actually findable -- and TestInstallMergesTheMemoryIndex
+	// covers that.
+	memDst := filepath.Join(p.ConfigDir, "projects", "-home-bob-work", "memory", "project-notes.md")
 	mem := Entry{ID: 5, Category: session.CatSession, Src: memSrc, Dst: memDst, Size: 8, Mode: 0o600, SHA256: sha("# notes\n")}
 	m.Entries = append(m.Entries, mem)
 	writeFile(t, StagedPath(staging, 5), "# notes\n")

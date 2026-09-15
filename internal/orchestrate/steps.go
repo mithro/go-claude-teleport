@@ -563,6 +563,9 @@ func (r *runner) runInstall(ctx context.Context) error {
 	for _, m := range rep.MemoryDiffers {
 		r.logf("install: memory file differs on the destination and was left alone: %s", m)
 	}
+	for _, m := range rep.MemoryIndexMerged {
+		r.logf("install: memory index merged (destination entries kept, the source's added): %s", m)
+	}
 	return nil
 }
 

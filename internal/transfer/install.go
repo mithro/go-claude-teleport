@@ -25,6 +25,11 @@ type InstallReport struct {
 	// said so — the grant is idempotent.
 	TrustGranted                bool
 	MemoryCopied, MemoryDiffers []string
+	// MemoryIndexMerged names each project memory index (MEMORY.md)
+	// whose diverging source lines were merged into the destination's
+	// copy. Separate from MemoryDiffers because the outcome is the
+	// opposite: those files were left alone, these were added to.
+	MemoryIndexMerged []string
 	// InstalledIDs is the manifest ids this call placed at Dst from
 	// scratch (the StagedSame case below) — never a PresentSame entry,
 	// which was already there before this call touched anything.
@@ -158,6 +163,33 @@ func dropStaged(stagingDir string, e Entry) {
 	os.Remove(base)
 	os.Remove(base + ".dir")
 	os.Remove(base + ".symlink")
+}
+
+// mergeMemoryEntry merges a diverging project memory INDEX (MEMORY.md)
+// with the destination's copy, reporting whether it did.
+//
+// Memory files absent on the destination are copied, so leaving the index
+// untouched -- which is what every other diverging memory file gets --
+// would leave those newly copied files present on disk and listed
+// nowhere. The index is how a memory is found, so not merging it is what
+// makes the copy useless. Only ever adds lines: see
+// session.MergeMemoryIndex.
+//
+// Any other memory file is prose, where a line union would produce
+// nonsense, so it keeps the leave-alone-and-report behaviour.
+func mergeMemoryEntry(stagingDir string, e Entry, rep *InstallReport) (bool, error) {
+	if !session.IsMemoryIndex(e.Dst) {
+		return false, nil
+	}
+	src, err := os.ReadFile(StagedPath(stagingDir, e.ID))
+	if err != nil {
+		return false, fmt.Errorf("merge memory index %s: %w", e.Dst, err)
+	}
+	if _, err := session.MergeMemoryIndex(e.Dst, src); err != nil {
+		return false, err
+	}
+	rep.MemoryIndexMerged = append(rep.MemoryIndexMerged, e.Dst)
+	return true, nil
 }
 
 func placeFile(stagingDir string, e Entry) error {
@@ -377,7 +409,17 @@ func install(ctx context.Context, m *Manifest, st map[int]Status, stagingDir str
 		case Absent, StagedMismatch:
 			return fmt.Errorf("install memory %s: status %s (not staged)", e.Dst, st[e.ID])
 		default:
-			rep.MemoryDiffers = append(rep.MemoryDiffers, e.Dst)
+			// A diverging memory file is KEPT: a project's memories belong
+			// to every session of that project, so the destination's copy
+			// is as real as the source's. The INDEX is the exception --
+			// see mergeMemoryEntry.
+			merged, err := mergeMemoryEntry(stagingDir, e, rep)
+			if err != nil {
+				return err
+			}
+			if !merged {
+				rep.MemoryDiffers = append(rep.MemoryDiffers, e.Dst)
+			}
 			dropStaged(stagingDir, e)
 		}
 	}
