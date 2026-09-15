@@ -423,7 +423,9 @@ here with `--from <host>` to inspect it locally).
   config, or `-o IgnoreUnknown=...`, is the way past it, including when
   a newer OpenSSH has keywords this build predates. Of the keywords
   that *are* defined, a teleport acts on twelve; `claude-teleport
-  doctor <host>` lists the others your config sets for that host.
+  doctor <host>` lists the others your config sets for that host, and
+  [docs/ssh-config-keywords.md](docs/ssh-config-keywords.md) gives the
+  verdict on every one of the 123, with the reasoning.
 - The same `claude-teleport` version on both ends (`claude-teleport doctor
   <host>` checks this, plus `claude` on `PATH`, the config directory, and
   more) and a logged-in Claude Code on the destination.
