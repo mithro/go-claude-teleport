@@ -577,11 +577,26 @@ Source facts come from the registry `tmux` field, the server found above,
 and one control-mode query: session name, `session_group`, window index and
 name, `automatic-rename`, pane title, `pane_current_path`, socket path.
 
-Destination server discovery, in order: `--tmux-socket`; a server on a
-socket with the source's socket *name* (`-L main`, now derived from the
-pane's real server); the default socket; if exactly one live server exists
-under the socket dir, that one; otherwise fail at preflight with the list
-found. **Never start a server.**
+Destination server discovery, in order: `--tmux-socket`; the live server
+that **uniquely holds the target session** (below); a server on a socket
+with the source's socket *name* (`-L main`, derived from the pane's real
+server); the default socket; if exactly one live server exists under the
+socket dir, that one; otherwise fail at preflight with the list found.
+**Never start a server.**
+
+The target session — `--tmux-session` if given, else the name derived from
+the source — travels to the destination in `inventory-tmux`
+(`target_session`, protocol 4), because which server a session sits on is
+recorded nowhere. Without it the destination chose by socket name alone,
+which on a multi-server host was wrong two ways: it refused with "use
+`--tmux-socket NAME`" where the answer was discoverable, and where a name
+*did* match it could open a second session of the target's name on the
+preferred server while the real one sat on another. The rule is narrow by
+design: it never beats an explicit `--tmux-socket`; two holders are no
+basis for choosing and fall back to the name order rather than erroring;
+and a single live server is returned without a session scan at all. So it
+may only turn a refusal into a success or pick a better server, never
+break a case that already worked.
 
 Window placement: group name `G` = `--tmux-session` if given, else source
 `session_group` if non-empty, else `session_name`. A `--tmux-session` name
