@@ -57,7 +57,7 @@ type PaneProbe interface {
 type Session struct {
 	ID         ID
 	Paths      Paths
-	ProjectDir string // <ProjectsDir>/<munged launch cwd>
+	ProjectDir string // the directory the transcript is really in (see ProjectCwd)
 	Transcript string // <ProjectDir>/<id>.jsonl
 	LaunchCwd  string // first cwd in the transcript
 	WorkCwd    string // last cwd in the transcript
@@ -67,6 +67,35 @@ type Session struct {
 	State      State
 	Registry   *Registry // non-nil iff StateRunning
 	Tmux       *TmuxRef  // non-nil when a pane is known (running or suspended)
+}
+
+// ProjectCwd is the cwd whose project directory actually holds this
+// session's transcript.
+//
+// Claude Code files a transcript under projects/Munge(cwd), but a session
+// that changed directory records two cwds -- the first (LaunchCwd) and the
+// last (WorkCwd) -- and only one of them names the directory the
+// transcript is really in. ProjectDir is found by glob, so it is always
+// the truth; this reports the cwd that agrees with it.
+//
+// Everything doing project-directory arithmetic must use THIS rather than
+// LaunchCwd. On a session where the two differ, Munge(LaunchCwd) names a
+// project directory that does not exist, so a path mapping built from it
+// silently fails to apply and a destination asked to corroborate a root
+// against it can never succeed.
+//
+// The fallback is LaunchCwd -- what every caller used before this existed
+// -- so a layout matching neither (a hand-renamed project directory)
+// behaves exactly as it did.
+func (s *Session) ProjectCwd() string {
+	base := filepath.Base(s.ProjectDir)
+	if s.LaunchCwd != "" && Munge(s.LaunchCwd) == base {
+		return s.LaunchCwd
+	}
+	if s.WorkCwd != "" && Munge(s.WorkCwd) == base {
+		return s.WorkCwd
+	}
+	return s.LaunchCwd
 }
 
 // FindTranscript locates <projectsDir>/*/<id>.jsonl. Exactly one must exist.
