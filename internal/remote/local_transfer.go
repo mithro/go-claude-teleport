@@ -55,7 +55,11 @@ func (l *Local) SessionExtras(ctx context.Context, id session.ID, pm session.Pat
 	if err != nil {
 		return nil, &Error{Code: "not-found", Message: err.Error()}
 	}
-	ex := &transfer.InstallExtras{ProjectCwd: pm.ApplyPath(s.LaunchCwd)}
+	// The project directory the transcript is really in -- see
+	// session.ProjectCwd. Using LaunchCwd here filed the index merge
+	// and the project entry under a directory that does not exist
+	// whenever the session had changed directory.
+	ex := &transfer.InstallExtras{ProjectCwd: pm.ApplyPath(s.ProjectCwd())}
 	if ie, ok, err := session.ReadIndexEntry(s.ProjectDir, id); err != nil {
 		return nil, err
 	} else if ok {
