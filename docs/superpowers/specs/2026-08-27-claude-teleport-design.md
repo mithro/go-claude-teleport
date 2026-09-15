@@ -643,6 +643,7 @@ Classification:
 | Difference | Class |
 |---|---|
 | any hook difference (settings or an installed plugin's `hooks/hooks.json`) | **block** |
+| a hooks config that declares *no hook* — `{}`, `null`, `{"PreToolUse":[]}`, or any nesting of empty containers — is **absent**, not a difference, on either side | — |
 | a *used* MCP server absent on the destination or configured differently | **block** |
 | a *used* plugin absent or at a different version | **block** |
 | a *used* skill or sub-agent type absent | **block** |
@@ -654,6 +655,18 @@ Classification:
 `block` refuses at preflight (exit 3) with the full table; `--allow-config-drift`
 downgrades every block to warn. `compare-config` prints the same table
 without a session (everything is then "used").
+
+Hooks are the only unconditional block, so an empty hooks config must not
+read as a difference: a host whose `settings.json` carries `"hooks": {}`
+runs exactly as many hooks as one with no `hooks` key, and hashing those
+two differently refused every teleport between such a pair for a
+difference that changes nothing (observed x1c-work → desktop, 2026-09-14:
+`sha256("{}")` = `44136fa355b3` against `(absent)`). Emptiness is decided
+structurally — a value is empty when it holds nothing but empty containers
+— and deliberately stops there: `{"matcher":"Bash","hooks":[]}` also runs
+no hook, but recognising that means encoding Claude Code's hook schema
+into the comparison, which would rot silently the next time the schema
+moves.
 
 ## 11. Placeholder
 

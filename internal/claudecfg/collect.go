@@ -66,6 +66,77 @@ func canonical(v any) string {
 	return strings.TrimRight(buf.String(), "\n")
 }
 
+// declaresNothing reports whether a decoded JSON value configures nothing
+// at all: JSON null, or a container (however nested) holding only such
+// values. `{}`, `null`, `{"PreToolUse":[]}` and
+// `{"PreToolUse":[{"matcher":"Bash","hooks":[]}]}` all qualify — each is a
+// hooks block under which no hook ever runs. A scalar never qualifies:
+// false and 0 are values someone wrote on purpose.
+func declaresNothing(v any) bool {
+	switch x := v.(type) {
+	case nil:
+		return true
+	case map[string]any:
+		for _, e := range x {
+			if !declaresNothing(e) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		for _, e := range x {
+			if !declaresNothing(e) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// hooksHash hashes a settings.json "hooks" value, with a hooks block that
+// declares no hook hashing as absent ("").
+//
+// Hooks are the one Block-class comparison in Compare, so a difference here
+// refuses the teleport outright. A host whose settings.json carries
+// `"hooks": {}` runs exactly as many hooks as one with no hooks key — none
+// — and hashing those two differently made every teleport between such a
+// pair demand --allow-config-drift for a difference that changes nothing.
+// Observed between x1c-work and desktop, 2026-09-14: sha256("{}") =
+// 44136fa355b3 against "(absent)".
+func hooksHash(v any) string {
+	if declaresNothing(v) {
+		return ""
+	}
+	return configHash(canonical(v))
+}
+
+// hooksFileHash is FileHash for a plugin's hooks/hooks.json, except that a
+// file declaring no hook hashes as absent — the same reasoning as
+// hooksHash, for the same Block-class comparison
+// (plugin.<name>.hooks). The hash of a file that DOES declare a hook is
+// unchanged: the raw content, so formatting-only edits still register.
+// A file that is not JSON at all falls back to the content hash rather
+// than failing the teleport; deciding it is malformed is Claude Code's
+// business, not this comparison's.
+func hooksFileHash(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("hash %s: %w", path, err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err == nil && declaresNothing(v) {
+		return "", nil
+	}
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:]), nil
+}
+
 // readObject decodes a JSON object file; absent -> (nil,false,nil).
 func readObject(path string) (map[string]any, bool, error) {
 	data, err := os.ReadFile(path)
@@ -217,7 +288,7 @@ func Collect(p session.Paths, cwd, host, claudeVersion string) (*Inventory, erro
 		return nil, err
 	} else if ok {
 		if hooks, present := s["hooks"]; present {
-			inv.HooksHash = configHash(canonical(hooks))
+			inv.HooksHash = hooksHash(hooks)
 		}
 		if perm, _ := s["permissions"].(map[string]any); perm != nil {
 			inv.Permissions = Permissions{DefaultMode: stringOf(perm["defaultMode"]),
@@ -267,7 +338,7 @@ func Collect(p session.Paths, cwd, host, claudeVersion string) (*Inventory, erro
 			pi := PluginInfo{Version: stringOf(entry["version"])}
 			if install := stringOf(entry["installPath"]); install != "" {
 				var err error
-				if pi.HooksHash, err = FileHash(filepath.Join(install, "hooks", "hooks.json")); err != nil {
+				if pi.HooksHash, err = hooksFileHash(filepath.Join(install, "hooks", "hooks.json")); err != nil {
 					return nil, err
 				}
 				if pi.MCPHash, err = FileHash(filepath.Join(install, ".mcp.json")); err != nil {
