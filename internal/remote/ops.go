@@ -99,6 +99,10 @@ type GitDestStateResult struct {
 type InventoryTmuxArgs struct {
 	Ref             *session.TmuxRef `json:"ref"`
 	PreferredSocket string           `json:"preferred_socket"`
+	// TargetSession is the session the window will open in, so discovery
+	// can prefer a server that already holds it (protocol 4). Empty from a
+	// protocol-3 peer, which simply means the old name-only precedence.
+	TargetSession string `json:"target_session"`
 }
 type InventoryTmuxResult struct {
 	Facts *tmuxx.Facts `json:"facts"`

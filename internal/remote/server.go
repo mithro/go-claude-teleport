@@ -138,7 +138,7 @@ var plan02Ops = map[string]handler{
 		if err != nil {
 			return nil, err
 		}
-		f, err := ep.InventoryTmux(ctx, a.Ref, a.PreferredSocket)
+		f, err := ep.InventoryTmux(ctx, a.Ref, a.PreferredSocket, a.TargetSession)
 		return InventoryTmuxResult{Facts: f}, err
 	},
 	OpManifestDiff: func(ctx context.Context, ep Endpoint, args json.RawMessage) (any, error) {

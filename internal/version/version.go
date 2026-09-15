@@ -33,4 +33,15 @@ var Version = "dev"
 //   - transfer.Entry gained Deferred, which changes how the destination
 //     classifies an entry; a 2 peer drops it and would refuse the
 //     existing-main git entries as collisions.
-const Protocol = 3
+//
+// Bumped to 4 by the multi-server tmux work: InventoryTmuxArgs gained
+// TargetSession, the session the destination window will open in. The
+// destination uses it to prefer a live tmux server that already holds that
+// session over one that merely shares the source's socket name
+// (tmuxx.FindServerForSession). A protocol-3 peer never sends the field, so
+// it would silently fall back to name-only discovery — refusing with "use
+// --tmux-socket NAME" on a host running several servers where the answer
+// was discoverable, or opening a second session of that name on the wrong
+// server. Both are wrong answers rather than errors, which is exactly the
+// kind of mismatch the protocol version exists to prevent.
+const Protocol = 4

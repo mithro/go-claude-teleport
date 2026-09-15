@@ -27,7 +27,7 @@ type Endpoint interface {
 	InventoryGit(ctx context.Context, cwd string) (*gitx.Info, error)
 	GitDestState(ctx context.Context, mainDir, worktreeDir, branch string) (*gitx.DestState, error)
 	GitSourceFacts(ctx context.Context, mainDir, indexRel, tip, destTip string) (*gitx.SourceFacts, error)
-	InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket string) (*tmuxx.Facts, error)
+	InventoryTmux(ctx context.Context, ref *session.TmuxRef, preferredSocket, targetSession string) (*tmuxx.Facts, error)
 	TmuxSessions(ctx context.Context, socketPath string) ([]tmuxx.SessionInfo, error)
 	ListSessions(ctx context.Context) ([]SessionSummary, error)
 
