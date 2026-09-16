@@ -229,6 +229,20 @@ func (f *fakeTmux) runLocked(cmd string) (out []string, err error, trig *exitTri
 			return []string{"off"}, nil, nil
 		}
 		return nil, fmt.Errorf("show-options: no window %q", flag(a, "-t")), nil
+	case "list-windows":
+		// A window NAME cannot be a tmux target when it contains a dot,
+		// so tmuxx resolves names to window ids through this.
+		sess := strings.TrimPrefix(flag(a, "-t"), "=")
+		if _, ok := f.sessions[sess]; !ok {
+			return nil, fmt.Errorf("can't find session: %s", sess), nil
+		}
+		var out []string
+		for _, w := range f.windows {
+			if w.session == sess {
+				out = append(out, w.id+"\t"+w.name)
+			}
+		}
+		return out, nil, nil
 	case "list-panes":
 		format := flag(a, "-F")
 		target := flag(a, "-t")
@@ -238,6 +252,8 @@ func (f *fakeTmux) runLocked(cmd string) (out []string, err error, trig *exitTri
 			switch {
 			case target == "" && contains(a, "-a"):
 				out = append(out, f.describe(w, p, format))
+			case target == p.windowID:
+				out = append(out, p.id)
 			case target == p.id:
 				out = append(out, strconv.Itoa(p.cmd.Process.Pid))
 			case strings.HasPrefix(target, "="):

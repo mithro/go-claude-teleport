@@ -42,7 +42,11 @@ func (p *prober) FindWindow(sess, window string) ([]string, error) {
 	}
 	target := "=" + stored + ":" + window
 	if _, err := strconv.Atoi(window); err != nil {
-		target = "=" + stored + ":=" + window // exact window-name match
+		id, err := p.resolveWindowName(stored, window)
+		if err != nil {
+			return nil, fmt.Errorf("window %s %s: %w", sess, window, err)
+		}
+		target = id
 	}
 	lines, err := p.t.Run(p.ctx, fmt.Sprintf(`list-panes -t %s -F "#{pane_id}"`, Quote(target)))
 	if err != nil {
@@ -58,6 +62,48 @@ func (p *prober) FindWindow(sess, window string) ([]string, error) {
 		return nil, fmt.Errorf("window %s %s: no panes", sess, window)
 	}
 	return out, nil
+}
+
+// resolveWindowName maps a window NAME to its tmux window id ("@N").
+//
+// A tmux target is "<session>:<window>.<pane>", so tmux splits a target at
+// the dot — and a name containing one can never be targeted by name. Real
+// case (2026-09-17): window "tt mech f.o" in session "tt" gave
+//
+//	can't find window: tt mech f
+//
+// tmux having taken ".o" for a pane specifier. A window id is
+// server-global, unambiguous and dot-free, so that is what gets targeted.
+//
+// The name is matched the way session names are (R-PRB-9): tmux stores the
+// vis(3)-encoded spelling while a human types the plain one, so either is
+// accepted. A name shared by two windows of the session is an error rather
+// than a silent pick — the error names the candidates so the caller can
+// re-run with an index.
+func (p *prober) resolveWindowName(storedSession, typed string) (string, error) {
+	lines, err := p.t.Run(p.ctx, fmt.Sprintf("list-windows -t %s -F \"#{window_id}\t#{window_name}\"",
+		Quote("="+storedSession)))
+	if err != nil {
+		return "", fmt.Errorf("list-windows: %w", err)
+	}
+	var ids []string
+	for _, l := range lines {
+		id, name, ok := strings.Cut(l, "\t")
+		if !ok {
+			continue
+		}
+		if name == typed || UnvisName(name) == typed {
+			ids = append(ids, id)
+		}
+	}
+	switch len(ids) {
+	case 0:
+		return "", fmt.Errorf("no window named %q in session %s", typed, storedSession)
+	case 1:
+		return ids[0], nil
+	}
+	return "", fmt.Errorf("session %s has %d windows named %q (%s); use the window index instead",
+		storedSession, len(ids), typed, strings.Join(ids, ", "))
 }
 
 // resolveSessionName maps a human-typed tmux session name to tmux's
