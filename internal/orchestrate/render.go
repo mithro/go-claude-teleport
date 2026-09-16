@@ -17,7 +17,10 @@ import (
 func (p *Plan) Render(w io.Writer) {
 	s := p.Session
 	fmt.Fprintf(w, "Session  %s (%s) on %s\n", s.ID.Short(), s.State, p.SourceInfo.Hostname)
-	fmt.Fprintf(w, "  cwd    %s\n", s.LaunchCwd)
+	// The project cwd, not the launch cwd: every decision below this line
+	// is made from it, so naming anything else describes a teleport that
+	// is not the one about to run.
+	fmt.Fprintf(w, "  cwd    %s\n", s.ProjectCwd())
 	if s.Branch != "" {
 		fmt.Fprintf(w, "  branch %s\n", s.Branch)
 	}
