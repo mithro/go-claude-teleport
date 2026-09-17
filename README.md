@@ -62,9 +62,11 @@ apt repository is published at `https://mith.ro/go-claude-teleport/`:
 
 ```sh
 sudo install -d -m0755 /etc/apt/keyrings
+# The published key is ASCII-armored despite its .gpg name, so it must be
+# stored as .asc — see below.
 curl -fsSL https://mith.ro/go-claude-teleport/go-claude-teleport.gpg \
-  | sudo tee /etc/apt/keyrings/mithro-go-claude-teleport.gpg > /dev/null
-echo "deb [signed-by=/etc/apt/keyrings/mithro-go-claude-teleport.gpg] https://mith.ro/go-claude-teleport/trixie/ ./" \
+  | sudo tee /etc/apt/keyrings/mithro-go-claude-teleport.asc > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/mithro-go-claude-teleport.asc] https://mith.ro/go-claude-teleport/trixie/ ./" \
   | sudo tee /etc/apt/sources.list.d/mithro-go-claude-teleport.list
 sudo apt update && sudo apt install claude-teleport
 ```
@@ -73,6 +75,22 @@ Each suite (`trixie/`, `sid/`) is its own flat repository, so the trailing
 `./` stays and the suite goes in the URL. The package is a static binary
 with no suite-specific dependencies, so the two carry identical contents —
 pick either on a derivative or a newer Debian (Ubuntu, forky, …).
+
+**Store the key as `.asc`, not `.gpg`.** apt ties the extension to the
+format: `.gpg` must be a binary keyring, `.asc` must be ASCII-armored. The
+key this repository publishes is armored (it begins `-----BEGIN PGP PUBLIC
+KEY BLOCK-----`) even though it is served under a `.gpg` name, so saving
+it as `.gpg` mis-types it. Older apt warns and carries on; apt 3.x
+(Ubuntu 26.04 and up) ignores the file and the repository then reads as
+unsigned:
+
+```
+W: The key(s) in the keyring /etc/apt/keyrings/mithro-go-claude-teleport.gpg
+   are ignored as the file has an unsupported filetype.
+E: The repository '…' is not signed.
+```
+
+`.asc` needs nothing installed, unlike converting with `gpg --dearmor`.
 
 Or build it yourself:
 
