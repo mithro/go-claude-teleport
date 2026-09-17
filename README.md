@@ -80,8 +80,7 @@ pick either on a derivative or a newer Debian (Ubuntu, forky, …).
 format: `.gpg` must be a binary keyring, `.asc` must be ASCII-armored. The
 key this repository publishes is armored (it begins `-----BEGIN PGP PUBLIC
 KEY BLOCK-----`) even though it is served under a `.gpg` name, so saving
-it as `.gpg` mis-types it. Older apt warns and carries on; apt 3.x
-(Ubuntu 26.04 and up) ignores the file and the repository then reads as
+it as `.gpg` mis-types it, and on many hosts the repository then reads as
 unsigned:
 
 ```
@@ -89,6 +88,15 @@ W: The key(s) in the keyring /etc/apt/keyrings/mithro-go-claude-teleport.gpg
    are ignored as the file has an unsupported filetype.
 E: The repository '…' is not signed.
 ```
+
+**Which hosts** is decided by the OpenPGP verifier apt uses, not by the
+apt version. apt prefers `sqv` (Sequoia) when it is installed, and `sqv`
+reads armored and binary keyrings alike; without it apt falls back to
+`gpgv`, which rejects an armored keyring outright (`invalid packet
+(ctb=2d)` — `0x2d` is the armor's leading `-`). So a host with `sqv`
+never notices, and a host without it cannot install at all. Debian 13
+ships `sqv`; a stock Ubuntu does not. Checking `command -v sqv` predicts
+the outcome; the apt version does not.
 
 `.asc` needs nothing installed, unlike converting with `gpg --dearmor`.
 
