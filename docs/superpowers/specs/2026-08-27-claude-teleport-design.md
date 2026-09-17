@@ -130,9 +130,34 @@ path that was never transferred.
 and CI can use throw-away config dirs), `HOME`, `CLAUDE_CODE_SESSION_ID`,
 `CLAUDE_PID`, `TMUX`, `TMUX_PANE`, `SSH_AUTH_SOCK`.
 
+**One transcript, two names.** A project directory can be reached by more
+than one path. When a session's work moves to another repository, the new
+`Munge(cwd)` name symlinked at the directory already holding the
+transcript keeps the one file reachable from both cwds, so the session
+keeps its history instead of starting a second transcript.
+`filepath.Glob` expands path components textually and never resolves a
+symlink, so it returns that file once per spelling: hits are therefore
+grouped by **file identity** (`os.SameFile`, i.e. dev+inode), not by path.
+Two genuinely different files sharing a session id remain an error —
+collapsing those would pick one session's history at random. Which
+spelling then becomes `ProjectDir` decides everything `ProjectCwd` feeds,
+so the work cwd's spelling wins: that is where the pane is and where
+Claude Code is appending.
+
 **Resume semantics**: `claude --resume <sid>` is run from the session's
-launch cwd (the first `cwd` in the transcript); the built-in placeholder
-`chdir`s there before exec, as go-tmux-saver's `claude-resume` does.
+project cwd — `claude --resume` is project-scoped, resolving the id
+against the project matching the *current* directory's munged name, so any
+other directory fails to resolve it. The built-in placeholder `chdir`s
+there before exec (as go-tmux-saver's `claude-resume` does), offering both
+recorded cwds to that same rule and refusing one that no longer exists.
+
+**Targeting a tmux window.** A tmux target is
+`<session>:<window>.<pane>`, so tmux splits at the dot and a window whose
+*name* contains one can never be selected by name. Named windows are
+resolved to their window id (`@N`) first — server-global, unambiguous and
+dot-free — matching the stored and decoded spellings as R-PRB-9 does for
+session names, and refusing a name two windows share rather than picking
+one.
 
 ## 4. Architecture
 
