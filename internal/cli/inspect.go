@@ -63,11 +63,14 @@ func summarizePlan(p *orchestrate.Plan) *planSummary {
 // a safe summary of the preflight plan and drift table against that
 // destination, or the refusal reason.
 type inspectReport struct {
-	ID         string              `json:"id"`
-	State      string              `json:"state"`
-	Name       string              `json:"name,omitempty"`
-	LaunchCwd  string              `json:"launch_cwd"`
-	WorkCwd    string              `json:"work_cwd"`
+	ID        string `json:"id"`
+	State     string `json:"state"`
+	Name      string `json:"name,omitempty"`
+	LaunchCwd string `json:"launch_cwd"`
+	WorkCwd   string `json:"work_cwd"`
+	// ProjectCwd is the one a teleport acts on: the cwd whose project
+	// directory really holds the transcript (session.ProjectCwd).
+	ProjectCwd string              `json:"project_cwd"`
 	Branch     string              `json:"branch"`
 	Version    string              `json:"claude_version"`
 	Transcript string              `json:"transcript"`
@@ -146,7 +149,7 @@ job's own manifest is left untouched.`,
 			}
 			rep := &inspectReport{
 				ID: string(sess.ID), State: sess.State.String(), Name: sess.Name,
-				LaunchCwd: sess.LaunchCwd, WorkCwd: sess.WorkCwd, Branch: sess.Branch,
+				LaunchCwd: sess.LaunchCwd, WorkCwd: sess.WorkCwd, ProjectCwd: sess.ProjectCwd(), Branch: sess.Branch,
 				Version: sess.Version, Transcript: sess.Transcript, Registry: sess.Registry,
 				Tmux: sess.Tmux, Files: inv.Files, Memory: inv.Memory, Skipped: inv.Skipped, Usage: usage,
 			}
@@ -156,7 +159,10 @@ job's own manifest is left untouched.`,
 			for _, f := range append(append([]session.FileEntry{}, inv.Files...), inv.Memory...) {
 				rep.TotalBytes += f.Size
 			}
-			if gi, gerr := gitx.Inspect(sess.LaunchCwd); gerr != nil {
+			// The repository a teleport would move is the one at the
+			// PROJECT cwd; inspecting the launch cwd of a session that
+			// changed directory reports on a directory nothing touches.
+			if gi, gerr := gitx.Inspect(sess.ProjectCwd()); gerr != nil {
 				if !errors.Is(gerr, gitx.ErrNotRepo) {
 					rep.GitError = gerr.Error()
 				}
@@ -298,7 +304,7 @@ func renderInspect(w io.Writer, rep *inspectReport, host string, plan *orchestra
 	case rep.GitError != "":
 		fmt.Fprintf(w, "\nGit     error: %s\n", rep.GitError)
 	default:
-		fmt.Fprintf(w, "\nGit     not a git repository (%s is copied as plain files)\n", rep.LaunchCwd)
+		fmt.Fprintf(w, "\nGit     not a git repository (%s is copied as plain files)\n", rep.ProjectCwd)
 	}
 
 	if rep.Usage != nil {

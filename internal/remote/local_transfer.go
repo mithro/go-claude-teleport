@@ -55,7 +55,11 @@ func (l *Local) SessionExtras(ctx context.Context, id session.ID, pm session.Pat
 	if err != nil {
 		return nil, &Error{Code: "not-found", Message: err.Error()}
 	}
-	ex := &transfer.InstallExtras{ProjectCwd: pm.ApplyPath(s.LaunchCwd)}
+	// The project directory the transcript is really in -- see
+	// session.ProjectCwd. Using LaunchCwd here filed the index merge
+	// and the project entry under a directory that does not exist
+	// whenever the session had changed directory.
+	ex := &transfer.InstallExtras{ProjectCwd: pm.ApplyPath(s.ProjectCwd())}
 	if ie, ok, err := session.ReadIndexEntry(s.ProjectDir, id); err != nil {
 		return nil, err
 	} else if ok {
@@ -74,12 +78,17 @@ func (l *Local) SessionExtras(ctx context.Context, id session.ID, pm session.Pat
 		}
 		ex.History = append(ex.History, bytes.TrimSpace(out.Bytes()))
 	}
-	if pe, ok, err := session.ReadProjectEntry(l.paths.GlobalJSON, s.LaunchCwd); err != nil {
+	// The project entry and the trust dialog both belong to the directory
+	// the destination relaunches Claude in, which is the project cwd --
+	// reading the launch cwd grants trust somewhere the resumed Claude
+	// never opens, leaving it at the first-run dialog.
+	projectCwd := s.ProjectCwd()
+	if pe, ok, err := session.ReadProjectEntry(l.paths.GlobalJSON, projectCwd); err != nil {
 		return nil, err
 	} else if ok {
 		ex.ProjectEntry = pe
 	}
-	if err := l.findTrust(s.LaunchCwd, ex, pm); err != nil {
+	if err := l.findTrust(projectCwd, ex, pm); err != nil {
 		return nil, err
 	}
 	return ex, nil

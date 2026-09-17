@@ -42,20 +42,30 @@ func shortenHome(home, p string) string {
 
 // ChdirTarget returns the directory to resume from, or "". `claude --resume`
 // is project-scoped: it resolves the id against the project matching the
-// CURRENT directory's munged name, so the pane must cd back to the launch
-// cwd (when it still exists and really is the transcript's project).
+// CURRENT directory's munged name, so the pane must cd back to the cwd
+// whose munged name IS the transcript's project directory — provided it
+// still exists.
+//
+// A session that changed directory records two cwds and is filed under
+// only one of them (session.ProjectCwd), so both are offered to the same
+// rule, launch cwd first. Offering only the launch cwd made every such
+// session fail the check and resume from wherever the pane happened to be,
+// where the id does not resolve.
 func ChdirTarget(m session.Meta, transcript string) string {
-	cwd := m.LaunchCwd
-	if cwd == "" || transcript == "" {
+	if transcript == "" {
 		return ""
 	}
-	if fi, err := os.Stat(cwd); err != nil || !fi.IsDir() {
-		return ""
+	want := filepath.Base(filepath.Dir(transcript))
+	for _, cwd := range []string{m.LaunchCwd, m.WorkCwd} {
+		if cwd == "" || session.Munge(cwd) != want {
+			continue
+		}
+		if fi, err := os.Stat(cwd); err != nil || !fi.IsDir() {
+			continue
+		}
+		return cwd
 	}
-	if session.Munge(cwd) != filepath.Base(filepath.Dir(transcript)) {
-		return ""
-	}
-	return cwd
+	return ""
 }
 
 // Render writes the banner. tty enables ANSI styling.

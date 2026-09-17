@@ -28,7 +28,11 @@ func (a *app) resolveSessionCwdUsage(sel string) (*session.Session, string, *ses
 		if s, err = a.resolveSession(strings.Fields(sel)); err != nil {
 			return nil, "", nil, err
 		}
-		cwd = s.LaunchCwd
+		// The cwd preflight compares from: the project cwd, whose entry
+		// supplies the project-scoped MCP servers and allowed tools. The
+		// launch cwd of a session that changed directory usually has no
+		// entry at all, so comparing from it drops those rows silently.
+		cwd = s.ProjectCwd()
 	} else if cwd == "" {
 		if cwd, err = os.Getwd(); err != nil {
 			return nil, "", nil, Exit(ExitFailed, "getwd: %v", err)

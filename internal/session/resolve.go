@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -57,7 +58,7 @@ type PaneProbe interface {
 type Session struct {
 	ID         ID
 	Paths      Paths
-	ProjectDir string // <ProjectsDir>/<munged launch cwd>
+	ProjectDir string // the directory the transcript is really in (see ProjectCwd)
 	Transcript string // <ProjectDir>/<id>.jsonl
 	LaunchCwd  string // first cwd in the transcript
 	WorkCwd    string // last cwd in the transcript
@@ -69,33 +70,138 @@ type Session struct {
 	Tmux       *TmuxRef  // non-nil when a pane is known (running or suspended)
 }
 
-// FindTranscript locates <projectsDir>/*/<id>.jsonl. Exactly one must exist.
+// ProjectCwd is the cwd whose project directory actually holds this
+// session's transcript.
+//
+// Claude Code files a transcript under projects/Munge(cwd), but a session
+// that changed directory records two cwds -- the first (LaunchCwd) and the
+// last (WorkCwd) -- and only one of them names the directory the
+// transcript is really in. ProjectDir is found by glob, so it is always
+// the truth; this reports the cwd that agrees with it.
+//
+// Everything doing project-directory arithmetic must use THIS rather than
+// LaunchCwd. On a session where the two differ, Munge(LaunchCwd) names a
+// project directory that does not exist, so a path mapping built from it
+// silently fails to apply and a destination asked to corroborate a root
+// against it can never succeed.
+//
+// The fallback is LaunchCwd -- what every caller used before this existed
+// -- so a layout matching neither (a hand-renamed project directory)
+// behaves exactly as it did.
+func (s *Session) ProjectCwd() string {
+	base := filepath.Base(s.ProjectDir)
+	if s.LaunchCwd != "" && Munge(s.LaunchCwd) == base {
+		return s.LaunchCwd
+	}
+	if s.WorkCwd != "" && Munge(s.WorkCwd) == base {
+		return s.WorkCwd
+	}
+	return s.LaunchCwd
+}
+
+// FindTranscript locates <projectsDir>/*/<id>.jsonl. Exactly one FILE must
+// exist; see findTranscripts for why that is not the same as one path.
 func FindTranscript(projectsDir string, id ID) (string, error) {
+	hits, err := findTranscripts(projectsDir, id)
+	if err != nil {
+		return "", err
+	}
+	return hits[0], nil
+}
+
+// findTranscripts returns every path under projectsDir that names the
+// session's transcript, sorted, and errors unless they all name the same
+// file.
+//
+// One directory can be reached by several names. Claude Code files a
+// transcript under projects/Munge(cwd), so a session whose work moves to
+// another repository would start a second transcript -- unless the new
+// munged name is a symlink to the directory already holding the first, at
+// which point the one file is reachable by both spellings and the session
+// keeps its history.
+//
+// filepath.Glob expands path components textually and never resolves a
+// symlink, so it returns that file once per spelling. Counting the hits
+// called this an ambiguous session and refused to touch it; identity is
+// what matters, so compare with os.SameFile (dev+inode) instead. Two
+// genuinely different files sharing an id stay an error -- collapsing
+// those would pick one session's history at random.
+func findTranscripts(projectsDir string, id ID) ([]string, error) {
 	hits, err := filepath.Glob(filepath.Join(projectsDir, "*", string(id)+".jsonl"))
 	if err != nil {
-		return "", fmt.Errorf("glob transcripts under %s: %w", projectsDir, err)
+		return nil, fmt.Errorf("glob transcripts under %s: %w", projectsDir, err)
 	}
-	switch len(hits) {
+
+	// One group per distinct file, each holding that file's spellings.
+	var infos []os.FileInfo
+	var groups [][]string
+	for _, h := range hits {
+		fi, err := os.Stat(h)
+		if err != nil {
+			continue // vanished, or a dangling symlink: not a transcript
+		}
+		placed := false
+		for i, seen := range infos {
+			if os.SameFile(fi, seen) {
+				groups[i] = append(groups[i], h)
+				placed = true
+				break
+			}
+		}
+		if !placed {
+			infos = append(infos, fi)
+			groups = append(groups, []string{h})
+		}
+	}
+
+	switch len(groups) {
 	case 0:
-		return "", fmt.Errorf("%w: no transcript %s.jsonl under %s", ErrNotFound, id, projectsDir)
+		return nil, fmt.Errorf("%w: no transcript %s.jsonl under %s", ErrNotFound, id, projectsDir)
 	case 1:
-		return hits[0], nil
+		return groups[0], nil
 	default:
-		return "", fmt.Errorf("session %s has %d transcripts under %s: %s", id, len(hits), projectsDir, strings.Join(hits, ", "))
+		return nil, fmt.Errorf("session %s has %d transcripts under %s: %s", id, len(groups), projectsDir, strings.Join(hits, ", "))
 	}
+}
+
+// pickSpelling chooses which of several names for one transcript roots the
+// session.
+//
+// It decides ProjectDir, and everything downstream follows: ProjectCwd
+// reads it back, and from that come the destination cwd, the repository
+// transferred, and the directory the resumed Claude is launched in. The
+// work cwd is where the session actually is -- its pane is there and
+// Claude Code is appending there -- so that spelling wins. Rooting at the
+// launch cwd would move the repository the session has left.
+func pickSpelling(paths []string, meta Meta) string {
+	for _, cwd := range []string{meta.WorkCwd, meta.LaunchCwd} {
+		if cwd == "" {
+			continue
+		}
+		want := Munge(cwd)
+		for _, p := range paths {
+			if filepath.Base(filepath.Dir(p)) == want {
+				return p
+			}
+		}
+	}
+	return paths[0]
 }
 
 // Load reads an already-known session (by id) from disk; State is Idle
 // unless the registry (with a live pid) or a placeholder pane says otherwise.
 func Load(p Paths, id ID, probe PaneProbe) (*Session, error) {
-	transcript, err := FindTranscript(p.ProjectsDir(), id)
+	spellings, err := findTranscripts(p.ProjectsDir(), id)
 	if err != nil {
 		return nil, err
 	}
-	meta, err := ReadMeta(transcript)
+	// Every spelling is the same file, so the metadata is read once and
+	// only then decides which of them roots the session.
+	meta, err := ReadMeta(spellings[0])
 	if err != nil {
 		return nil, err
 	}
+	transcript := pickSpelling(spellings, meta)
 	s := &Session{ID: id, Paths: p, ProjectDir: filepath.Dir(transcript), Transcript: transcript,
 		LaunchCwd: meta.LaunchCwd, WorkCwd: meta.WorkCwd, Branch: meta.Branch, Version: meta.Version, State: StateIdle}
 	regs, err := ReadRegistry(p.SessionsDir())

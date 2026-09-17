@@ -59,11 +59,22 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 		return nil, err
 	}
 
+	// Everything below roots at the cwd whose project directory actually
+	// holds this session's transcript, NOT at the first cwd the transcript
+	// happens to record. A session that changed directory -- claude started
+	// in a container directory or a main checkout, the work done in a repo
+	// or linked worktree below it -- has the two disagree, and rooting at
+	// the launch cwd then transferred the wrong tree entirely: the whole
+	// container directory as loose files in the first case, the main
+	// checkout without the worktree the session lives in in the second.
+	// See session.ProjectCwd.
+	projectCwd := sess.ProjectCwd()
+
 	// Path map (spec §7.2), longest prefix first.
 	var maps []session.Mapping
 	maps = append(maps, o.Maps...)
 	if o.DestPath != "" {
-		maps = append(maps, session.Mapping{From: sess.LaunchCwd, To: o.DestPath})
+		maps = append(maps, session.Mapping{From: projectCwd, To: o.DestPath})
 	}
 	if p.SourceInfo.Home != p.DestInfo.Home {
 		maps = append(maps, session.Mapping{From: p.SourceInfo.Home, To: p.DestInfo.Home})
@@ -72,7 +83,7 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 		maps = append(maps, session.Mapping{From: p.SourceInfo.DataDir, To: p.DestInfo.DataDir})
 	}
 	p.PathMap = session.NewPathMap(maps...)
-	p.DestCwd = p.PathMap.ApplyPath(sess.LaunchCwd)
+	p.DestCwd = p.PathMap.ApplyPath(projectCwd)
 
 	// Spec §7.2 ruling R-P3-18a: the mappings above only rewrite a leading
 	// path PREFIX, so they cannot reach inside a Munge()'d project-directory
@@ -84,7 +95,7 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 	// prefix-first ordering makes it win for entries whose Root sits under
 	// projects/<munged> (CatSession/memory manifest entries, and the
 	// rewritten sessions-index fullPath in SessionExtras).
-	srcProjectDir := src.Paths().ProjectDir(sess.LaunchCwd)
+	srcProjectDir := src.Paths().ProjectDir(projectCwd)
 	dstProjectDir := dst.Paths().ProjectDir(p.DestCwd)
 	if srcProjectDir != dstProjectDir {
 		maps = append(maps, session.Mapping{From: srcProjectDir, To: dstProjectDir})
@@ -97,7 +108,7 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 	if sess.Registry != nil && sess.Registry.Version != "" {
 		srcVersion = sess.Registry.Version
 	}
-	srcCfg, err := src.InventoryHost(ctx, sess.LaunchCwd, srcVersion)
+	srcCfg, err := src.InventoryHost(ctx, projectCwd, srcVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -116,10 +127,10 @@ func Preflight(ctx context.Context, o Options, src, dst remote.Endpoint, jobID s
 	}
 
 	// Git (spec §8).
-	gi, err := src.InventoryGit(ctx, sess.LaunchCwd)
+	gi, err := src.InventoryGit(ctx, projectCwd)
 	switch {
 	case isCode(err, "not-found"):
-		p.Git = &gitx.Plan{Mode: gitx.ModeNotRepo, SrcWorktree: sess.LaunchCwd, DstWorktree: p.DestCwd, PackEntryID: gitx.NoEntry, IndexEntryID: gitx.NoEntry}
+		p.Git = &gitx.Plan{Mode: gitx.ModeNotRepo, SrcWorktree: projectCwd, DstWorktree: p.DestCwd, PackEntryID: gitx.NoEntry, IndexEntryID: gitx.NoEntry}
 	case err != nil:
 		return nil, err
 	default:

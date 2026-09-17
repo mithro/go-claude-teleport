@@ -67,7 +67,7 @@ this format is undocumented and evolves, every assumption here is a test.
 | `projects/<munged-cwd>/<sid>/subagents/agent-*.jsonl`, `*.meta.json` | sub-agent transcripts | yes |
 | `projects/<munged-cwd>/<sid>/tool-results/*.txt` | persisted large tool outputs | yes |
 | `projects/<munged-cwd>/sessions-index.json` | `{version, entries:[{sessionId, fullPath, fileMtime, firstPrompt, summary, messageCount, created, modified, gitBranch, projectPath, isSidechain}], originalPath}` | the session's entry is merged |
-| `projects/<munged-cwd>/memory/` | auto-memory for the project (shared by all sessions of that project) | copied only if absent on the destination; otherwise diffed and reported |
+| `projects/<munged-cwd>/memory/` | auto-memory for the project (shared by all sessions of that project) | copied only if absent on the destination; a diverging file is reported and left alone, except `MEMORY.md` — see below |
 | `file-history/<sid>/<hash>@v<N>` | backups of edited files | yes |
 | `tasks/<sid>/*.json`, `.lock` | task list | yes (lock excluded) |
 | `session-env/<sid>/` | per-session env snapshots | yes |
@@ -101,6 +101,27 @@ and `.` replaced by `-` (`/home/alice/github/x/.worktrees/y` →
 `-home-alice-github-x--worktrees-y`). A worktree session therefore has its
 own project directory, distinct from the main checkout's.
 
+**Which cwd names the project directory.** A transcript records a cwd per
+record, so a session that changed directory has a *first* (`LaunchCwd`)
+and a *last* (`WorkCwd`), and only one of them names the directory the
+transcript is actually filed in. `session.ProjectCwd` reports whichever
+agrees with the real directory (found by glob, so always the truth),
+falling back to `LaunchCwd`. **Everything that does project-directory
+arithmetic uses it** — the path map, the destination cwd, the git
+inventory root, the index merge, the project entry — because on a session
+where the two differ, `Munge(LaunchCwd)` names a directory that does not
+exist.
+
+This is not a corner case: of 15 live sessions surveyed on one host,
+**11** had the two disagree — claude started in a container directory or a
+main checkout, with the work done in a repository or linked worktree
+below it. Rooting at `LaunchCwd` transferred the wrong tree entirely:
+the whole container directory as loose files in the first case (491,141
+entries, then refused because a pre-existing root cannot be corroborated
+against a transcript filed elsewhere), and the main checkout *without*
+the worktree the session lives in in the second, so it resumed into a
+path that was never transferred.
+
 **Environment inside a session** (what `! claude-teleport` sees):
 `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`, `CLAUDE_CODE_EXECPATH`
 (`…/versions/<ver>`), `CLAUDECODE=1`, `TMUX`, `TMUX_PANE`.
@@ -109,9 +130,34 @@ own project directory, distinct from the main checkout's.
 and CI can use throw-away config dirs), `HOME`, `CLAUDE_CODE_SESSION_ID`,
 `CLAUDE_PID`, `TMUX`, `TMUX_PANE`, `SSH_AUTH_SOCK`.
 
+**One transcript, two names.** A project directory can be reached by more
+than one path. When a session's work moves to another repository, the new
+`Munge(cwd)` name symlinked at the directory already holding the
+transcript keeps the one file reachable from both cwds, so the session
+keeps its history instead of starting a second transcript.
+`filepath.Glob` expands path components textually and never resolves a
+symlink, so it returns that file once per spelling: hits are therefore
+grouped by **file identity** (`os.SameFile`, i.e. dev+inode), not by path.
+Two genuinely different files sharing a session id remain an error —
+collapsing those would pick one session's history at random. Which
+spelling then becomes `ProjectDir` decides everything `ProjectCwd` feeds,
+so the work cwd's spelling wins: that is where the pane is and where
+Claude Code is appending.
+
 **Resume semantics**: `claude --resume <sid>` is run from the session's
-launch cwd (the first `cwd` in the transcript); the built-in placeholder
-`chdir`s there before exec, as go-tmux-saver's `claude-resume` does.
+project cwd — `claude --resume` is project-scoped, resolving the id
+against the project matching the *current* directory's munged name, so any
+other directory fails to resolve it. The built-in placeholder `chdir`s
+there before exec (as go-tmux-saver's `claude-resume` does), offering both
+recorded cwds to that same rule and refusing one that no longer exists.
+
+**Targeting a tmux window.** A tmux target is
+`<session>:<window>.<pane>`, so tmux splits at the dot and a window whose
+*name* contains one can never be selected by name. Named windows are
+resolved to their window id (`@N`) first — server-global, unambiguous and
+dot-free — matching the stored and decoded spellings as R-PRB-9 does for
+session names, and refusing a name two windows share rather than picking
+one.
 
 ## 4. Architecture
 
@@ -666,6 +712,21 @@ Classification:
 | Claude version differs | warn |
 | model, effortLevel, unused MCP servers/plugins/skills, `allowedTools`, `env`, keybindings, CLAUDE.md/agents/commands trees | warn |
 | destination lacks the project entry | info (it is carried over) |
+
+### Project memory
+
+A diverging memory file is KEPT: a project's memories belong to every
+session of that project, so the destination's copy is as real as the
+source's, and the plan reports it rather than replacing it.
+
+`MEMORY.md` is the one exception, because it is an *index* — one pointer
+line per memory file — and memory files absent on the destination ARE
+copied. Leaving the index alone therefore lands new memory files on disk
+and listed nowhere, which is how a memory is found; the copy would be
+useless. It is merged instead: destination lines and their order are
+untouched, source lines it does not already carry are appended, and a
+merge with nothing to add does not rewrite the file. Nothing there can
+lose a memory — the worst case is an index listing something twice.
 
 `block` refuses at preflight (exit 3) with the full table; `--allow-config-drift`
 downgrades every block to warn. `compare-config` prints the same table
