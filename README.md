@@ -61,12 +61,18 @@ Static binaries and `.deb` packages are attached to every
 apt repository is published at `https://mith.ro/go-claude-teleport/`:
 
 ```sh
+sudo install -d -m0755 /etc/apt/keyrings
 curl -fsSL https://mith.ro/go-claude-teleport/go-claude-teleport.gpg \
   | sudo tee /etc/apt/keyrings/mithro-go-claude-teleport.gpg > /dev/null
-echo "deb [signed-by=/etc/apt/keyrings/mithro-go-claude-teleport.gpg] https://mith.ro/go-claude-teleport/ ./" \
+echo "deb [signed-by=/etc/apt/keyrings/mithro-go-claude-teleport.gpg] https://mith.ro/go-claude-teleport/trixie/ ./" \
   | sudo tee /etc/apt/sources.list.d/mithro-go-claude-teleport.list
 sudo apt update && sudo apt install claude-teleport
 ```
+
+Each suite (`trixie/`, `sid/`) is its own flat repository, so the trailing
+`./` stays and the suite goes in the URL. The package is a static binary
+with no suite-specific dependencies, so the two carry identical contents —
+pick either on a derivative or a newer Debian (Ubuntu, forky, …).
 
 Or build it yourself:
 
