@@ -43,6 +43,12 @@ func authMethods(agentSocket string, identityFiles []string, home string, logf f
 			cleanup = func() { conn.Close() }
 		}
 	}
+	// An encrypted key file is not fatal on its own. The agent very often
+	// holds that exact key -- which is how OpenSSH itself gets in -- and
+	// another identity file may be usable. Remember the first one and only
+	// report it if nothing else can authenticate, so the actionable
+	// message survives for the case where it really is the problem.
+	var lockedErr error
 	seen := map[string]bool{}
 	for _, f := range append(append([]string{}, identityFiles...), defaultIdentityFiles...) {
 		path := expandHome(f, home)
@@ -62,8 +68,11 @@ func authMethods(agentSocket string, identityFiles []string, home string, logf f
 		if err != nil {
 			var pm *ssh.PassphraseMissingError
 			if errors.As(err, &pm) {
-				cleanup()
-				return nil, nil, fmt.Errorf("identity file %s: %w", path, ErrPassphrase)
+				if lockedErr == nil {
+					lockedErr = fmt.Errorf("identity file %s: %w", path, ErrPassphrase)
+				}
+				logf("identity file %s is passphrase-protected; skipping it (the agent may hold this key)", path)
+				continue
 			}
 			cleanup()
 			return nil, nil, fmt.Errorf("identity file %s: %w", path, err)
@@ -71,6 +80,10 @@ func authMethods(agentSocket string, identityFiles []string, home string, logf f
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
 	if len(methods) == 0 {
+		cleanup()
+		if lockedErr != nil {
+			return nil, nil, lockedErr
+		}
 		return nil, nil, fmt.Errorf("no ssh authentication available: no ssh-agent (SSH_AUTH_SOCK) and no key file among %s", strings.Join(defaultIdentityFiles, ", "))
 	}
 	return methods, cleanup, nil
