@@ -89,14 +89,22 @@ type Session struct {
 // -- so a layout matching neither (a hand-renamed project directory)
 // behaves exactly as it did.
 func (s *Session) ProjectCwd() string {
-	base := filepath.Base(s.ProjectDir)
-	if s.LaunchCwd != "" && Munge(s.LaunchCwd) == base {
-		return s.LaunchCwd
+	return ProjectCwdOf(Meta{LaunchCwd: s.LaunchCwd, WorkCwd: s.WorkCwd}, s.ProjectDir)
+}
+
+// ProjectCwdOf is ProjectCwd for callers that have a Meta and the project
+// directory but never built a Session -- `list`, which reads one Meta per
+// transcript and must not pay for a full resolve of every session on the
+// host. The rule lives here once so the two cannot drift apart.
+func ProjectCwdOf(m Meta, projectDir string) string {
+	base := filepath.Base(projectDir)
+	if m.LaunchCwd != "" && Munge(m.LaunchCwd) == base {
+		return m.LaunchCwd
 	}
-	if s.WorkCwd != "" && Munge(s.WorkCwd) == base {
-		return s.WorkCwd
+	if m.WorkCwd != "" && Munge(m.WorkCwd) == base {
+		return m.WorkCwd
 	}
-	return s.LaunchCwd
+	return m.LaunchCwd
 }
 
 // FindTranscript locates <projectsDir>/*/<id>.jsonl. Exactly one FILE must

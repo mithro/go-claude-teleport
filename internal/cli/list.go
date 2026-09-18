@@ -77,7 +77,11 @@ func listSessions(p session.Paths, probe session.PaneProbe) ([]listRow, error) {
 		if err != nil {
 			return nil, err
 		}
-		row := listRow{ID: id, State: session.StateIdle.String(), Cwd: m.LaunchCwd, Branch: m.Branch, Last: m.LastTS}
+		// The project cwd, not the launch cwd: on a session that changed
+		// directory those differ, and the CWD column has to name the
+		// directory the session works in (see session.ProjectCwd).
+		row := listRow{ID: id, State: session.StateIdle.String(),
+			Cwd: session.ProjectCwdOf(m, filepath.Dir(t)), Branch: m.Branch, Last: m.LastTS}
 		if r, ok := running[id]; ok {
 			row.State, row.Name, row.PID, row.Tmux = session.StateRunning.String(), r.Name, r.PID, r.Tmux
 		} else if pi, ok := suspended[id]; ok {
