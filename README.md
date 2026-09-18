@@ -62,11 +62,8 @@ apt repository is published at `https://mith.ro/go-claude-teleport/`:
 
 ```sh
 sudo install -d -m0755 /etc/apt/keyrings
-# gpg --dearmor makes the stored keyring binary, which is what the .gpg
-# name promises apt — and it is a no-op if the key is already binary, so
-# this line stays correct either way. See below.
 curl -fsSL https://mith.ro/go-claude-teleport/go-claude-teleport.gpg \
-  | gpg --dearmor | sudo tee /etc/apt/keyrings/mithro-go-claude-teleport.gpg > /dev/null
+  | sudo tee /etc/apt/keyrings/mithro-go-claude-teleport.gpg > /dev/null
 echo "deb [signed-by=/etc/apt/keyrings/mithro-go-claude-teleport.gpg] https://mith.ro/go-claude-teleport/trixie/ ./" \
   | sudo tee /etc/apt/sources.list.d/mithro-go-claude-teleport.list
 sudo apt update && sudo apt install claude-teleport
@@ -76,35 +73,6 @@ Each suite (`trixie/`, `sid/`) is its own flat repository, so the trailing
 `./` stays and the suite goes in the URL. The package is a static binary
 with no suite-specific dependencies, so the two carry identical contents —
 pick either on a derivative or a newer Debian (Ubuntu, forky, …).
-
-**Why `gpg --dearmor`.** apt ties a keyring's extension to its format:
-`.gpg` must be a binary keyring, `.asc` must be ASCII-armored. The key
-this repository publishes is currently armored (it begins `-----BEGIN PGP
-PUBLIC KEY BLOCK-----`) even though it is served under a `.gpg` name, so
-saving those bytes straight into a `.gpg` file mis-types it, and on many
-hosts the repository then reads as unsigned:
-
-```
-W: The key(s) in the keyring /etc/apt/keyrings/mithro-go-claude-teleport.gpg
-   are ignored as the file has an unsupported filetype.
-E: The repository '…' is not signed.
-```
-
-**Which hosts** is decided by the OpenPGP verifier apt uses, not by the
-apt version. apt prefers `sqv` (Sequoia) when it is installed, and `sqv`
-reads armored and binary keyrings alike; without it apt falls back to
-`gpgv`, which rejects an armored keyring outright (`invalid packet
-(ctb=2d)` — `0x2d` is the armor's leading `-`). So a host with `sqv`
-never notices, and a host without it cannot install at all. Debian 13
-ships `sqv`; a stock Ubuntu does not. Checking `command -v sqv` predicts
-the outcome; the apt version does not.
-
-Piping through `gpg --dearmor` settles it without having to know which
-format is being served: it converts armored input to binary, and on input
-that is *already* binary it is a byte-for-byte no-op (verified with GnuPG
-2.4.7). So the line above is correct both today and once the publisher is
-fixed to emit a genuine binary keyring. It needs `gnupg` installed, which
-is the only cost.
 
 Or build it yourself:
 
