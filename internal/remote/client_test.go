@@ -417,7 +417,14 @@ func TestNewClientReportsClearErrorWhenRemoteExeIsNowhere(t *testing.T) {
 
 	remoteHome := t.TempDir()
 	noTmux := filepath.Join(t.TempDir(), "no-tmux-here")
-	remoteEnv := []string{"HOME=" + remoteHome, "PATH=/usr/bin:/bin", "TMUX_TMPDIR=" + noTmux}
+	// PATH must be hermetic for the same reason the fallbacks above are.
+	// It used to be /usr/bin:/bin, which quietly stopped testing anything
+	// the moment claude-teleport was installed from the .deb (it lands in
+	// /usr/bin) — the lookup then SUCCEEDED and the test failed claiming
+	// the error was missing. /bin/sh is started by absolute path, so an
+	// empty PATH costs the fixture nothing.
+	emptyPath := t.TempDir()
+	remoteEnv := []string{"HOME=" + remoteHome, "PATH=" + emptyPath, "TMUX_TMPDIR=" + noTmux}
 
 	sc := dialOverRealShellFixture(t, remoteEnv)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
