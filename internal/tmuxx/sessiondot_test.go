@@ -76,7 +76,7 @@ func TestFindWindowInUndottedSessionStillWorks(t *testing.T) {
 	f := &Fake{Replies: map[string][]string{
 		listSessionsCmd: {"netv2\t"},
 		"list-windows -t \"=netv2:\" -F \"#{window_id}\t#{window_name}\"": {"@48\trpi3-netv2 tests"},
-		`list-panes -t "@48" -F "#{pane_id}"`:                            {"%48"},
+		`list-panes -t "@48" -F "#{pane_id}"`:                             {"%48"},
 	}}
 	p := Prober(context.Background(), f, tb, "/tmp/tmux-1000/main")
 	panes, err := p.FindWindow("netv2", "rpi3-netv2 tests")
