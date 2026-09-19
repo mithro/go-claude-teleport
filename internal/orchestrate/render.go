@@ -232,6 +232,7 @@ func (p *Plan) renderGitCaveats(w io.Writer, dirtyCount int) {
 		notes = append(notes,
 			"every file under "+g.SrcWorktree+" travels, including the .git directory of any repository nested inside it",
 			"no gitignore is consulted (there is no repository to read one from), so --exclude is the only filter; --exclude '*' sends the session alone and leaves the destination's copy of the directory as it is",
+			"an absolute symlink, or one pointing outside the directory, is refused by the destination -- an untracked tree full of virtualenvs and build outputs is where those live, and this check runs before any content is compared",
 			"a destination file that already exists with different content refuses the teleport at preflight, before anything is installed; --force does not cover these (it applies only to the session's own files)",
 		)
 		fmt.Fprintln(w, "  Caveats")
