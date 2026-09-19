@@ -232,7 +232,14 @@ func (f *fakeTmux) runLocked(cmd string) (out []string, err error, trig *exitTri
 	case "list-windows":
 		// A window NAME cannot be a tmux target when it contains a dot,
 		// so tmuxx resolves names to window ids through this.
-		sess := strings.TrimPrefix(flag(a, "-t"), "=")
+		//
+		// The target is "=<session>:" — the trailing colon ends the
+		// session part, which is what lets a session name containing a
+		// dot be targeted at all. Real tmux accepts that spelling for
+		// every session name (probe-verified against tmux next-3.8:
+		// "=netv2:", "=tt:" and "=fpgas.online:" each list their
+		// windows), so the fake accepts it with or without the colon.
+		sess := strings.TrimSuffix(strings.TrimPrefix(flag(a, "-t"), "="), ":")
 		if _, ok := f.sessions[sess]; !ok {
 			return nil, fmt.Errorf("can't find session: %s", sess), nil
 		}

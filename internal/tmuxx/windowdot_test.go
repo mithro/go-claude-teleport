@@ -6,7 +6,10 @@ import (
 	"testing"
 )
 
-const listWindowsTTCmd = "list-windows -t \"=tt\" -F \"#{window_id}\t#{window_name}\""
+// "=tt:" — the trailing colon ends the session part of the target, so tmux
+// never tries to read a dot in the name as a pane specifier. See
+// TestResolveWindowNameTargetsTheSessionWithATrailingColon.
+const listWindowsTTCmd = "list-windows -t \"=tt:\" -F \"#{window_id}\t#{window_name}\""
 
 // A tmux target is "<session>:<window>.<pane>", so tmux splits a target at
 // the dot -- and a window NAME containing a dot can never be targeted by

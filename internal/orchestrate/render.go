@@ -159,8 +159,10 @@ func (p *Plan) renderGit(w io.Writer) {
 	g := p.Git
 	switch g.Mode {
 	case gitx.ModeNotRepo:
+		// No early return: this mode needs its caveats more than any
+		// other (renderGitCaveats). Dirty state is empty without a
+		// repository, so renderGitDirty prints nothing.
 		fmt.Fprintf(w, "  not a repository: %s copied as plain files to %s\n", g.SrcWorktree, g.DstWorktree)
-		return
 	case gitx.ModeFreshMain:
 		fmt.Fprintf(w, "  fresh-main: %s is absent on the destination; the whole repository is transferred\n", g.DstMain)
 		if g.Linked {
@@ -220,10 +222,25 @@ func (p *Plan) renderGitDirty(w io.Writer) int {
 // other notes that always apply to repo plans.
 func (p *Plan) renderGitCaveats(w io.Writer, dirtyCount int) {
 	g := p.Git
+	var notes []string
 	if g.Mode == gitx.ModeNotRepo {
+		// The repo modes are bounded by what git tracks. This one is not
+		// bounded by anything: gitx.Files answers ModeNotRepo with a bare
+		// walk of SrcWorktree that has no .git skip and no gitignore
+		// matcher -- with no repository there is nothing to read ignore
+		// rules from -- so --exclude is the only filter that exists.
+		notes = append(notes,
+			"every file under "+g.SrcWorktree+" travels, including the .git directory of any repository nested inside it",
+			"no gitignore is consulted (there is no repository to read one from), so --exclude is the only filter; --exclude '*' sends the session alone and leaves the destination's copy of the directory as it is",
+			"an absolute symlink, or one pointing outside the directory, is refused by the destination -- an untracked tree full of virtualenvs and build outputs is where those live, and this check runs before any content is compared",
+			"a destination file that already exists with different content refuses the teleport at preflight, before anything is installed; --force does not cover these (it applies only to the session's own files)",
+		)
+		fmt.Fprintln(w, "  Caveats")
+		for _, n := range notes {
+			fmt.Fprintf(w, "    - %s\n", n)
+		}
 		return
 	}
-	var notes []string
 	if g.Mode == gitx.ModeExistingMain && dirtyCount > 0 {
 		notes = append(notes, "staged deletions do not travel: only staged blobs and dirty working-tree files are sent, so a `git rm --cached` on the source is not replayed on the destination")
 	}
