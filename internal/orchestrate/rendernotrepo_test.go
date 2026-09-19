@@ -77,6 +77,27 @@ func TestRenderNotRepoSaysGitignoreIsNotConsulted(t *testing.T) {
 	}
 }
 
+// Symlinks are the refusal that actually fires for this mode, and it
+// fires FIRST: dst.ManifestDiff validates every entry before
+// transfer.Blocking ever compares content (preflight.go). A tracked tree
+// rarely carries an absolute symlink; an untracked one is full of them,
+// because every virtualenv has .venv/bin/python pointing at an
+// interpreter outside the tree.
+//
+// Measured on the real case (a8c34ffa, 8.1 GB, 404k entries walked): 571
+// entries refused, 559 of them "symlink target ... is absolute" and 12
+// "resolves to ..., outside root". The content-collision check was never
+// reached.
+func TestRenderNotRepoWarnsAboutSymlinks(t *testing.T) {
+	var b bytes.Buffer
+	notRepoPlan().Render(&b)
+	out := b.String()
+	if !strings.Contains(out, "symlink") {
+		t.Errorf("not-a-repo caveats do not mention symlinks, which are what\n"+
+			"actually refuses this mode in practice:\n%s", out)
+	}
+}
+
 // The repo modes must keep the caveats they already had -- this guards the
 // early-return being replaced rather than deleted.
 func TestRenderRepoModesKeepTheirCaveats(t *testing.T) {
