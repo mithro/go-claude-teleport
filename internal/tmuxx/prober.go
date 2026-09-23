@@ -81,8 +81,13 @@ func (p *prober) FindWindow(sess, window string) ([]string, error) {
 // than a silent pick — the error names the candidates so the caller can
 // re-run with an index.
 func (p *prober) resolveWindowName(storedSession, typed string) (string, error) {
+	// The trailing colon is load-bearing: it makes the target explicitly
+	// "<session>:" so tmux stops looking for a window/pane part, which is
+	// the only way a session name containing a dot can be targeted at all
+	// (see TestFindWindowInSessionWhoseNameContainsADot). new-window in
+	// window.go composes its target the same way.
 	lines, err := p.t.Run(p.ctx, fmt.Sprintf("list-windows -t %s -F \"#{window_id}\t#{window_name}\"",
-		Quote("="+storedSession)))
+		Quote("="+storedSession+":")))
 	if err != nil {
 		return "", fmt.Errorf("list-windows: %w", err)
 	}
