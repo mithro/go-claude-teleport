@@ -63,9 +63,9 @@ apt repository is published at `https://mith.ro/go-claude-teleport/`:
 ```sh
 sudo install -d -m0755 /etc/apt/keyrings
 curl -fsSL https://mith.ro/go-claude-teleport/go-claude-teleport.gpg \
-  | sudo tee /etc/apt/keyrings/mithro-go-claude-teleport.gpg > /dev/null
-echo "deb [signed-by=/etc/apt/keyrings/mithro-go-claude-teleport.gpg] https://mith.ro/go-claude-teleport/trixie/ ./" \
-  | sudo tee /etc/apt/sources.list.d/mithro-go-claude-teleport.list
+  | sudo tee /etc/apt/keyrings/go-claude-teleport.gpg > /dev/null
+echo "deb [signed-by=/etc/apt/keyrings/go-claude-teleport.gpg] https://mith.ro/go-claude-teleport/trixie/ ./" \
+  | sudo tee /etc/apt/sources.list.d/go-claude-teleport.list
 sudo apt update && sudo apt install claude-teleport
 ```
 
