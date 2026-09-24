@@ -220,8 +220,6 @@ jobs:
     with:
       suites: "trixie sid"
       architectures: "amd64 arm64 armhf riscv64"
-      origin: go-claude-teleport
       description: "Teleport Claude Code sessions between machines"
-      keyring-name: go-claude-teleport.gpg
     secrets:
       gpg-private-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
