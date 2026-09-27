@@ -1,0 +1,4 @@
+# How this repository is packaged, and why it differs from the defaults.
+# See https://github.com/mithro/apt-repo-action/blob/main/docs/packaging.md
+
+kind = "B"                  # our own code: a Go program packaged with nfpm (nfpm.yaml)
