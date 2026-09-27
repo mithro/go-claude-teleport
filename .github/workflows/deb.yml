@@ -1,0 +1,305 @@
+name: Debian packages
+
+# Every push to main builds and publishes: the unit tests and the fat
+# multi-architecture binaries, one .deb per suite and architecture (nfpm), the
+# signed apt repository at https://mith.ro/go-claude-teleport/, and a GitHub
+# Release of the build. Pull requests build the same packages as previews
+# (versions ending ~pr<P>) and publish nothing. The conventions are
+# mithro/apt-repo-action's docs/packaging.md. The integration and real-Claude
+# tests stay in test.yml.
+#
+# Versions come from git through the shared scripts/deb-version.py
+# (mithro/apt-repo-action's deb-version action): <X.Y>.post<N> after the last
+# hand-made vX.Y tag, plus ~deb<R> per suite and ~pr<P> on a pull request. CI
+# never creates a vX.Y tag.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deb-${{ github.ref }}
+  # A newer push to a pull request cancels the older build. On the default
+  # branch a running publish is never cancelled: the newest push waits for it,
+  # and replaces any older push still waiting (it contains that one's commits).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NFPM_VERSION: 2.41.1
+
+jobs:
+  # The unit tests, then the fat binaries (packaging/fatbuild.py). Every
+  # claude-teleport-linux-<arch> carries all architectures, so they are built
+  # together, once, here; build-deb only packages them.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # the version needs history and tags
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update && sudo apt-get install -y tmux git
+      - run: go vet ./...
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go test -race ./...
+      # ./internal/... , the same command the README documents (C11): the
+      # tmuxlive tag is opt-in and only a handful of packages carry such
+      # tests today, but naming two of them means a new one is silently
+      # never run in CI.
+      - run: go test -race -tags tmuxlive ./internal/...
+      # The binary's own version is the suite-independent one, sid's: two
+      # hosts must report the same version for a teleport (doctor, preflight),
+      # whichever suite each installed it from.
+      # TODO: @main once mithro/apt-repo-action#27 merges.
+      - name: Version
+        id: v
+        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        with:
+          suite: sid
+      - name: Build the fat binaries
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 packaging/fatbuild.py --version "$VERSION"
+          ls -l dist/
+          # The amd64 canonical must run and report the version.
+          test "$(./dist/claude-teleport-linux-amd64 version | awk '{print $2}')" = "$VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bin
+          path: dist/claude-teleport-linux-*
+          if-no-files-found: error
+          retention-days: 14
+
+  # One job per architecture: its fat binary is packaged for each of its
+  # suites, since ~deb<R> gives every suite its own version. The runner is
+  # the one that can run the architecture's install test.
+  build-deb:
+    name: build-deb (${{ join(matrix.suites, ' ') }} ${{ matrix.arch }})
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `arch` is the Debian name; `binarch` the fatbuild.py arch id whose
+          # canonical binary the .deb wraps; `platform` the docker platform
+          # the install test runs.
+          - {arch: amd64, binarch: amd64, runner: ubuntu-24.04, platform: linux/amd64,
+             suites: [trixie, forky, sid]}
+          - {arch: i386, binarch: "386", runner: ubuntu-24.04, platform: linux/386,
+             suites: [trixie, forky, sid]}
+          - {arch: arm64, binarch: arm64, runner: ubuntu-24.04-arm, platform: linux/arm64,
+             suites: [trixie, forky, sid]}
+          # fatbuild.py's arm is ARMv6 (GOARM=6), so it also runs on
+          # Raspbian's ARMv6 Raspberry Pis. The arm64 runners execute armhf
+          # natively.
+          - {arch: armhf, binarch: arm, runner: ubuntu-24.04-arm, platform: linux/arm/v7,
+             suites: [trixie, forky, sid, raspbian-trixie, raspbian-forky]}
+          # No riscv64 runner: its install test runs under QEMU.
+          - {arch: riscv64, binarch: riscv64, runner: ubuntu-24.04, platform: linux/riscv64,
+             suites: [trixie, forky, sid]}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # the version needs history and tags
+
+      # One step per suite: the shared action versions one suite at a time.
+      # TODO: @main once mithro/apt-repo-action#27 merges.
+      - name: Version (trixie)
+        id: v-trixie
+        if: contains(matrix.suites, 'trixie')
+        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        with:
+          suite: trixie
+      - name: Version (forky)
+        id: v-forky
+        if: contains(matrix.suites, 'forky')
+        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        with:
+          suite: forky
+      - name: Version (sid)
+        id: v-sid
+        if: contains(matrix.suites, 'sid')
+        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        with:
+          suite: sid
+      - name: Version (raspbian-trixie)
+        id: v-raspbian-trixie
+        if: contains(matrix.suites, 'raspbian-trixie')
+        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        with:
+          suite: raspbian-trixie
+      - name: Version (raspbian-forky)
+        id: v-raspbian-forky
+        if: contains(matrix.suites, 'raspbian-forky')
+        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        with:
+          suite: raspbian-forky
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin
+          path: dist/
+
+      - name: Build
+        env:
+          ARCH: ${{ matrix.arch }}
+          BINARCH: ${{ matrix.binarch }}
+          SUITES: ${{ join(matrix.suites, ' ') }}
+          V_trixie: ${{ steps.v-trixie.outputs.version }}
+          V_forky: ${{ steps.v-forky.outputs.version }}
+          V_sid: ${{ steps.v-sid.outputs.version }}
+          V_raspbian_trixie: ${{ steps.v-raspbian-trixie.outputs.version }}
+          V_raspbian_forky: ${{ steps.v-raspbian-forky.outputs.version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/nfpm.deb" \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_$(dpkg --print-architecture).deb"
+          sudo dpkg -i "$RUNNER_TEMP/nfpm.deb"
+          # nfpm.yaml packages ./dist/claude-teleport.
+          cp "dist/claude-teleport-linux-$BINARCH" dist/claude-teleport
+          chmod +x dist/claude-teleport
+          for suite in $SUITES; do
+            var="V_${suite//-/_}"
+            mkdir -p "built-debs/$suite"
+            VERSION="${!var}" nfpm package -p deb -f nfpm.yaml -t "built-debs/$suite/"
+            dpkg-deb -f "built-debs/$suite"/*.deb Package Version Architecture
+          done
+
+      - name: Install test
+        env:
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+          SUITES: ${{ join(matrix.suites, ' ') }}
+          BINARY_VERSION: ${{ needs.test.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$ARCH" = riscv64 ]; then
+            docker run --privileged --rm tonistiigi/binfmt --install riscv64
+          fi
+          for suite in $SUITES; do
+            # A Raspbian suite's package is tested in Debian armhf of the same
+            # codename: it is the same ARMv6 binary.
+            codename="${suite#raspbian-}"
+            echo "::group::$suite ($PLATFORM)"
+            # --platform always: after another architecture's container, the
+            # local debian:<codename> tag may point at that image instead.
+            docker run --rm --platform "$PLATFORM" -v "$PWD/built-debs/$suite:/debs:ro" \
+              -e BINARY_VERSION "debian:$codename" sh -ec '
+                apt-get update
+                apt-get install -y /debs/*.deb
+                claude-teleport version
+                test "$(claude-teleport version | cut -d" " -f2)" = "$BINARY_VERSION"'
+            echo "::endgroup::"
+          done
+
+      - name: Upload (trixie)
+        if: contains(matrix.suites, 'trixie')
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-trixie-${{ matrix.arch }}
+          path: built-debs/trixie/*.deb
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload (forky)
+        if: contains(matrix.suites, 'forky')
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-forky-${{ matrix.arch }}
+          path: built-debs/forky/*.deb
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload (sid)
+        if: contains(matrix.suites, 'sid')
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-sid-${{ matrix.arch }}
+          path: built-debs/sid/*.deb
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload (raspbian-trixie)
+        if: contains(matrix.suites, 'raspbian-trixie')
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-raspbian-trixie-${{ matrix.arch }}
+          path: built-debs/raspbian-trixie/*.deb
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload (raspbian-forky)
+        if: contains(matrix.suites, 'raspbian-forky')
+        uses: actions/upload-artifact@v7
+        with:
+          name: debs-raspbian-forky-${{ matrix.arch }}
+          path: built-debs/raspbian-forky/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-apt:
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    needs: build-deb
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: mithro/apt-repo-action/.github/workflows/publish-apt.yml@main
+    with:
+      suites: "trixie forky sid raspbian-trixie raspbian-forky"
+      architectures: "amd64 i386 arm64 armhf riscv64"
+      description: "Teleport Claude Code sessions between machines"
+    secrets:
+      gpg-private-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+
+  # A GitHub Release per build (docs/packaging.md, "GitHub Releases"): tagged
+  # build-<version>, never v* (vX.Y tags are made by hand), with every
+  # suite's .deb as <suite>_<file>.deb, the fat binaries and SHA256SUMS.
+  release:
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    needs: [test, build-deb]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the tag and the GitHub Release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: Collect the assets
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for dir in artifacts/debs-*; do
+            name="${dir#artifacts/debs-}"
+            suite="${name%-*}"   # debs-<suite>-<arch>; a suite may contain a dash
+            for deb in "$dir"/*.deb; do cp "$deb" "release/${suite}_$(basename "$deb")"; done
+          done
+          cp artifacts/bin/claude-teleport-linux-* release/
+          cd release
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: build-${{ needs.test.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null; then
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* --target "$GITHUB_SHA" --title "$TAG" \
+              --notes "Build of $GITHUB_SHA. Fat static linux binaries (386, amd64, arm (ARMv6), arm64, riscv64), each carrying every architecture so it can install itself onto a different-architecture remote; Debian packages for every suite (<suite>_<file>.deb); SHA256SUMS. Apt repository: https://mith.ro/go-claude-teleport/"
+          fi

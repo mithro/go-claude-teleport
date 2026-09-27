@@ -1,4 +1,7 @@
 name: test
+
+# The integration and real-Claude tests. The unit tests are deb.yml's test
+# job, which gates every build and publish.
 on:
   push:
     branches: [main]
@@ -17,30 +20,8 @@ permissions:
   contents: read
 
 jobs:
-  unit:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: sudo apt-get update && sudo apt-get install -y tmux git
-      - run: go vet ./...
-      - name: gofmt
-        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      - run: go test -race ./...
-      # ./internal/... , the same command the README documents (C11): the
-      # tmuxlive tag is opt-in and only a handful of packages carry such
-      # tests today, but naming two of them means a new one is silently
-      # never run in CI.
-      - run: go test -race -tags tmuxlive ./internal/...
-      - name: packaging helper tests
-        run: python3 -m unittest discover -s packaging -p 'version_test.py' -v
-
   integration:
     runs-on: ubuntu-latest
-    needs: unit
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -75,7 +56,6 @@ jobs:
   real-claude:
     if: github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
-    needs: unit
     timeout-minutes: 60
     strategy:
       fail-fast: false

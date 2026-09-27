@@ -443,7 +443,6 @@ here with `--from <host>` to inspect it locally).
 go vet ./... && go test -race ./...                                # unit tests
 go test -race -tags tmuxlive ./internal/...                        # opt-in: a throwaway tmux server
 test/integration/build.sh && go test -tags integration ./test/integration/ -v   # docker: source, jump, dest
-python3 -m unittest discover -s packaging -p 'version_test.py'
 ```
 
 The `tmuxlive`, `integration` and `realclaude` suites are all opt-in build
