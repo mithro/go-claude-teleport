@@ -56,23 +56,36 @@ done: session 3f2a9c1e is now on big-storage.example (running)
 
 ## Install
 
-Static binaries and `.deb` packages are attached to every
-[GitHub Release](https://github.com/mithro/go-claude-teleport/releases); an
-apt repository is published at `https://mith.ro/go-claude-teleport/`:
+From the signed apt repository at <https://mith.ro/go-claude-teleport/>, on
+Debian or Raspberry Pi OS. There is one per suite: `trixie`, `forky` and `sid`
+for amd64, i386, arm64, armhf and riscv64, and `raspbian-trixie` and
+`raspbian-forky` for 32-bit Raspberry Pi OS (ARMv6). Put your suite's name in
+place of `trixie` below:
 
 ```sh
 sudo install -d -m0755 /etc/apt/keyrings
-curl -fsSL https://mith.ro/go-claude-teleport/go-claude-teleport.gpg \
-  | sudo tee /etc/apt/keyrings/go-claude-teleport.gpg > /dev/null
+curl -fsSL https://mith.ro/go-claude-teleport/go-claude-teleport.gpg | sudo tee /etc/apt/keyrings/go-claude-teleport.gpg > /dev/null
 echo "deb [signed-by=/etc/apt/keyrings/go-claude-teleport.gpg] https://mith.ro/go-claude-teleport/trixie/ ./" \
   | sudo tee /etc/apt/sources.list.d/go-claude-teleport.list
-sudo apt update && sudo apt install claude-teleport
+sudo apt update
+sudo apt install claude-teleport
 ```
 
-Each suite (`trixie/`, `sid/`) is its own flat repository, so the trailing
-`./` stays and the suite goes in the URL. The package is a static binary
-with no suite-specific dependencies, so the two carry identical contents —
-pick either on a derivative or a newer Debian (Ubuntu, forky, …).
+The repository's signing key is
+`0283 7CF4 768C C599 9D3B  C606 D9CE 9D5D 286E E181`
+(`gpg --show-keys /etc/apt/keyrings/go-claude-teleport.gpg` shows it).
+
+The package is a static binary with no suite-specific dependencies, so on a
+derivative (Ubuntu, …) pick the Debian suite it is based on.
+`claude-teleport version` prints the version without its suite suffix
+(`0.24.post3` is `0.24` and 3 commits), so two hosts that installed the same
+build from different suites match.
+
+Every push to `main` is a build: the [Debian packages workflow](.github/workflows/deb.yml)
+publishes the packages to the apt repository and to a
+[GitHub Release](https://github.com/mithro/go-claude-teleport/releases) tagged
+`build-<version>`, with the static binaries. `vX.Y` tags are made by hand, when
+the version should change.
 
 Or build it yourself:
 
