@@ -54,6 +54,10 @@ jobs:
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go test -race ./...
+      # The release job only runs on the default branch; this checks its
+      # asset naming on every build (see packaging/release-assets.sh).
+      - name: Release asset names
+        run: sh packaging/release-assets-test.sh
       # ./internal/... , the same command the README documents (C11): the
       # tmuxlive tag is opt-in and only a handful of packages carry such
       # tests today, but naming two of them means a new one is silently
@@ -274,22 +278,17 @@ jobs:
     permissions:
       contents: write   # create the tag and the GitHub Release
     steps:
+      - name: Check out
+        uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           path: artifacts/
+      # Named as GitHub stores them, so SHA256SUMS matches what's downloaded.
       - name: Collect the assets
         run: |
           set -euo pipefail
-          mkdir -p release
-          for dir in artifacts/debs-*; do
-            name="${dir#artifacts/debs-}"
-            suite="${name%-*}"   # debs-<suite>-<arch>; a suite may contain a dash
-            for deb in "$dir"/*.deb; do cp "$deb" "release/${suite}_$(basename "$deb")"; done
-          done
-          cp artifacts/bin/claude-teleport-linux-* release/
-          cd release
-          sha256sum -- * > SHA256SUMS
-          cat SHA256SUMS
+          sh packaging/release-assets.sh artifacts release artifacts/bin/claude-teleport-linux-*
+          cat release/SHA256SUMS
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
