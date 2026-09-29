@@ -65,7 +65,7 @@ jobs:
       # TODO: @main once mithro/apt-repo-action#27 merges.
       - name: Version
         id: v
-        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        uses: mithro/apt-repo-action/deb-version@main
         with:
           suite: sid
       - name: Build the fat binaries
@@ -123,31 +123,31 @@ jobs:
       - name: Version (trixie)
         id: v-trixie
         if: contains(matrix.suites, 'trixie')
-        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        uses: mithro/apt-repo-action/deb-version@main
         with:
           suite: trixie
       - name: Version (forky)
         id: v-forky
         if: contains(matrix.suites, 'forky')
-        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        uses: mithro/apt-repo-action/deb-version@main
         with:
           suite: forky
       - name: Version (sid)
         id: v-sid
         if: contains(matrix.suites, 'sid')
-        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        uses: mithro/apt-repo-action/deb-version@main
         with:
           suite: sid
       - name: Version (raspbian-trixie)
         id: v-raspbian-trixie
         if: contains(matrix.suites, 'raspbian-trixie')
-        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        uses: mithro/apt-repo-action/deb-version@main
         with:
           suite: raspbian-trixie
       - name: Version (raspbian-forky)
         id: v-raspbian-forky
         if: contains(matrix.suites, 'raspbian-forky')
-        uses: mithro/apt-repo-action/deb-version@deb-version/patch-series
+        uses: mithro/apt-repo-action/deb-version@main
         with:
           suite: raspbian-forky
 
