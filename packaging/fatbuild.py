@@ -10,7 +10,7 @@ install can reconstruct and install the matching helper onto a different-arch
 remote — the zero-install teleport path.
 
 Usage:
-  uv run python packaging/fatbuild.py --version vX.Y [--out dist] [--arches amd64,arm64]
+  uv run python packaging/fatbuild.py --version 0.24.post3 [--out dist] [--arches amd64,arm64]
 
 The output binaries are dist/claude-teleport-linux-<arch>.
 """

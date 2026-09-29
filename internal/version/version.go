@@ -2,8 +2,9 @@
 // helper protocol version.
 package version
 
-// Version is "dev" for local builds; the release workflow sets it to the
-// vX.Y tag with -ldflags "-X github.com/mithro/go-claude-teleport/internal/version.Version=vX.Y".
+// Version is "dev" for local builds; the Debian packages workflow (deb.yml)
+// sets it to the build's suite-independent version, e.g. 0.24.post3, with
+// -ldflags "-X github.com/mithro/go-claude-teleport/internal/version.Version=0.24.post3".
 var Version = "dev"
 
 // Protocol is the remote helper protocol version (spec §4.3).

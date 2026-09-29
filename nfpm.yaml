@@ -2,13 +2,14 @@
 # VERSION and ARCH are expanded from the environment by nfpm at package time
 # (nfpm does not expand them inside contents[].src, so the binary is always
 # packaged from the fixed path ./dist/claude-teleport — build it there first):
-#   VERSION=0.2 ARCH=arm64 nfpm package -p deb -f nfpm.yaml -t dist/
+#   VERSION=0.24.post3~deb13 ARCH=arm64 nfpm package -p deb -f nfpm.yaml -t dist/
+# deb.yml gets VERSION from mithro/apt-repo-action's deb-version action.
 name: claude-teleport
 arch: ${ARCH}
 platform: linux
 version: ${VERSION}
-# Keep the Debian version exactly as given (X.Y from the vX.Y tag); without
-# this nfpm re-renders it as semver (0.2 -> 0.2.0).
+# Keep the Debian version exactly as given (0.24.post3~deb13); without this
+# nfpm re-renders it as semver.
 version_schema: none
 section: utils
 priority: optional
