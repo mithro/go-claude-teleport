@@ -279,8 +279,16 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@v5
+      # Only the packages and binaries: since release waits for publish-apt,
+      # the run also holds the github-pages artifact (the whole apt site).
+      # A pattern keeps one directory per artifact (artifacts/<name>/).
       - uses: actions/download-artifact@v4
         with:
+          pattern: debs-*
+          path: artifacts/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin*
           path: artifacts/
       # Named as GitHub stores them, so SHA256SUMS matches what's downloaded.
       - name: Collect the assets
